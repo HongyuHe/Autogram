@@ -1,0 +1,31 @@
+# P3 invariant-learner config -- GEANT (CrossCheck 1000-snapshot sample, 23 nodes).
+# Same knob layout as abilene.yaml; only the data path / node-scale differ (design Sec. 10.4).
+dataset: geant
+data_path: data/crosscheck-samples/geant_sample_1000.pkl
+seed: 0
+
+# Inner loop -- the soft band epsilon is FIT per candidate in closed form, never searched.
+eval:
+  target_coverage: 0.90
+  holdout_frac: 0.5
+  gate_k: 6.0
+  eps_exact: 0.01
+  eps_max: 0.15
+  lift_min: 2.0
+
+# Middle loop -- MAP-Elites + islands evolutionary rule-set search.
+search:
+  iterations: 150
+  islands: 4
+  migration_every: 25
+  thompson: true
+  seed_from_grammar: false
+  bootstrap_random: 12
+  assemble_k_max: 16
+  dedup_rel: 0.05
+
+# Outer loop -- grammar / LLM extension cadence.
+grammar:
+  proposer: subagent
+  rounds: 1
+  max_complexity: 12

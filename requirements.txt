@@ -1,0 +1,19 @@
+# Secondary / fallback dependency list for the P3 invariant-learning engine (`autogram`).
+#
+# The CANONICAL manifest is the repository-root pyproject.toml + uv.lock; provision the
+# environment with `uv sync` (see autogram/README.md). This file is kept only as a
+# convenience for installing the engine deps into a non-project environment via uv's pip
+# interface, e.g.:  uv pip install -r requirements.txt
+# Pinned as lower bounds matching a verified-working environment.
+
+# --- runtime ---
+numpy>=2.0          # vectorised DSL evaluation and band fitting
+pandas>=2.0         # only used to read the CrossCheck *.pkl samples
+pyyaml>=6.0         # YAML config loading (configs/*.yaml)
+
+# --- optional: only needed for the OpenAI proposer backend ---
+# The engine runs fully without this (scripted / subagent backends need no network).
+openai>=1.40        # imported lazily inside autogram/proposer/openai_backend.py
+
+# --- dev / test ---
+pytest>=8.0         # offline, mockable test suite (tests/)

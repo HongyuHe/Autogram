@@ -1,0 +1,31 @@
+# P3 invariant-learner config -- Abilene (CrossCheck 1000-snapshot sample).
+# Every knob the engine exposes is grouped by the loop level that owns it (design Sec. 10.4).
+dataset: abilene
+data_path: data/crosscheck-samples/abilene_sample_1000.pkl
+seed: 0
+
+# Inner loop -- the soft band epsilon is FIT per candidate in closed form, never searched.
+eval:
+  target_coverage: 0.90   # coverage the band is fit to hit
+  holdout_frac: 0.5       # split-conformal calibration/eval split
+  gate_k: 6.0             # noise gate: |bias|/scale must exceed gate_k * sigma_prop
+  eps_exact: 0.01         # band <= this => reported EXACT
+  eps_max: 0.15           # band > this with no structure => reject
+  lift_min: 2.0           # min name-semantic lift vs a name-blind null
+
+# Middle loop -- MAP-Elites + islands evolutionary rule-set search.
+search:
+  iterations: 150
+  islands: 4
+  migration_every: 25
+  thompson: true
+  seed_from_grammar: false  # the scripted proposer is the explicit grammar-seed source
+  bootstrap_random: 12
+  assemble_k_max: 16
+  dedup_rel: 0.05
+
+# Outer loop -- grammar / LLM extension cadence.
+grammar:
+  proposer: subagent        # scripted | openai | subagent
+  rounds: 1
+  max_complexity: 12        # admits the complexity-10 Kirchhoff node-flow law (I7)

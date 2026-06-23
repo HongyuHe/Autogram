@@ -1,0 +1,51 @@
+[project]
+name = "autogram-analysis"
+version = "0.1.0"
+requires-python = ">=3.12"
+# Single uv-managed environment for both the analysis notebooks and the `autogram` P3 engine.
+# `uv sync` provisions the .venv from this file + uv.lock; `uv run ...` executes against it.
+# The project is packaged (see [build-system]) purely to expose the `autogram` console script
+# (see [project.scripts]). uv installs it in editable mode, so `autogram/` stays importable
+# from source -- both `uv run autogram ...` and `uv run python -m autogram.cli ...` work.
+dependencies = [
+    "ipykernel>=7.3.0",
+    "jupyterlab>=4.5.8",
+    "matplotlib>=3.11.0",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "seaborn>=0.13.2",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Only needed for the OpenAI proposer backend: `uv sync --extra openai`.
+# The scripted and subagent backends run with no network and no extra.
+openai = ["openai>=1.40"]
+
+[project.scripts]
+# Console entry point so the engine runs as `uv run autogram <cmd> [flags]`
+# (the short, canonical form of `uv run python -m autogram.cli ...`).
+autogram = "autogram.cli:main"
+
+[dependency-groups]
+# Installed by default with `uv sync`; the offline, mockable test suite.
+# `openai` is included here (not just as a runtime extra) so the shipped tests can
+# exercise the OpenAI backend through a monkeypatched SDK -- no network or key is used.
+dev = [
+    "pytest>=8.0",
+    "openai>=1.40",
+]
+
+[build-system]
+# Packaged with hatchling solely so [project.scripts] installs the `autogram` command.
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# The importable package is `autogram/` (the distribution name is `autogram-analysis`).
+packages = ["autogram"]
+
+[tool.pytest.ini_options]
+# Tests live at the repo root (outside the importable `autogram/` package); `autogram`
+# resolves through the editable install that `uv sync` performs.
+testpaths = ["tests"]
