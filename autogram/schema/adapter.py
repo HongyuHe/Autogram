@@ -205,17 +205,6 @@ class SchemaAdapter:
         x = v.get(self.codec_primary)
         return float("nan") if x is None else float(x)
 
-    def decode_clean(self, v, kind: str) -> float:
-        if self.codec_kind == "scalar":
-            return float("nan") if v is None else float(v)
-        if kind == self.noisy_kind:
-            x = v.get(self.codec_clean)
-            if x is None:
-                x = v.get(self.codec_primary)
-        else:
-            x = v.get(self.codec_primary)
-        return float("nan") if x is None else float(x)
-
     # -- glyphs (interpretability; role names are reused so engine unparse is unchanged) --
     def ref_glyph(self, role: str) -> str:
         return self.ref_glyphs.get(role, role)

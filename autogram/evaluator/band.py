@@ -1,14 +1,13 @@
 """Analytic tolerance (band) fitting -- split-conformal, never searched (design Sec. 5.4, 10.1).
 
 For a candidate we observe a per-point residual ``rho`` and a typed scale ``s``.  We turn
-this into a single dimensionless tolerance ``eps`` on ``|rho|/s`` that achieves a global
-target coverage ``kappa*`` -- the *only* coverage knob, set once for the whole run, not per
-rule.  Using split-conformal (fit ``eps`` on a calibration split, measure coverage on a
-disjoint eval split) keeps the reported confidence honest rather than optimistic.
+this into a single dimensionless tolerance ``eps`` on ``|rho|/s`` by finding the residual
+knee: the largest observed gap between the tight core and the tail.  The achieved coverage
+is therefore an output of the residual distribution, not a configured target coverage.
 
-Why fit and not search: the residual distribution already determines the smallest band that
-reaches a target coverage; searching over ``eps`` would re-discover that quantile while
-multiplying the search space (Sec. 5.4).  So the inner loop is closed-form.
+Why fit and not search: the residual distribution already determines the core edge;
+searching over ``eps`` would re-discover that edge while multiplying the search space
+(Sec. 5.4).  So the inner loop is closed-form.
 """
 
 from __future__ import annotations
@@ -52,23 +51,57 @@ class BandFit:
     k_eval: int           # held-out points inside the band
 
 
-def fit_band(op: str, rho: np.ndarray, s: np.ndarray, target_cov: float,
-             holdout_frac: float, seed: int) -> BandFit:
+def _knee_index(vs: np.ndarray) -> int:
+    """Index of the core's upper edge: the lower side of the largest observed gap."""
+    n = vs.size
+    if n < 2:
+        return n - 1
+    gaps = np.diff(vs)
+    if gaps.size == 0 or float(np.max(gaps)) <= 0.0:
+        return n - 1
+    return int(np.argmax(gaps))
+
+
+def knee_coverage(v: np.ndarray) -> float:
+    """Read an operating coverage off the residual distribution by knee detection.
+
+    Sort the dimensionless violations ``v`` ascending and find the largest *observed gap*
+    between consecutive values.  That gap is the boundary between the tight core (genuine
+    structure) and the tail (violations); the fraction of points at or below it is the
+    coverage the band should operate at.  Coverage is thus an OUTPUT of the data, not a
+    configured target ``kappa*``.  If there is no gap, the residuals have no separable core
+    and the operating point is the whole observed distribution.
+    """
+    n = v.size
+    if n == 0:
+        return 0.0
+    vs = np.sort(v)
+    i = _knee_index(vs)
+    return (i + 1) / n
+
+
+def fit_band_auto(op: str, rho: np.ndarray, s: np.ndarray,
+                  holdout_frac: float, seed: int):
+    """Self-calibrated band fit: set ``eps`` at the residual knee, coverage honest on held-out.
+
+    The band edge is the *core's upper value* at the knee (split-conformal when there are
+    enough points to hold out rows; tiny samples use the same observed knee rather than a
+    hard-coded target).  A clean bimodal residual yields a tight ``eps`` rather than a
+    quantile that rounds up into the tail.  Returns ``(BandFit, coverage)`` where
+    ``coverage`` is the data-chosen operating point.  No ``kappa*`` and no noise constant
+    ``eta`` are involved.
+    """
     v = violation_magnitude(op, rho, s)
     n = v.size
     if n == 0:
-        return BandFit(0.0, 0.0, 0.0, 0, 0)
-    if n < 4:  # too few points to split honestly -- fit and report on the same data
-        eps = float(np.quantile(v, target_cov))
-        k = int(np.count_nonzero(v <= eps + 1e-15))
-        return BandFit(eps, k / n, k / n, n, k)
+        return BandFit(0.0, 0.0, 0.0, 0, 0), 0.0
     cal, ev = _split(n, holdout_frac, seed)
-    # Conformal quantile with finite-sample correction: ceil((m+1) q) / m order statistic.
-    m = cal.size
-    q_level = min(1.0, np.ceil((m + 1) * target_cov) / m)
-    eps = float(np.quantile(v[cal], q_level))
+    vc = np.sort(v[cal])
+    i = _knee_index(vc)
+    eps = float(vc[i])
     cov_cal = float(np.mean(v[cal] <= eps + 1e-15))
     k_eval = int(np.count_nonzero(v[ev] <= eps + 1e-15))
     cov_eval = k_eval / ev.size if ev.size else cov_cal
+    coverage = (i + 1) / cal.size
     return BandFit(eps=eps, cov_cal=cov_cal, cov_eval=cov_eval,
-                   n_eval=int(ev.size), k_eval=k_eval)
+                   n_eval=int(ev.size), k_eval=k_eval), coverage

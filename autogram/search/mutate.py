@@ -25,11 +25,11 @@ _SCALARS = (0.5, 2.0, -1.0)
 # ---------------------------------------------------------------------------
 
 def _ref_roles(binder: str, G: Grammar) -> List[str]:
-    return [r for r in A.REF_ROLES.get(binder, ()) if r in G.ref_roles]
+    return list(G.refs_for(binder))
 
 
 def _fam_roles(binder: str, G: Grammar) -> List[str]:
-    return [r for r in A.FAM_ROLES.get(binder, ()) if r in G.fam_roles]
+    return list(G.fams_for(binder))
 
 
 def random_term(binder: str, G: Grammar, rng: random.Random, depth: int = 2) -> Optional[A.Term]:
@@ -64,12 +64,26 @@ def random_rule(G: Grammar, rng: random.Random, binder: Optional[str] = None,
     for _ in range(tries):
         b = binder or rng.choice(G.binders)
         op = rng.choice(G.ops)
-        left = random_term(b, G, rng)
-        # right side: 0 for ordering ops, otherwise another term
-        if op in (">=", "<=") and rng.random() < 0.6:
-            right: Optional[A.Term] = Const(0)
+        refs = _ref_roles(b, G)
+        fams = _fam_roles(b, G)
+        if op in ("==", "~=") and refs and rng.random() < 0.75:
+            motif = rng.choices(("ref_ref", "ref_sum", "ref_zero"), weights=(2, 4, 2))[0]
+            if motif == "ref_ref" and len(refs) >= 2:
+                a, c = rng.sample(refs, 2)
+                left, right = Ref(a), Ref(c)
+            elif motif == "ref_sum" and fams:
+                left = Ref(rng.choice(refs))
+                right = Agg("SUM", rng.choice(fams))
+            else:
+                left, right = Ref(rng.choice(refs)), Const(0)
         else:
-            right = random_term(b, G, rng)
+            left = random_term(b, G, rng)
+            # right side: 0 for ordering ops and occasional equality-to-zero laws
+            if ((op in (">=", "<=") and rng.random() < 0.6)
+                    or (op in ("==", "~=") and rng.random() < 0.3)):
+                right: Optional[A.Term] = Const(0)
+            else:
+                right = random_term(b, G, rng)
         if left is None or right is None:
             continue
         r = Rule(b, Compare(left, op, right), tag="rand")
@@ -153,10 +167,9 @@ def _separation_neighbour(rule: Rule, G: Grammar, rng: random.Random) -> Optiona
 
     Reachable from any parent that references a role whose base measurement family has a
     second enabled member (e.g. ``egress`` -> ``egress != egress_rev``).  This gives the
-    anti-invariant niche an *evolutionary* path in addition to the deterministic
-    :func:`~autogram.dsl.grammar.anti_invariant_seeds`, so recovery survives a grammar
-    extension that introduces a new ``_rev`` family for which no static seed was enumerated.
-    Leakage-free: it only recombines names already in the parent / grammar vocabulary.
+    anti-invariant niche an *evolutionary* path: recovery survives a grammar extension that
+    introduces a new ``_rev`` family without any hand-written seed.  Leakage-free: it only
+    recombines names already in the parent / grammar vocabulary.
     """
     if "!=" not in G.ops:
         return None

@@ -1,8 +1,6 @@
-"""Evolutionary rule-set search (design Sec. 10.3-10.4).
+"""Typed random generation and mutation helpers for the collapsed discovery loop.
 
-The middle loop: a quality-diversity (MAP-Elites) search over the typed DSL-AST
-genotype, with island parallelism, Thompson-sampling budget allocation, and a
-submodular mine-and-cover assembler that turns the archive of accepted rules into a
-parsimonious, de-duplicated portfolio.  The band/threshold is *never* searched here --
-it is fit analytically inside the evaluator (the inner loop, Sec. 5.4).
+The old MAP-Elites / Thompson stack is gone.  Search now lives in
+``autogram.discovery.loop`` as one proposer feeding a simple Pareto archive; this package keeps
+only the schema-typed AST variation routines used by the random proposer.
 """
