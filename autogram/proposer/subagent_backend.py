@@ -22,7 +22,10 @@ Three ways to supply the subagent's reply (checked in order):
 * ``responder`` callback  -- ``responder(prompt:str) -> str`` (used by tests / programmatic
   spawning; the harness can pass a closure that spawns a real isolated subagent).
 * response file          -- ``<work_dir>/subagent_response_<dataset>.json`` written by an
-  externally-spawned subagent that only received the prompt file.
+  externally-spawned subagent that only received the prompt file.  For multi-round (outer-loop)
+  runs an externally-spawned harness may answer each round distinctly via
+  ``<work_dir>/subagent_response_<dataset>_round<k>.json`` (k = 1, 2, ...); when a per-round
+  file is absent the backend falls back to the base file, so a single static reply still works.
 * fallback               -- empty proposal (so the engine still runs; the run report records
   that no real subagent reply was used).  Never falls back to the grammar's true-form
   templates.
@@ -46,34 +49,57 @@ class SubagentProposer(Proposer):
         self.dataset = dataset
         self.responder = responder
         self.used_real_subagent = False     # surfaced in the run report for honesty
+        self.last_notes = ""                 # proposer feedback (admitted/rejected forms)
         os.makedirs(work_dir, exist_ok=True)
 
-    def prompt_path(self) -> str:
+    def prompt_path(self, round_idx: Optional[int] = None) -> str:
+        if round_idx:
+            return os.path.join(
+                self.work_dir, f"subagent_prompt_{self.dataset}_round{round_idx}.txt")
         return os.path.join(self.work_dir, f"subagent_prompt_{self.dataset}.txt")
 
-    def response_path(self) -> str:
+    def response_path(self, round_idx: Optional[int] = None) -> str:
+        if round_idx:
+            return os.path.join(
+                self.work_dir, f"subagent_response_{self.dataset}_round{round_idx}.json")
         return os.path.join(self.work_dir, f"subagent_response_{self.dataset}.json")
 
     def propose(self, ctx: ProposalContext) -> Proposal:
+        round_idx = getattr(ctx, "round_index", 0) or 0
         prompt = render_proposal_prompt(ctx)        # leakage-checked
+        # Always refresh the base prompt (back-compat / single-shot harness); for round >= 1
+        # also drop a per-round prompt so an external harness can answer each round distinctly.
         with open(self.prompt_path(), "w", encoding="ascii", errors="replace") as fh:
             fh.write(prompt)
+        if round_idx:
+            with open(self.prompt_path(round_idx), "w",
+                      encoding="ascii", errors="replace") as fh:
+                fh.write(prompt)
 
         text: Optional[str] = None
         source = "fallback"
         if self.responder is not None:
             text = self.responder(prompt)
             source = "responder-callback"
-        elif os.path.exists(self.response_path()):
-            with open(self.response_path(), "r", encoding="utf-8") as fh:
-                text = fh.read()
-            source = "response-file"
+        else:
+            # Prefer a per-round reply; fall back to the base static reply when absent so a
+            # single committed response still drives every round (the practical default).
+            rp = self.response_path(round_idx)
+            if round_idx and not os.path.exists(rp):
+                rp = self.response_path()
+            if os.path.exists(rp):
+                with open(rp, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+                source = f"response-file:round{round_idx}" if round_idx else "response-file"
 
         if not text:
-            return Proposal(seeds=[], notes="subagent: no reply; engine continues via "
-                                            "blind random search (no grammar fallback)")
+            self.last_notes = ("subagent: no reply; engine continues via blind random "
+                               "search (no grammar fallback)")
+            return Proposal(seeds=[], notes=self.last_notes)
         assert_no_leakage(text, "subagent response")  # defensive re-scan
-        prop = parse_proposal_json(text, ctx.grammar)
+        prop = parse_proposal_json(text, ctx.grammar, ctx.ceiling)
         self.used_real_subagent = True
-        prop.notes = f"subagent[{source}] -> {len(prop.seeds)} admissible forms"
+        detail = f" | {prop.notes}" if prop.notes else ""
+        prop.notes = f"subagent[{source}] -> {len(prop.seeds)} admissible forms{detail}"
+        self.last_notes = prop.notes
         return prop

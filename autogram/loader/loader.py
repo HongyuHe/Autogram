@@ -122,3 +122,53 @@ def load_dataset(path: str, name: str | None = None) -> Dataset:
         name = "abilene" if "ATLAng" in nm.nodes else "geant"
     return Dataset(name=name, name_model=nm, observed=observed, clean=clean,
                    timestamps=np.asarray(ts), n_snapshots=len(df))
+
+
+def _cells_to_matrix_adapter(df: pd.DataFrame, cols, nm: NameModel, which: str) -> np.ndarray:
+    """Decode cells via a :class:`SchemaAdapter` codec (generalised path).
+
+    ``which`` is ``"observed"`` or ``"clean"``; the per-column ``kind`` lets the codec
+    decide which field is noisy (only ``noisy_kind`` columns get a clean counterpart).
+    """
+    adapter = nm.adapter
+    n = len(df)
+    mat = np.empty((n, len(cols)), dtype=float)
+    for j, c in enumerate(cols):
+        kind = nm.by_name[c].kind
+        vals = df[c].values
+        col = mat[:, j]
+        for i in range(n):
+            v = vals[i]
+            x = adapter.decode_observed(v) if which == "observed" \
+                else adapter.decode_clean(v, kind)
+            col[i] = np.nan if x is None else float(x)
+    return mat
+
+
+def load_dataframe(df: pd.DataFrame, adapter, name: str,
+                   timestamps=None) -> Dataset:
+    """Build a :class:`Dataset` from an in-memory frame via a compiled adapter.
+
+    This is the schema-general counterpart of :func:`load_dataset`: the column
+    semantics, low/high split, and cell decoding are all driven by ``adapter``
+    (data, not hardcoded CrossCheck templates).  ``load_dataset`` is left byte-for-byte
+    unchanged so the CrossCheck hot path never routes through here.
+    """
+    columns = list(df.columns)
+    nm = NameModel.from_columns_with_adapter(columns, adapter)
+    low = list(nm.low_cols)
+    high = list(nm.high_cols)
+    ordered = low + high
+
+    obs_low = _cells_to_matrix_adapter(df, low, nm, "observed")
+    obs_high = _cells_to_matrix_adapter(df, high, nm, "observed")
+    observed = Frame(np.hstack([obs_low, obs_high]), ordered)
+
+    cln_low = _cells_to_matrix_adapter(df, low, nm, "clean")
+    clean = Frame(np.hstack([cln_low, obs_high]), ordered)
+
+    if timestamps is None:
+        timestamps = (df["timestamp"].values if "timestamp" in df.columns
+                      else np.arange(len(df)))
+    return Dataset(name=name, name_model=nm, observed=observed, clean=clean,
+                   timestamps=np.asarray(timestamps), n_snapshots=len(df))

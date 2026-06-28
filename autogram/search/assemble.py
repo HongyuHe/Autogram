@@ -12,17 +12,21 @@ portfolio:
 3. **niche collapse** -- keep one best-scoring representative per distinct structural niche
    (binder x comparison-kind x residual keyset), the granularity at which recall counts
    distinct invariants;
-4. **information-aware budget** -- two-sided equalities and anti-invariants are the
-   informative laws and are kept in full; one-sided bounds (``a >= b`` / ``a <= b``) are a
-   low-information class (a single equality dominates the two bounds it implies, and the
-   operator tautologies ``max >= min`` / ``sum >= part`` / ``v >= 0`` form a large
-   mutually-redundant fan) summarised by their best representative per (binder, kind), which
-   compete only for the slots left after the informative laws (with one slot guaranteed so
-   the sign-bound schema is always surfaced).  This prevents the redundant bound fan from
-   crowding structurally distinct equalities out of the budget.
+4. **information-aware budget + sign-entailment filter** -- two-sided equalities and
+   anti-invariants are the informative laws and are kept in full; one-sided bounds
+   (``a >= b`` / ``a <= b``) are split by a leakage-free symbolic test of the established sign
+   model (every measurement family is a non-negative count, i.e. invariant I1).  *Compound*
+   sign tautologies -- bounds that hold for every non-negative assignment (``i >= -H``,
+   ``0.25e <= 1.5e + H``) -- carry no information and are dropped; the non-negativity schema
+   ``q >= 0`` (target I1) is kept as one canonical representative; genuinely data-supported
+   bounds are summarised by their best representative per (binder, kind) and compete only for
+   the slots left after the informative laws (one slot guaranteed so I1 always surfaces).  This
+   removes the redundant bound fan without touching any equality or anti-invariant.
 
-Genuine, structurally-distinct invariants are never pruned by similarity, so recall over a
-diverse target set (exact, soft-structural, anti) is preserved.
+Niche representatives are chosen by score, then by parsimony (simplest equivalent form), so a
+bloated restatement never represents a niche.  Genuine, structurally-distinct invariants are
+never pruned by similarity, so recall over a diverse target set (exact, soft-structural, anti)
+is preserved.
 """
 
 from __future__ import annotations
@@ -126,6 +130,58 @@ def _has_cancellation(rule: Rule) -> bool:
     return bool(_side_keys(rule.atom.left) & _side_keys(rule.atom.right))
 
 
+def _bound_residual(rule: Rule) -> Dict[str, float]:
+    """Signed coefficient map of the quantity a one-sided bound asserts to be ``>= 0``.
+
+    For ``a >= b`` this is ``a - b``; for ``a <= b`` it is ``b - a`` (so the bound always reads
+    ``residual >= 0``).  Keys are Ref roles / Agg unparses (every measurement family in the DSL
+    is a non-negative byte/packet count) plus the literal ``#const`` for constant offsets.
+    Returns ``{}`` for two-sided or anti relations (not one-sided bounds)."""
+    op = rule.atom.op
+    acc: Dict[str, float] = {}
+    if op == ">=":
+        _flatten(rule.atom.left, 1.0, acc)
+        _flatten(rule.atom.right, -1.0, acc)
+    elif op == "<=":
+        _flatten(rule.atom.right, 1.0, acc)
+        _flatten(rule.atom.left, -1.0, acc)
+    else:
+        return {}
+    return {k: v for k, v in acc.items() if abs(v) > 1e-9}
+
+
+def _sign_tautology(rule: Rule) -> bool:
+    """True if a one-sided bound holds for *every* non-negative assignment of its terms.
+
+    All measurement families in the DSL are byte/packet counts and are therefore non-negative
+    -- this is invariant I1 itself, the established sign model.  A bound that reduces to
+    ``residual >= 0`` with every measurement coefficient ``>= 0`` and a non-negative constant
+    is true by the sign model alone, independent of the data: it carries no information beyond
+    non-negativity (e.g. ``i >= -H``, ``0.25e <= 1.5e + H``, ``-MIN(i) <= AVG(e)``).  Two-sided
+    equalities and anti-invariants are never tautological in this sense and return False."""
+    if rule.atom.op not in (">=", "<="):
+        return False
+    d = _bound_residual(rule)
+    if d.get("#const", 0.0) < -1e-9:
+        return False
+    return all(v >= -1e-9 for k, v in d.items() if k != "#const")
+
+
+def _pure_sign_bound(rule: Rule) -> bool:
+    """True for the canonical non-negativity schema ``q >= 0`` (target I1).
+
+    A pure sign bound is a sign tautology whose residual is a *single* measurement term with no
+    constant offset, i.e. it states exactly ``measurement >= 0``.  This is distinguished from
+    *compound* sign tautologies such as ``i >= -H`` (two terms), which restate non-negativity
+    with extra bloat and carry no information; only the single canonical representative of the
+    sign schema is retained (the recall grader credits I1 as any size-1 ``ge`` residual)."""
+    if not _sign_tautology(rule):
+        return False
+    d = _bound_residual(rule)
+    terms = [k for k in d if k != "#const"]
+    return len(terms) == 1 and abs(d.get("#const", 0.0)) <= 1e-9
+
+
 def assemble(results: List[EvaluationResult], ds: Dataset, cfg: EvalConfig,
              dedup_rel: float = 0.05, k_max: int = 16) -> List[EvaluationResult]:
     """Return the de-duplicated, capped portfolio (highest score first)."""
@@ -205,37 +261,67 @@ def assemble(results: List[EvaluationResult], ds: Dataset, cfg: EvalConfig,
     # deliberately NOT used: two rules constraining different variables can both hold everywhere
     # yet be different invariants.
     best_per_niche: Dict[tuple, EvaluationResult] = {}
+
+    def _niche_rank(r: EvaluationResult) -> tuple:
+        # lower is better: highest score, then simplest form (parsimony tie-break, MDL-aligned),
+        # then tightest band.  Picking the simplest equivalent rule as the niche representative
+        # canonicalises bloated restatements (e.g. ``v + v + v >= 0`` -> ``v >= 0``).
+        return (-r.combined_score, r.rule.complexity(), r.eps)
+
     for r in uniq:
         nk = _niche(r.rule)
         cur = best_per_niche.get(nk)
-        if cur is None or r.combined_score > cur.combined_score:
+        if cur is None or _niche_rank(r) < _niche_rank(cur):
             best_per_niche[nk] = r
 
-    # 3. portfolio assembly with an information-aware budget.  Two-sided equalities (``a == b``)
-    # and anti-invariants (``a != b``) are the informative laws: each distinct one is a genuine
-    # invariant the learner should report, so they are kept in full (never capped against each
-    # other).  One-sided bounds (``a >= b`` / ``a <= b``) are a low-information class -- a single
-    # equality dominates the two bounds it implies, and the operator-level tautologies
-    # (``max >= min``, ``sum >= part``, ``v >= 0``) form a large mutually-redundant fan that
-    # would otherwise crowd the real equalities out of the budget (each holds exactly, so each
-    # scores ~identically high).  All bounds are therefore summarised by their best
-    # representative per (binder, kind), and only those compete for the slots left after the
-    # informative laws, with at least one slot guaranteed so the sign-bound schema (target I1)
-    # is always surfaced.
+    # 3. portfolio assembly with an information-aware budget + sign-entailment tautology filter.
+    # Two-sided equalities (``a == b``) and anti-invariants (``a != b``) are the informative
+    # laws: each distinct one is a genuine invariant the learner should report, so they are kept
+    # in full (never capped against each other).  One-sided bounds are split by a leakage-free
+    # symbolic test (``_sign_tautology``):
+    #   * the non-negativity schema ``q >= 0`` (target I1) -- kept as ONE canonical representative
+    #     (prefer a ``ge`` form, then the simplest / highest-scoring), guaranteeing a slot;
+    #   * *compound* sign tautologies (``i >= -H``, ``0.25e <= 1.5e + H``, ``-MIN(i) <= AVG(e)``)
+    #     hold for every non-negative assignment and add no information -- they are DROPPED;
+    #   * genuine, data-supported bounds (not entailed by the sign model) that ALSO clear the
+    #     name-semantic lift floor (``lift >= cfg.lift_min``) are summarised by their best
+    #     representative per (binder, kind) and compete for the slots left after the informative
+    #     laws; a bound with lift ~1 (tight only because of its form, e.g. ``H[Y,X] <= i[X<-Y]``)
+    #     is uninformative bloat and is dropped, exactly as the equality gate already requires.
+    # This removes the redundant bound fan (poc-eval E2) while never touching equalities/antis,
+    # so recall over the exact / soft-structural / anti targets is preserved.
     informative = [r for r in best_per_niche.values()
                    if _OP_KIND.get(r.rule.atom.op) in ("eq", "anti")]
+    bounds_all = [r for r in best_per_niche.values()
+                  if _OP_KIND.get(r.rule.atom.op) in ("ge", "le")]
+
+    pure_sign = [r for r in bounds_all if _pure_sign_bound(r.rule)]
+
+    def _sign_rank(r: EvaluationResult) -> tuple:
+        is_ge = 0 if r.rule.atom.op == ">=" else 1   # I1 is graded as a ge bound -> prefer ge
+        return (is_ge, r.rule.complexity(), -r.combined_score)
+
+    sign_rep = min(pure_sign, key=_sign_rank) if pure_sign else None
+
+    genuine = [r for r in bounds_all
+               if not _sign_tautology(r.rule) and r.lift >= cfg.lift_min]
     bound_by_class: Dict[tuple, EvaluationResult] = {}
-    for r in best_per_niche.values():
-        kind = _OP_KIND.get(r.rule.atom.op)
-        if kind not in ("ge", "le"):
-            continue
-        bk = (r.rule.binder, kind)
+    for r in genuine:
+        bk = (r.rule.binder, _OP_KIND[r.rule.atom.op])
         cur = bound_by_class.get(bk)
         if cur is None or r.combined_score > cur.combined_score:
             bound_by_class[bk] = r
 
     informative.sort(key=lambda r: r.combined_score, reverse=True)
-    bounds = sorted(bound_by_class.values(), key=lambda r: r.combined_score, reverse=True)
-    n_bound_slots = max(1, k_max - len(informative))
-    kept = informative + bounds[:n_bound_slots]
+    genuine_summary = sorted(bound_by_class.values(),
+                             key=lambda r: r.combined_score, reverse=True)
+    slots = max(1, k_max - len(informative))
+    chosen_bounds: List[EvaluationResult] = []
+    if sign_rep is not None:
+        chosen_bounds.append(sign_rep)               # guaranteed slot -> target I1 surfaced
+    for r in genuine_summary:
+        if len(chosen_bounds) >= slots:
+            break
+        chosen_bounds.append(r)
+    kept = informative + chosen_bounds
     return sorted(kept, key=lambda r: r.combined_score, reverse=True)

@@ -1,11 +1,13 @@
-# P3 invariant-learner config -- GEANT (CrossCheck 1000-snapshot sample, 23 nodes).
+# P3 invariant-learner config -- GEANT (CrossCheck 1000-snapshot sample, 22 nodes).
 # Same knob layout as abilene.yaml; only the data path / node-scale differ (design Sec. 10.4).
 dataset: geant
 data_path: data/crosscheck-samples/geant_sample_1000.pkl
 seed: 0
 
-# Inner loop -- the soft band epsilon is FIT per candidate in closed form, never searched.
+# Inner loop -- production-style learning must be observed-only: the hidden clean frame is only an evaluation/debug oracle and is not available in practice.
 eval:
+  deployed: true
+  rel_noise: 0.02
   target_coverage: 0.90
   holdout_frac: 0.5
   gate_k: 6.0
@@ -20,12 +22,18 @@ search:
   migration_every: 25
   thompson: true
   seed_from_grammar: false
+  anti_seeds: true
+  structural_seeds: true    # deterministically seed the leakage-free aggregate-equality family (I4-I8 forms) once the grammar widens; decoy-rich, data-gated, never reads the catalog
   bootstrap_random: 12
   assemble_k_max: 16
   dedup_rel: 0.05
 
-# Outer loop -- grammar / LLM extension cadence.
+# Outer loop -- start restricted and use multiple rounds so the LLM proposer can exercise the grammar-extension API by widening toward the ceilings.
 grammar:
   proposer: subagent
-  rounds: 1
+  rounds: 3
+  start: narrow
+  auto_widen: true          # engine-side floor: if a round's static reply carries no extension, widen to the public ceiling so the practical narrow+deployed path does not starve
   max_complexity: 12
+  max_complexity_ceiling: 12
+  max_add_arity_ceiling: 3

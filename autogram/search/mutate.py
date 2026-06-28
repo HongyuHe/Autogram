@@ -15,7 +15,7 @@ from typing import List, Optional
 from ..dsl import ast as A
 from ..dsl.ast import Add, Agg, Compare, Const, Ref, Rule, Scale
 from ..dsl.grammar import Grammar
-from ..dsl.typecheck import is_admissible
+from ..dsl.typecheck import _base_family, is_admissible
 
 _SCALARS = (0.5, 2.0, -1.0)
 
@@ -134,11 +134,57 @@ def _replace_side(rule: Rule, side: str, new: A.Term) -> Rule:
     return Rule(rule.binder, atom, tag=rule.tag)
 
 
+def _term_ref_roles(term: A.Term) -> set:
+    """All single-column ``Ref`` roles appearing anywhere in ``term``."""
+    if isinstance(term, Ref):
+        return {term.role}
+    if isinstance(term, Scale):
+        return _term_ref_roles(term.term)
+    if isinstance(term, Add):
+        out: set = set()
+        for t in term.terms:
+            out |= _term_ref_roles(t)
+        return out
+    return set()                                        # Agg / Const contribute no Ref role
+
+
+def _separation_neighbour(rule: Rule, G: Grammar, rng: random.Random) -> Optional[Rule]:
+    """Derive a same-family reverse-orientation separation ``a != a_rev`` from ``rule``.
+
+    Reachable from any parent that references a role whose base measurement family has a
+    second enabled member (e.g. ``egress`` -> ``egress != egress_rev``).  This gives the
+    anti-invariant niche an *evolutionary* path in addition to the deterministic
+    :func:`~autogram.dsl.grammar.anti_invariant_seeds`, so recovery survives a grammar
+    extension that introduces a new ``_rev`` family for which no static seed was enumerated.
+    Leakage-free: it only recombines names already in the parent / grammar vocabulary.
+    """
+    if "!=" not in G.ops:
+        return None
+    parent_roles = _term_ref_roles(rule.atom.left) | _term_ref_roles(rule.atom.right)
+    cand_roles = _ref_roles(rule.binder, G)
+    pairs = []
+    for r in parent_roles:
+        base = _base_family(r)
+        for other in cand_roles:
+            if other != r and _base_family(other) == base:
+                pairs.append((r, other))
+    if not pairs:
+        return None
+    a, c = rng.choice(pairs)
+    cand = Rule(rule.binder, Compare(Ref(a), "!=", Ref(c)), tag="sep")
+    ok, _ = is_admissible(cand, G)
+    return cand if ok else None
+
+
 def mutate_rule(rule: Rule, G: Grammar, rng: random.Random, tries: int = 12) -> Optional[Rule]:
     """Return a mutated admissible neighbour of ``rule`` (or ``None``)."""
     for _ in range(tries):
         kind = rng.random()
-        if kind < 0.2:                                  # swap operator
+        if kind < 0.1:                                  # derive a same-family separation
+            cand = _separation_neighbour(rule, G, rng)
+            if cand is None:
+                continue
+        elif kind < 0.25:                               # swap operator
             atom = Compare(rule.atom.left, rng.choice(G.ops), rule.atom.right)
             cand = Rule(rule.binder, atom, tag=rule.tag)
         elif kind < 0.85:                               # mutate one side's subterm

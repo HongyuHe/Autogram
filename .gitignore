@@ -29,11 +29,25 @@ env/
 Thumbs.db
 
 # --- Autogram run artifacts ---
-# Prompts are regenerated on every run/dump-prompt and are disposable.
-# The committed subagent_response_*.json replies are reproducibility inputs and stay tracked.
-artifacts/subagent_prompt_*.txt
-# Timestamped independent-eval run folders are disposable evaluation outputs.
-artifacts/autogram_eval_*/
-# Structured run bundles and traces are regenerable learning outputs.
-artifacts/**/trace.jsonl
-artifacts/**/result.json
+artifacts/
+# # Prompts are regenerated on every run/dump-prompt and are disposable.
+# # The committed subagent_response_*.json replies are reproducibility inputs and stay tracked.
+# artifacts/subagent_prompt_*.txt
+# # Timestamped independent-eval run folders are disposable evaluation outputs.
+# artifacts/autogram_eval_*/
+# # Structured run bundles and traces are regenerable learning outputs.
+# artifacts/trace_*.jsonl
+# artifacts/result_*.json
+# artifacts/bench_*.json
+# artifacts/**/trace.jsonl
+# artifacts/**/result.json
+# # Human-readable learned-rule files (rules/<dataset>_<time>.txt) are regenerable run outputs.
+# rules/
+
+# --- Docs policy ---
+# Keep only the source papers and the curated Abilene/GEANT invariant catalogue in git.
+docs/**
+!docs/
+!docs/crosscheck_paper.pdf
+!docs/netnomos_paper.pdf
+!docs/abilene_geant_invariants.md

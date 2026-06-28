@@ -136,6 +136,7 @@ class NameModel:
     by_name: dict = field(default_factory=dict)          # name -> ColumnSemantics
     low_cols: tuple = ()
     high_cols: tuple = ()
+    adapter: object = None                                # optional SchemaAdapter (Sec. E6)
 
     @classmethod
     def from_columns(cls, columns) -> "NameModel":
@@ -153,6 +154,29 @@ class NameModel:
                 high_cols.append(c)
         return cls(nodes=nodes, by_name=by_name,
                    low_cols=tuple(low_cols), high_cols=tuple(high_cols))
+
+    @classmethod
+    def from_columns_with_adapter(cls, columns, adapter) -> "NameModel":
+        """Build a name model from a compiled :class:`SchemaAdapter` (generalised path).
+
+        Parsing and token inference are delegated to the adapter; the ``low``/``high`` split
+        keys on the adapter's declared ``noisy_kind``/``demand_kind`` so an arbitrary schema's
+        measured-vs-demand columns land in the same buckets the engine already understands.
+        """
+        nodes = adapter.infer_tokens(columns)
+        by_name = {}
+        low_cols, high_cols = [], []
+        for c in columns:
+            sem = adapter.parse_column(c, nodes)
+            if sem is None:
+                continue
+            by_name[c] = sem
+            if sem.kind == adapter.noisy_kind:
+                low_cols.append(c)
+            else:
+                high_cols.append(c)
+        return cls(nodes=nodes, by_name=by_name, low_cols=tuple(low_cols),
+                   high_cols=tuple(high_cols), adapter=adapter)
 
     # -- locality families ---------------------------------------------------
     def resolve_family(self, token: str, type_: str, direction: str) -> tuple:

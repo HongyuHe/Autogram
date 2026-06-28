@@ -35,8 +35,15 @@ class EvalConfig:
     w_tightness: float = 1.0
     w_support: float = 0.5
     w_mdl: float = 0.25
+    w_lift: float = 0.15               # reward name-semantic lift so genuine laws outrank
+    #                                    trivial sign bounds (lift ~1) in the within-cell rank
     subsample: int = 0                 # 0 => use all points; else cap points per rule
     seed: int = 0
+    # Deployment/learning split (Sec. 5.5): when False (default) the gate uses the clean
+    # oracle to measure injected noise exactly; when True the engine is observed-only and
+    # estimates noise analytically from ``rel_noise`` -- no clean frame is ever read.
+    deployed: bool = False
+    rel_noise: float = 0.02            # eta: modelled relative per-cell noise (deployed only)
 
 
 @dataclass
@@ -53,6 +60,9 @@ class SearchConfig:
     assemble_k_max: int = 16           # cap on the assembled portfolio size
     dedup_rel: float = 0.05            # near-duplicate residual-corr threshold
     seed_from_grammar: bool = False    # also inject enumerate_candidates(G) as seeds?
+    anti_seeds: bool = True            # inject the same-family separation niche (a != a_rev)
+    structural_seeds: bool = False     # inject the leakage-free aggregate-equality family
+    #                                    (counter-vs-sum, two-end, totals, balance) + decoys
     bootstrap_random: int = 12         # blind random rules added to the seed pool
     seed: int = 0
 
@@ -65,6 +75,18 @@ class GrammarConfig:
     rounds: int = 1                    # outer grammar-extension rounds
     proposals_per_round: int = 12
     max_complexity: int = 12           # admits the complexity-10 Kirchhoff flow law (I3)
+    # --- adaptive grammar widening (Sec. 10.4 outer loop) ----------------------
+    start: str = "full"                # "full": start at the ceiling vocabulary (default,
+    #                                    unchanged behaviour); "narrow": start restricted and
+    #                                    let the proposer widen G toward the ceiling over rounds
+    max_complexity_ceiling: int = 12   # hard cap a proposed extension may raise complexity to
+    max_add_arity_ceiling: int = 3     # hard cap a proposed extension may raise Add arity to
+    auto_widen: bool = True            # engine-side graceful-degradation widening: when the
+    #                                    proposer supplies no usable extension and G is still
+    #                                    below the ceiling, widen G to the public ceiling so the
+    #                                    outer loop fires even on the static file-backed subagent
+    #                                    path. Inert when start == ceiling (default "full"), so
+    #                                    headline runs are byte-for-byte unchanged.
     seed: int = 0
 
 

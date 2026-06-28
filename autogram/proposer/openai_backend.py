@@ -30,15 +30,18 @@ class OpenAIProposer(Proposer):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.last_notes = ""                          # proposer feedback for the run report
 
     def propose(self, ctx: ProposalContext) -> Proposal:
         if not self.api_key:
-            return Proposal(seeds=[], notes="no OPENAI_API_KEY set; openai backend skipped")
+            self.last_notes = "no OPENAI_API_KEY set; openai backend skipped"
+            return Proposal(seeds=[], notes=self.last_notes)
         prompt = render_proposal_prompt(ctx)          # leakage-checked
         try:
             from openai import OpenAI
         except Exception as exc:  # pragma: no cover - import guard
-            return Proposal(seeds=[], notes=f"openai SDK unavailable: {exc}")
+            self.last_notes = f"openai SDK unavailable: {exc}"
+            return Proposal(seeds=[], notes=self.last_notes)
         client = OpenAI(api_key=self.api_key)
         resp = client.chat.completions.create(
             model=self.model,
@@ -52,6 +55,8 @@ class OpenAIProposer(Proposer):
         )
         text = resp.choices[0].message.content or "{}"
         assert_no_leakage(text, "openai response")     # defensive
-        prop = parse_proposal_json(text, ctx.grammar)
-        prop.notes = f"openai:{self.model} -> {len(prop.seeds)} admissible forms"
+        prop = parse_proposal_json(text, ctx.grammar, ctx.ceiling)
+        detail = f" | {prop.notes}" if prop.notes else ""
+        prop.notes = f"openai:{self.model} -> {len(prop.seeds)} admissible forms{detail}"
+        self.last_notes = prop.notes
         return prop

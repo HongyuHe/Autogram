@@ -2,7 +2,7 @@
 
 Scope: the two sample datasets under `./data/crosscheck-samples/`
 (`abilene_sample_1000.pkl`, `geant_sample_1000.pkl`) — 1000 contiguous snapshots each,
-Abilene (12 nodes) and GÉANT (23 nodes). This file lists **every structural invariant that
+Abilene (12 nodes) and GÉANT (22 nodes). This file lists **every structural invariant that
 is applicable and testable on the columns actually present**, with a reproducible hold-rate
 (the `threshold` column) and a plain-language meaning.
 

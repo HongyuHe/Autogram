@@ -9,6 +9,7 @@ consulted only by the gate, mirroring the deployment/learning split of Sec. 5.5.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 import numpy as np
 
@@ -16,12 +17,26 @@ from ..config import EvalConfig
 from ..loader.loader import Dataset
 from ..dsl import ast as A
 from ..dsl.evaluate import ground
-from ..noise.model import decompose
+from ..noise.model import decompose, decompose_observed
 from .band import fit_band
 from .gate import Verdict, classify
 from .metrics import MDL, mdl, name_blind_lift, tightness, wilson
 
 ACCEPT = {Verdict.EXACT, Verdict.SOFT_STRUCTURAL, Verdict.SOFT, Verdict.ANTI}
+
+
+def lift_info(op: str, lift: float) -> float:
+    """Name-semantic information bonus: clamped natural-log of the name-blind lift.
+
+    A genuine high-lift law (link two-end agreement lift ~190, flow conservation ~200+)
+    should outrank a trivially-true sign bound (lift ~1) that ties it on band/coverage, so
+    the ranker adds ``w_lift * log(lift)``.  The clamp keeps both the exact-zero lift sentinel
+    (``name_blind_lift`` returns null/tr ~1e12 when residuals vanish) and degenerate near-zero
+    lifts bounded.  A disequality (``!=``) carries no band-tightness lift, so it gets none.
+    """
+    if op == "!=":
+        return 0.0
+    return max(-3.0, min(math.log(max(lift, 1e-9)), 6.0))
 
 
 @dataclass
@@ -59,7 +74,11 @@ def evaluate(rule: A.Rule, ds: Dataset, cfg: EvalConfig) -> EvaluationResult:
         return _reject(rule, "degenerate grounding")
 
     bf = fit_band(op, g.rho, g.scale, cfg.target_coverage, cfg.holdout_frac, cfg.seed)
-    nd = decompose(rule, ds.observed, ds.clean, ds.name_model)
+    if cfg.deployed:
+        # Observed-only: never read ds.clean; estimate noise from the rel_noise model.
+        nd = decompose_observed(rule, ds.observed, ds.name_model, cfg.rel_noise)
+    else:
+        nd = decompose(rule, ds.observed, ds.clean, ds.name_model)
     lift = name_blind_lift(rule, ds.observed, ds.name_model, cfg.n_perm, cfg.seed)
 
     resid_over_s = np.abs(g.rho) / g.scale
@@ -76,9 +95,11 @@ def evaluate(rule: A.Rule, ds: Dataset, cfg: EvalConfig) -> EvaluationResult:
     kappa = phat
 
     w = tightness(bf.eps if op != "!=" else 0.0)
+    info = lift_info(op, lift)
     score = (cfg.w_confidence * kappa
              + cfg.w_tightness * w
              + cfg.w_support * g.support
+             + cfg.w_lift * info
              - cfg.w_mdl * dl.total / 100.0)
     if verdict not in ACCEPT:
         score *= 0.1

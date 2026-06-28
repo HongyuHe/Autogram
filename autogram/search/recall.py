@@ -136,10 +136,22 @@ def _matches_form(t: Target, binder: str, kind: str, keys: Set[str]) -> bool:
 
 def score_recall(portfolio: List[EvaluationResult]) -> RecallReport:
     """Match a learned ``portfolio`` against the testable catalogue targets."""
-    fps = [(_rule_fingerprint(r), r) for r in portfolio]
-    rep = RecallReport(n_targets=len(TESTABLE_TARGETS))
+    return score_against(portfolio, TESTABLE_TARGETS, OUT_OF_SCOPE)
 
-    for t in TESTABLE_TARGETS:
+
+def score_against(portfolio: List[EvaluationResult],
+                  targets: Tuple[Target, ...],
+                  out_of_scope: Tuple[Tuple[str, str], ...] = ()) -> RecallReport:
+    """Generic recall scorer: match a portfolio against an arbitrary ``targets`` set.
+
+    Factored out of :func:`score_recall` so a *different* benchmark (e.g. the schema-general
+    second benchmark, which carries its own planted ground truth) can be graded by the very
+    same form-and-strictness matcher without importing the CrossCheck catalogue.
+    """
+    fps = [(_rule_fingerprint(r), r) for r in portfolio]
+    rep = RecallReport(n_targets=len(targets))
+
+    for t in targets:
         full: Optional[EvaluationResult] = None
         partial: Optional[EvaluationResult] = None
         for (binder, kind, keys), r in fps:
@@ -161,7 +173,7 @@ def score_recall(portfolio: List[EvaluationResult]) -> RecallReport:
         else:
             rep.matches.append(Match(t.tid, t.label, "MISSED"))
 
-    for tid, why in OUT_OF_SCOPE:
+    for tid, why in out_of_scope:
         rep.matches.append(Match(tid, why, "OUT_OF_SCOPE",
                                  note="not expressible in the numeric per-point DSL"))
     return rep

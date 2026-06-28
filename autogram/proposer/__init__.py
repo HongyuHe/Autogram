@@ -10,11 +10,11 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from .base import (GrammarExtension, LeakageError, Proposal, ProposalContext, Proposer,
-                   assert_no_leakage, build_context)
+                   SearchFeedback, assert_no_leakage, build_context)
 
 __all__ = [
-    "Proposer", "Proposal", "ProposalContext", "GrammarExtension", "LeakageError",
-    "assert_no_leakage", "build_context", "make_proposer",
+    "Proposer", "Proposal", "ProposalContext", "GrammarExtension", "SearchFeedback",
+    "LeakageError", "assert_no_leakage", "build_context", "make_proposer",
 ]
 
 

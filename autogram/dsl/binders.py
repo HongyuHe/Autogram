@@ -18,6 +18,8 @@ from ..loader.names import NameModel
 
 def enumerate_bindings(binder: str, nm: NameModel) -> List[dict]:
     """Return the list of bindings for ``binder`` over the dataset's locality."""
+    if getattr(nm, "adapter", None) is not None:
+        return nm.adapter.enumerate_bindings(binder, nm)
     if binder == "cell":
         return [{"col": c} for c in (list(nm.low_cols) + list(nm.high_cols))]
     if binder == "node":
@@ -37,6 +39,8 @@ def enumerate_bindings(binder: str, nm: NameModel) -> List[dict]:
 
 def resolve_ref(role: str, binder: str, binding: dict, nm: NameModel) -> Optional[str]:
     """Resolve a single-column ``role`` to a concrete column name (or ``None``)."""
+    if getattr(nm, "adapter", None) is not None:
+        return nm.adapter.resolve_ref(role, binder, binding, nm)
     if binder == "cell":
         return binding["col"] if role == "self" else None
     if binder == "node":
@@ -64,6 +68,8 @@ def resolve_ref(role: str, binder: str, binding: dict, nm: NameModel) -> Optiona
 
 def resolve_family(family_role: str, binder: str, binding: dict, nm: NameModel) -> tuple:
     """Resolve a family ``role`` to a tuple of concrete column names."""
+    if getattr(nm, "adapter", None) is not None:
+        return nm.adapter.resolve_family(family_role, binder, binding, nm)
     if binder == "node":
         x = binding["X"]
         if family_role == "demand_row":
