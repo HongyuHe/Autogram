@@ -22,10 +22,10 @@ import numpy as np
 @dataclass
 class Vocab:
     """The token spellings used to name columns (everything the inducer must discover)."""
-    meas: str = "meas"
+    measurement: str = "measurement"
     demand: str = "flow"
-    src: str = "src"
-    dst: str = "dst"
+    source: str = "source"
+    destination: str = "destination"
     to: str = "to"
     frm: str = "from"
     entity_prefix: str = "n"
@@ -46,19 +46,25 @@ class Synthetic:
 
 def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0.0,
                    seed: int = 0, vocab: Vocab = None, unstable_frac: float = 0.0,
-                   families=None, regime_factor: float = 1.6) -> Synthetic:
+                   families=None, regime_factor: float = 1.6,
+                   offset_hold_rate: float = 0.67, offset_factor: float = 0.98,
+                   presence_rate: float = 0.6) -> Synthetic:
     """Generate a dataset with planted invariants and ``noise`` relative Gaussian noise.
 
-    Planted (clean) relationships (all enabled by default; validation may enable one family
-    at a time so recovery cannot be dominated by the easiest relation):
+    Planted (clean) relationships (the default core set includes row/column sums, two-end
+    agreement, self-zero, and agg+ref balance; validation may enable one family at a time
+    so recovery cannot be dominated by the easiest relation):
 
     * ``flow_i_i == 0``                         (zero self-demand)
-    * ``meas_i_src ~= sum_{j!=i} flow_i_j``     (origination = demand row sum)
-    * ``meas_i_dst ~= sum_{j!=i} flow_j_i``     (termination = demand column sum)
-    * ``meas_i_to_j == meas_j_from_i``          (directed two-end agreement)
+    * ``measurement_i_source ~= sum_{j!=i} flow_i_j``     (origination = demand row sum)
+    * ``measurement_i_destination ~= sum_{j!=i} flow_j_i``     (termination = demand column sum)
+    * ``measurement_i_to_j == measurement_j_from_i``          (directed two-end agreement)
+    * ``measurement_i_to_j ~= measurement_j_from_i``          (systematic-offset approximate pair)
+    * ``exists(measurement_i_to_j) <=> exists(measurement_j_from_i)`` (presence pairing)
+    * ``measurement_i_source + sum_j flow_j_i == measurement_i_destination + sum_j flow_i_j`` (agg+ref balance)
     * every column ``>= 0``                     (non-negativity)
 
-    ``noise`` is applied to the measured (``meas_*``) columns only; the demand matrix stays
+    ``noise`` is applied to the measured (``measurement_*``) columns only; the demand matrix stays
     clean.  The engine never sees ``noise``; the self-calibrated band must track it.
 
     ``unstable_frac`` (in [0, 1)) plants a *regime/overfit* trap used only by the drop-stability
@@ -66,13 +72,13 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
     ``1 - unstable_frac`` of snapshots and then shifts to a different linear regime (the
     ``from_*`` side is scaled by ``regime_factor``) for the final ``unstable_frac``.  Because
     agreement still holds on the majority of rows, the pooled median residual stays small -- so
-    the rule keeps a high name-permutation lift and ample support -- yet its coverage at the
+    the pooled residual can still look strong, yet its coverage at the
     rule's own tight tolerance collapses on the late time block, so it is admissible by every
     test *except* stability.  The demand row/column sums are untouched, so the genuinely stable
     invariants are unaffected.
     """
     vocab = vocab or Vocab()
-    enabled = set(families or ("row_sum", "col_sum", "two_end", "self_zero"))
+    enabled = set(families or ("row_sum", "col_sum", "two_end", "self_zero", "agg_ref_balance"))
     rng = np.random.default_rng(seed)
     T, N = n_snapshots, n_entities
     ents = [vocab.entity(i) for i in range(N)]
@@ -88,13 +94,24 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
     for i in range(N):
         D_off[:, i, i] = 0.0
 
-    # directed link value L[t, i, j] (i -> j); two-end agreement ties to_ij == from_ji.
-    # ``Lfrm`` carries the from-side; with ``unstable_frac`` it shifts regime on the late block.
+    # directed link value L[t, i, j] (i -> j).  The reverse-named side is varied by family:
+    # exact equality, systematic multiplicative offset, shared presence mask, or independence.
     L = rng.gamma(shape=2.0, scale=8.0, size=(T, N, N))
     for i in range(N):
         L[:, i, i] = 0.0
     if "two_end" in enabled:
         Lfrm = L.copy()
+    elif "offset_pair" in enabled:
+        Lfrm = L.copy()
+        n_clean = int(round(min(max(offset_hold_rate, 0.0), 1.0) * T))
+        if n_clean < T:
+            Lfrm[n_clean:, :, :] = L[n_clean:, :, :] * offset_factor
+    elif "presence_pair" in enabled:
+        mask = rng.random((T, N, N)) < min(max(presence_rate, 0.0), 1.0)
+        for i in range(N):
+            mask[:, i, i] = False
+        L = L * mask
+        Lfrm = rng.gamma(shape=2.0, scale=8.0, size=(T, N, N)) * mask
     else:
         Lfrm = rng.gamma(shape=2.0, scale=8.0, size=(T, N, N))
         for i in range(N):
@@ -117,28 +134,36 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
             add(f"{vocab.demand}_{ents[i]}_{ents[j]}", D[:, i, j])
 
     # single-entity measured columns: origination / termination (row/col sums)
-    orig = (D_off.sum(axis=2) if "row_sum" in enabled
-            else rng.gamma(shape=2.0, scale=10.0, size=(T, N)))
-    term = (D_off.sum(axis=1) if "col_sum" in enabled
-            else rng.gamma(shape=2.0, scale=10.0, size=(T, N)))
+    row_totals = D_off.sum(axis=2)
+    col_totals = D_off.sum(axis=1)
+    if "agg_ref_balance" in enabled:
+        bias = rng.gamma(shape=2.0, scale=10.0, size=(T, N))
+        shared_offset = 0.0 if ("row_sum" in enabled or "col_sum" in enabled) else bias
+        orig = row_totals + shared_offset
+        term = col_totals + shared_offset
+    else:
+        orig = (row_totals if "row_sum" in enabled
+                else rng.gamma(shape=2.0, scale=10.0, size=(T, N)))
+        term = (col_totals if "col_sum" in enabled
+                else rng.gamma(shape=2.0, scale=10.0, size=(T, N)))
     for i in range(N):
-        add(f"{vocab.meas}_{ents[i]}_{vocab.src}", orig[:, i])
-        add(f"{vocab.meas}_{ents[i]}_{vocab.dst}", term[:, i])
+        add(f"{vocab.measurement}_{ents[i]}_{vocab.source}", orig[:, i])
+        add(f"{vocab.measurement}_{ents[i]}_{vocab.destination}", term[:, i])
 
     # directed measured columns: to_ij and from_ji share the same value (unless destabilised)
     for i in range(N):
         for j in range(N):
             if i == j:
                 continue
-            add(f"{vocab.meas}_{ents[i]}_{vocab.to}_{ents[j]}", L[:, i, j])
-            add(f"{vocab.meas}_{ents[j]}_{vocab.frm}_{ents[i]}", Lfrm[:, i, j])
+            add(f"{vocab.measurement}_{ents[i]}_{vocab.to}_{ents[j]}", L[:, i, j])
+            add(f"{vocab.measurement}_{ents[j]}_{vocab.frm}_{ents[i]}", Lfrm[:, i, j])
 
     matrix = np.hstack(blocks)
 
     # apply relative noise to measured columns only (demand stays clean)
     if noise > 0:
         for k, name in enumerate(cols):
-            if name.startswith(vocab.meas + "_"):
+            if name.startswith(vocab.measurement + "_"):
                 matrix[:, k] = matrix[:, k] * (1.0 + noise * rng.standard_normal(T))
         matrix = np.maximum(matrix, 0.0)
 
@@ -170,14 +195,14 @@ def make_null(n_entities: int = 6, n_snapshots: int = 400, seed: int = 0,
         for j in range(N):
             add(f"{vocab.demand}_{ents[i]}_{ents[j]}")
     for i in range(N):
-        add(f"{vocab.meas}_{ents[i]}_{vocab.src}")
-        add(f"{vocab.meas}_{ents[i]}_{vocab.dst}")
+        add(f"{vocab.measurement}_{ents[i]}_{vocab.source}")
+        add(f"{vocab.measurement}_{ents[i]}_{vocab.destination}")
     for i in range(N):
         for j in range(N):
             if i == j:
                 continue
-            add(f"{vocab.meas}_{ents[i]}_{vocab.to}_{ents[j]}")
-            add(f"{vocab.meas}_{ents[j]}_{vocab.frm}_{ents[i]}")
+            add(f"{vocab.measurement}_{ents[i]}_{vocab.to}_{ents[j]}")
+            add(f"{vocab.measurement}_{ents[j]}_{vocab.frm}_{ents[i]}")
     matrix = np.hstack(blocks)
     ts = np.arange(T)
     return Synthetic(columns=cols, matrix=matrix, timestamps=ts, vocab=vocab,
@@ -186,6 +211,7 @@ def make_null(n_entities: int = 6, n_snapshots: int = 400, seed: int = 0,
 
 def _planted(vocab: Vocab, ents, N) -> Dict[str, object]:
     two_end = set()
+    agg_ref_balance = []
     self_zero = []
     row_sum = []
     col_sum = []
@@ -193,12 +219,23 @@ def _planted(vocab: Vocab, ents, N) -> Dict[str, object]:
         self_zero.append(f"{vocab.demand}_{ents[i]}_{ents[i]}")
         row = frozenset(f"{vocab.demand}_{ents[i]}_{ents[j]}" for j in range(N) if j != i)
         col = frozenset(f"{vocab.demand}_{ents[j]}_{ents[i]}" for j in range(N) if j != i)
-        row_sum.append((f"{vocab.meas}_{ents[i]}_{vocab.src}", row))
-        col_sum.append((f"{vocab.meas}_{ents[i]}_{vocab.dst}", col))
+        row_sum.append((f"{vocab.measurement}_{ents[i]}_{vocab.source}", row))
+        col_sum.append((f"{vocab.measurement}_{ents[i]}_{vocab.destination}", col))
+        agg_ref_balance.append(frozenset({
+            (f"{vocab.measurement}_{ents[i]}_{vocab.source}", col),
+            (f"{vocab.measurement}_{ents[i]}_{vocab.destination}", row),
+        }))
         for j in range(N):
             if i == j:
                 continue
-            two_end.add(frozenset({f"{vocab.meas}_{ents[i]}_{vocab.to}_{ents[j]}",
-                                   f"{vocab.meas}_{ents[j]}_{vocab.frm}_{ents[i]}"}))
-    return {"two_end": two_end, "self_zero": self_zero,
-            "row_sum": row_sum, "col_sum": col_sum}
+            two_end.add(frozenset({f"{vocab.measurement}_{ents[i]}_{vocab.to}_{ents[j]}",
+                                   f"{vocab.measurement}_{ents[j]}_{vocab.frm}_{ents[i]}"}))
+    return {
+        "two_end": two_end,
+        "offset_pair": two_end,
+        "presence_pair": two_end,
+        "self_zero": self_zero,
+        "row_sum": row_sum,
+        "col_sum": col_sum,
+        "agg_ref_balance": agg_ref_balance,
+    }

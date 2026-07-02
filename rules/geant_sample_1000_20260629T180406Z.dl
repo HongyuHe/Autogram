@@ -1,0 +1,17 @@
+[forall cell] self >= 0                                          # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] 0 ~= demand_self                                   # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.510
+[forall node] m_origination + SUM(fam_ingress_from) ~= m_termination + SUM(fam_egress_to) # SOFT       eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+4.905
+[forall node] m_origination >= 0                                 # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall node] m_termination >= 0                                 # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall network] SUM(all_m_origination) ~= SUM(all_m_termination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+5.117
+[forall node] m_origination <|> m_termination              # EXISTENCE  eps=1e-09 hold=0.979[0.98,0.98] supp=1.00 mdl=+29.297
+[forall network] SUM(all_demand) ~= SUM(all_m_origination)       # LOOSE      eps=0.05 hold=0.965[0.95,0.97] supp=1.00 mdl=+4.032
+[forall network] SUM(all_demand) ~= SUM(all_m_termination)       # LOOSE      eps=0.05 hold=0.944[0.93,0.96] supp=1.00 mdl=+4.034
+
+# Autogram discovered invariants (observed data only; no catalogue, no oracle)
+# dataset    : geant_sample_1000
+# run time   : 2026-06-29T18:04:06Z (UTC)
+# git        : 4bcbeee
+# proposer   : enumeration  seed=0  rounds=1
+# statistic  : hold-rate with Wilson confidence interval; MDL is tie-break only
+# portfolio  : 9 invariant(s)

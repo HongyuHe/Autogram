@@ -70,7 +70,7 @@ def test_self_demand_grounds_to_zero(dataset):
 
 
 def test_two_end_agreement_residual_small(dataset):
-    # meas_X_to_Y == meas_Y_from_X  ==  o1 ~= o0_rev (clean on planted structure, ~noise observed)
+    # measurement_X_to_Y == measurement_Y_from_X  ==  o1 ~= o0_rev (clean on planted structure, ~noise observed)
     r = _rule("link", A.Ref("o1"), "~=", A.Ref("o0_rev"))
     g = ground(r, dataset.observed, dataset.name_model)
     res = np.abs(rel_residual(g))

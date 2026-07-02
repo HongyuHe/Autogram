@@ -1,39 +1,18 @@
-# P3 invariant-learner config -- Abilene (CrossCheck 1000-snapshot sample).
-# Every knob the engine exposes is grouped by the loop level that owns it (design Sec. 10.4).
+# Autogram v2 config -- Abilene CrossCheck observed sample.
 dataset: abilene
 data_path: data/crosscheck-samples/abilene_sample_1000.pkl
 seed: 0
 
-# Inner loop -- production-style learning must be observed-only: the hidden clean frame is only an evaluation/debug oracle and is not available in practice.
+schema:
+  backend: subagent   # allowed: subagent, openai
+
 eval:
-  deployed: true           # never read ds.clean during normal learning; estimate propagated noise from rel_noise instead
-  rel_noise: 0.02          # eta: assumed relative noise level for noisy low-level cells in deployed mode
-  target_coverage: 0.90   # coverage the band is fit to hit
-  holdout_frac: 0.5       # split-conformal calibration/eval split
-  gate_k: 6.0             # noise gate: |bias|/scale must exceed gate_k * sigma_prop
-  eps_exact: 0.01         # band <= this => reported EXACT
-  eps_max: 0.15           # band > this with no structure => reject
-  lift_min: 2.0           # min name-semantic lift vs a name-blind null
+  tolerance: 0.05
+  separation_tolerance: 0.000001
+  hold_rate_threshold: 0.62
+  ci_alpha: 0.05
 
-# Middle loop -- MAP-Elites + islands evolutionary rule-set search.
 search:
-  iterations: 150
-  islands: 4
-  migration_every: 25
-  thompson: true
-  seed_from_grammar: false  # the scripted proposer is the explicit grammar-seed source
-  anti_seeds: true          # deterministically seed the same-family separation niche (I9)
-  structural_seeds: true    # deterministically seed the leakage-free aggregate-equality family (I4-I8 forms) once the grammar widens; decoy-rich, data-gated, never reads the catalog
-  bootstrap_random: 12
-  assemble_k_max: 16
-  dedup_rel: 0.05
-
-# Outer loop -- start restricted and use multiple rounds so the LLM proposer can exercise the grammar-extension API by widening toward the ceilings.
-grammar:
-  proposer: subagent        # scripted | openai | subagent
-  rounds: 3                 # round 1 proposes within the narrow grammar; later rounds receive search feedback and may return an "extension"
-  start: narrow             # makes link/network roles unreachable until the proposer widens the grammar
-  auto_widen: true          # engine-side floor: if a round's static reply carries no extension, widen to the public ceiling so the practical narrow+deployed path does not starve
-  max_complexity: 12        # full-start cap; retained for compatibility when start is "full"
-  max_complexity_ceiling: 12 # hard cap for LLM-proposed grammar widening
-  max_add_arity_ceiling: 3  # hard cap for LLM-proposed Add arity widening
+  proposer: enumeration
+  max_complexity: 10
+  max_add_arity: 2

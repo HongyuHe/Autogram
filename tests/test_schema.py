@@ -13,7 +13,7 @@ from autogram.schema.spec import CellCodec, ColumnPattern, RoleOntology, SchemaS
 def test_induced_spec_compiles(adapter):
     # the session adapter is a compiled induced spec; it exposes the induced ontology
     assert "link" in adapter.binders and "node" in adapter.binders
-    assert adapter.noisy_kind == "meas" and adapter.demand_kind == "demand"
+    assert adapter.noisy_kind == "measurement" and adapter.demand_kind == "flow"
 
 
 def test_compiler_round_trip():
@@ -50,7 +50,7 @@ def test_compiler_rejects_bad_regex():
     onto = RoleOntology(binders=("cell",), ref_roles={"cell": ("self",)}, fam_roles={"cell": ()})
     bad = SchemaSpec(
         name="bad",
-        patterns=(ColumnPattern(name="x", matcher="regex", kind="meas",
+        patterns=(ColumnPattern(name="x", matcher="regex", kind="measurement",
                                 direction="o", regex=r"(?P<n>.+"),),
         ontology=onto, ref_templates=(), family_selectors=(),
         binder_enumerate={"cell": "per_measured_col"}, cell_codec=CellCodec(kind="scalar"))

@@ -1,0 +1,51 @@
+[forall cell] self >= 0                                          # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] o0 != o0_rev                                       # SEPARATION eps=1e-06 hold=1.000[1.00,1.00] supp=1.00 mdl=+9.987
+[forall link] o1 != o1_rev                                       # SEPARATION eps=1e-06 hold=1.000[1.00,1.00] supp=1.00 mdl=+9.986
+[forall link] demand >= 0                                        # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] demand_rev >= 0                                    # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] o0 >= 0                                            # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] o0_rev >= 0                                        # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] o1 >= 0                                            # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] o1_rev >= 0                                        # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall node] 0 ~= demand_self                                   # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.510
+[forall node] m_origination + SUM(fam_ingress_from) ~= m_termination + SUM(fam_egress_to) # SOFT       eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+4.871
+[forall node] m_origination >= 0                                 # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall node] m_termination >= 0                                 # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] demand != demand_rev                               # SEPARATION eps=1e-06 hold=0.999[1.00,1.00] supp=1.00 mdl=+9.794
+[forall network] SUM(all_m_origination) ~= SUM(all_m_termination) # LOOSE      eps=0.05 hold=0.999[0.99,1.00] supp=1.00 mdl=+5.003
+[forall link] demand <|> o0                                # EXISTENCE  eps=1e-09 hold=0.983[0.98,0.98] supp=1.00 mdl=+29.297
+[forall link] demand <|> o1_rev                            # EXISTENCE  eps=1e-09 hold=0.983[0.98,0.98] supp=1.00 mdl=+29.297
+[forall link] demand_rev <|> o0_rev                        # EXISTENCE  eps=1e-09 hold=0.983[0.98,0.98] supp=1.00 mdl=+29.297
+[forall link] demand_rev <|> o1                            # EXISTENCE  eps=1e-09 hold=0.983[0.98,0.98] supp=1.00 mdl=+29.297
+[forall link] o0 <|> o0_rev                                # EXISTENCE  eps=1e-09 hold=0.973[0.97,0.98] supp=1.00 mdl=+29.297
+[forall link] o0 <|> o1                                    # EXISTENCE  eps=1e-09 hold=0.973[0.97,0.98] supp=1.00 mdl=+29.297
+[forall link] o0_rev <|> o1_rev                            # EXISTENCE  eps=1e-09 hold=0.973[0.97,0.98] supp=1.00 mdl=+29.297
+[forall link] o1 <|> o1_rev                                # EXISTENCE  eps=1e-09 hold=0.973[0.97,0.98] supp=1.00 mdl=+29.297
+[forall link] o0 + o0_rev ~= o1 + o1_rev                         # LOOSE      eps=0.05 hold=0.972[0.97,0.97] supp=1.00 mdl=+4.990
+[forall link] o0 + o1 ~= o0_rev + o1_rev                         # LOOSE      eps=0.05 hold=0.972[0.97,0.97] supp=1.00 mdl=+5.051
+[forall node] m_origination <|> m_termination              # EXISTENCE  eps=1e-09 hold=0.969[0.97,0.97] supp=1.00 mdl=+29.297
+[forall link] o0 ~= o1_rev                                       # LOOSE      eps=0.05 hold=0.961[0.96,0.96] supp=1.00 mdl=+5.695
+[forall link] o0_rev ~= o1                                       # LOOSE      eps=0.05 hold=0.961[0.96,0.96] supp=1.00 mdl=+5.695
+[forall link] demand <|> o0_rev                            # EXISTENCE  eps=1e-09 hold=0.957[0.95,0.96] supp=1.00 mdl=+29.297
+[forall link] demand <|> o1                                # EXISTENCE  eps=1e-09 hold=0.957[0.95,0.96] supp=1.00 mdl=+29.297
+[forall link] demand_rev <|> o0                            # EXISTENCE  eps=1e-09 hold=0.957[0.95,0.96] supp=1.00 mdl=+29.297
+[forall link] demand_rev <|> o1_rev                        # EXISTENCE  eps=1e-09 hold=0.957[0.95,0.96] supp=1.00 mdl=+29.297
+[forall link] demand <|> demand_rev                        # EXISTENCE  eps=1e-09 hold=0.941[0.94,0.94] supp=1.00 mdl=+29.297
+[forall network] SUM(all_demand) ~= SUM(all_m_termination)       # LOOSE      eps=0.05 hold=0.933[0.92,0.95] supp=1.00 mdl=+3.983
+[forall network] SUM(all_demand) ~= SUM(all_m_origination)       # LOOSE      eps=0.05 hold=0.929[0.91,0.94] supp=1.00 mdl=+4.011
+[forall node] m_origination + SUM(demand_col) ~= m_termination + SUM(demand_row) # LOOSE      eps=0.05 hold=0.807[0.80,0.81] supp=1.00 mdl=+3.353
+[forall node] SUM(demand_col) + SUM(demand_row) ~= m_origination + m_termination # LOOSE      eps=0.05 hold=0.736[0.73,0.74] supp=1.00 mdl=+3.254
+[forall node] SUM(demand_row) ~= m_origination                   # LOOSE      eps=0.05 hold=0.662[0.65,0.67] supp=1.00 mdl=+3.858
+[forall node] demand_self + SUM(demand_row) ~= m_origination     # LOOSE      eps=0.05 hold=0.662[0.65,0.67] supp=1.00 mdl=+3.558
+[forall node] SUM(demand_row) ~= demand_self + m_origination     # LOOSE      eps=0.05 hold=0.662[0.65,0.67] supp=1.00 mdl=+3.558
+[forall node] SUM(demand_col) ~= m_termination                   # LOOSE      eps=0.05 hold=0.658[0.65,0.67] supp=1.00 mdl=+3.862
+[forall node] demand_self + SUM(demand_col) ~= m_termination     # LOOSE      eps=0.05 hold=0.658[0.65,0.67] supp=1.00 mdl=+3.562
+[forall node] SUM(demand_col) ~= demand_self + m_termination     # LOOSE      eps=0.05 hold=0.658[0.65,0.67] supp=1.00 mdl=+3.562
+
+# Autogram discovered invariants (observed data only; no catalogue, no oracle)
+# dataset    : abilene_sample_1000
+# run time   : 2026-06-29T05:04:58Z (UTC)
+# git        : 4bcbeee
+# proposer   : enumeration  seed=0  rounds=1
+# statistic  : hold-rate with Wilson confidence interval; MDL is tie-break only
+# portfolio  : 43 invariant(s)

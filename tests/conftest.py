@@ -1,8 +1,7 @@
 """Shared fixtures for the discovery test-suite.
 
-Everything is synthetic and offline: a small dataset with structured names + planted invariants,
-its induced schema adapter, the derived grammar, and a built :class:`Dataset`.  No CrossCheck
-data, no oracle, no network.
+The data is synthetic, but schema induction still goes through the real subagent backend.  No
+CrossCheck data, clean oracle, or target-rule catalogue reaches the engine.
 """
 
 from __future__ import annotations
@@ -11,9 +10,23 @@ import pytest
 
 from autogram.config import DiscoveryConfig, SearchConfig
 from autogram.discovery import synth
-from autogram.discovery.induce import HeuristicInducer, induce_adapter
+from autogram.discovery.induce import induce_adapter
 from autogram.dsl.grammar import grammar_from_adapter
 from autogram.loader.loader import build_dataset
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _cache_real_subagent_replies():
+    """Keep tests tractable while each unique schema prompt is still parsed by the real subagent."""
+    import os
+
+    old = os.environ.get("AUTOGRAM_SUBAGENT_CACHE")
+    os.environ["AUTOGRAM_SUBAGENT_CACHE"] = "1"
+    yield
+    if old is None:
+        os.environ.pop("AUTOGRAM_SUBAGENT_CACHE", None)
+    else:
+        os.environ["AUTOGRAM_SUBAGENT_CACHE"] = old
 
 
 @pytest.fixture(scope="session")
@@ -38,5 +51,5 @@ def dataset(data, adapter):
 
 @pytest.fixture
 def small_cfgs():
-    return (DiscoveryConfig(n_perm=8, seed=0),
-            SearchConfig(rounds=4, proposals_per_round=80, seed=0))
+    return (DiscoveryConfig(seed=0, hold_rate_threshold=0.9),
+            SearchConfig(seed=0, max_complexity=8))

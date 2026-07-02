@@ -30,8 +30,8 @@ class ColumnSemantics:
     kind: str                      # measurement layer / entity-kind token
     direction: str                 # relation/direction token (e.g. egress, demand, ...)
     nodes: tuple                   # entity tokens this column touches (ordered)
-    src: Optional[str] = None      # relation source / local entity
-    dst: Optional[str] = None      # relation destination
+    source: Optional[str] = None      # relation source / local entity
+    destination: Optional[str] = None      # relation destination
     peer: Optional[str] = None     # neighbour entity
 
     @property
@@ -40,7 +40,7 @@ class ColumnSemantics:
 
         All measured quantities share one comparable dimension here, so the role string is a
         single ``"volume"`` group; the ``kind``/``direction`` carry the interpretable
-        structure (and seed the name-permutation null), but do not block cross-kind
+        structure (for reporting), but do not block cross-kind
         comparison.
         """
         return "volume"

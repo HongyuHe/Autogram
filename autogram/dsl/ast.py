@@ -18,6 +18,7 @@ Surface syntax (ASCII):
     ~=   approximate-equality within a fitted band
     ==   exact equality
     <=, >=, !=   ordering / disequality
+    <|>    bidirectional structural presence
     *    scalar multiply
     SUM/MIN/MAX/AVG(role)   family aggregation
 """
@@ -28,7 +29,7 @@ from dataclasses import dataclass
 from typing import Tuple, Union
 
 # Operator and aggregation vocabularies are intrinsic to the DSL (not dataset-specific).
-OPS = ("~=", "==", "<=", ">=", "!=")
+OPS = ("~=", "==", "<=", ">=", "!=", "<|>")
 AGG_KINDS = ("SUM", "MIN", "MAX", "AVG")
 
 

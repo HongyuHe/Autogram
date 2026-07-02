@@ -15,11 +15,12 @@ dependencies = [
     "pandas>=3.0.3",
     "seaborn>=0.13.2",
     "pyyaml>=6.0",
+    "z3-solver>=4.16.0.0",
 ]
 
 [project.optional-dependencies]
-# Only needed for the OpenAI proposer backend: `uv sync --extra openai`.
-# The scripted and subagent backends run with no network and no extra.
+# Only needed for the OpenAI schema backend: `uv sync --extra openai`.
+# The mandatory subagent backend invokes an authenticated Copilot CLI transport.
 openai = ["openai>=1.40"]
 
 [project.scripts]
@@ -28,9 +29,9 @@ openai = ["openai>=1.40"]
 autogram = "autogram.cli:main"
 
 [dependency-groups]
-# Installed by default with `uv sync`; the offline, mockable test suite.
-# `openai` is included here (not just as a runtime extra) so the shipped tests can
-# exercise the OpenAI backend through a monkeypatched SDK -- no network or key is used.
+# Installed by default with `uv sync`; tests exercise the real subagent path by default.
+# `openai` is included here (not just as a runtime extra) so responder-injected OpenAI
+# coverage can run without requiring an API key.
 dev = [
     "pytest>=8.0",
     "openai>=1.40",

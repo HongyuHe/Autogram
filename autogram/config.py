@@ -1,49 +1,39 @@
-"""Configuration for the open-ended discovery engine.
-
-Every quantity that used to bake in a dataset assumption is gone.  There is no declared noise
-scale ``eta``, no target coverage ``kappa*``, no ``gate_k`` / ``eps_exact`` / ``eps_max`` /
-``lift_min``, and no fixed stability/support cut-off.  What remains are statistical protocol
-choices (permutation count, significance level, split counts) and search-budget knobs -- never
-thresholds tuned to a particular dataset's structure.
-
-The band's operating coverage and tolerance are read off each rule's own residual distribution
-(:func:`autogram.evaluator.band.fit_band_auto`); acceptance is a self-calibrated comparison
-against the name-permutation null plus cross-split / temporal stability.
-"""
+"""Configuration for the guarantees-first discovery engine."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 
+DEFAULT_MAX_COMPLEXITY = 10
+DEFAULT_MAX_ADD_ARITY = 2
+
+
 @dataclass
 class DiscoveryConfig:
-    """Data-only evaluator + acceptance knobs (statistical levels, not tuned constants)."""
+    """Logic + hold-rate evaluation knobs.
 
-    holdout_frac: float = 0.5       # split-conformal calibration/eval split (generic)
-    n_perm: int = 24                # permutations for the name-permutation null
-    n_splits: int = 4               # disjoint cross-splits for stability
-    n_time_blocks: int = 3          # contiguous time blocks for temporal stability
-    alpha: float = 0.05             # significance level for the lift percentile / FDR control
-    require_lift: bool = True       # ablation seam: disable only to measure lift/null necessity
-    require_null_support: bool = True  # ablation seam: disable with lift to count pre-null admits
-    require_stability: bool = True  # ablation seam: disable only to measure stability necessity
-    require_parsimony: bool = True  # ablation seam: disable only for pre-MDL lift ablations
-    subsample: int = 0              # 0 => use all points; else cap residual points per rule
+    The evaluator has one statistic: empirical hold-rate with a Wilson confidence interval.
+    Z3 handles logical truth, equivalence and subsumption; MDL is only a final tie-breaker.
+    """
+
+    tolerance: float = 0.05             # dimensionless epsilon for ~=, ==, <=, >=
+    separation_tolerance: float = 1e-6  # minimum relative gap for != separations
+    presence_tolerance: float = 1e-9    # relative non-zero cutoff for <|> pairings
+    hold_rate_threshold: float = 0.62   # Wilson lower bound required for approximate-law acceptance
+    ci_alpha: float = 0.05              # Wilson interval confidence level
+    subsample: int = 0                  # 0 => use every grounded point
     seed: int = 0
 
 
 @dataclass
 class SearchConfig:
-    """Discovery loop (proposer + Pareto archive) budget knobs."""
+    """Bounded enumeration controls."""
 
-    rounds: int = 6                 # outer rounds (own-elite progress checked each round)
-    proposals_per_round: int = 120  # candidate rules proposed per round
-    p_mutate: float = 0.7           # fraction of proposals from mutation vs fresh random
-    proposer: str = "random"        # random (offline) or portfolio (LLM + random)
-    max_complexity: int = 12
-    max_add_arity: int = 3
-    stall_patience: int = 2         # rounds without Pareto progress before re-inducing schema
+    proposer: str = "enumeration"
+    max_complexity: int = DEFAULT_MAX_COMPLEXITY
+    max_add_arity: int = DEFAULT_MAX_ADD_ARITY
+    max_rules: int = 0                  # 0 => exhaust the bounded grammar
     seed: int = 0
 
 

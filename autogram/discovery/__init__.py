@@ -1,26 +1,34 @@
-"""Open-ended invariant discovery package.
+"""Guarantees-first invariant discovery package."""
 
-This is the redesigned engine: schema induction from column names, an LLM/random proposer
-inside the induced schema, a data-only evaluator, a simple Pareto archive, and a discovery loop
-whose only judge is the data.  Nothing here reads a clean oracle, a known-invariant catalogue,
-or a pre-tuned constant.
-"""
-
-from .induce import HeuristicInducer, SchemaInducer, induce_adapter, induce_spec
+from .induce import (
+    OpenAISchemaInducer,
+    SchemaInducer,
+    SubagentSchemaInducer,
+    available_inducer_backends,
+    induce_adapter,
+    induce_spec,
+    make_inducer,
+)
 from .evaluate import DataOnlyEvaluator, Evaluation
 from .archive import ParetoArchive
-from .loop import DiscoveryResult, discover
+from .loop import DiscoveryResult, discover, discover_dataframe
+from .subagent import AutogramSubagentRunner
 from . import synth, validate
 
 __all__ = [
     "SchemaInducer",
-    "HeuristicInducer",
+    "SubagentSchemaInducer",
+    "OpenAISchemaInducer",
+    "AutogramSubagentRunner",
+    "available_inducer_backends",
+    "make_inducer",
     "induce_spec",
     "induce_adapter",
     "DataOnlyEvaluator",
     "Evaluation",
     "ParetoArchive",
     "discover",
+    "discover_dataframe",
     "DiscoveryResult",
     "synth",
     "validate",

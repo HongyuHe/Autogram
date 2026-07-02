@@ -1,0 +1,36 @@
+[forall cell] self >= 0                                          # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] demand != demand_rev                               # SEPARATION eps=1e-06 hold=1.000[1.00,1.00] supp=1.00 mdl=+9.843
+[forall link] o1 != o1_rev                                       # SEPARATION eps=1e-06 hold=1.000[1.00,1.00] supp=1.00 mdl=+9.842
+[forall link] o0 != o0_rev                                       # SEPARATION eps=1e-06 hold=1.000[1.00,1.00] supp=1.00 mdl=+9.842
+[forall link] demand >= 0                                        # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] demand_rev >= 0                                    # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] o0 >= 0                                            # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] o0_rev >= 0                                        # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] o1 >= 0                                            # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall link] o1_rev >= 0                                        # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall node] 0 ~= demand_self                                   # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.510
+[forall node] m_dst >= 0                                         # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall node] m_src >= 0                                         # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall node] m_dst + SUM(demand_row) ~= m_src + SUM(demand_col) # LOOSE      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+4.018
+[forall node] SUM(demand_col) + SUM(demand_row) ~= m_dst + m_src # LOOSE      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+3.992
+[forall network] SUM(all_demand) ~= SUM(all_m_src)               # SOFT       eps=0.05 hold=1.000[0.99,1.00] supp=1.00 mdl=+4.986
+[forall network] SUM(all_demand) ~= SUM(all_m_dst)               # SOFT       eps=0.05 hold=1.000[0.99,1.00] supp=1.00 mdl=+4.943
+[forall network] SUM(all_m_dst) ~= SUM(all_m_src)                # SOFT       eps=0.05 hold=1.000[0.99,1.00] supp=1.00 mdl=+4.762
+[forall node] SUM(demand_row) ~= m_src                           # LOOSE      eps=0.05 hold=0.991[0.99,0.99] supp=1.00 mdl=+4.500
+[forall node] demand_self + SUM(demand_row) ~= m_src             # LOOSE      eps=0.05 hold=0.991[0.99,0.99] supp=1.00 mdl=+4.200
+[forall node] SUM(demand_row) ~= demand_self + m_src             # LOOSE      eps=0.05 hold=0.991[0.99,0.99] supp=1.00 mdl=+4.200
+[forall node] SUM(demand_col) ~= m_dst                           # LOOSE      eps=0.05 hold=0.989[0.98,0.99] supp=1.00 mdl=+4.492
+[forall node] demand_self + SUM(demand_col) ~= m_dst             # LOOSE      eps=0.05 hold=0.989[0.98,0.99] supp=1.00 mdl=+4.192
+[forall node] SUM(demand_col) ~= demand_self + m_dst             # LOOSE      eps=0.05 hold=0.989[0.98,0.99] supp=1.00 mdl=+4.192
+[forall link] o0 + o1 ~= o0_rev + o1_rev                         # LOOSE      eps=0.05 hold=0.980[0.98,0.98] supp=1.00 mdl=+4.018
+[forall link] o0 + o0_rev ~= o1 + o1_rev                         # LOOSE      eps=0.05 hold=0.979[0.98,0.98] supp=1.00 mdl=+4.021
+[forall link] o0 ~= o1_rev                                       # LOOSE      eps=0.05 hold=0.931[0.93,0.94] supp=1.00 mdl=+4.418
+[forall link] o0_rev ~= o1                                       # LOOSE      eps=0.05 hold=0.931[0.93,0.94] supp=1.00 mdl=+4.418
+
+# Autogram discovered invariants (observed data only; no catalogue, no oracle)
+# dataset    : synthetic
+# run time   : 2026-06-29T04:57:08Z (UTC)
+# git        : 4bcbeee
+# proposer   : enumeration  seed=0  rounds=1
+# statistic  : hold-rate with Wilson confidence interval; MDL is tie-break only
+# portfolio  : 28 invariant(s)

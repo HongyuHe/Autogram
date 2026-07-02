@@ -45,7 +45,7 @@ def _compile_pattern(p) -> _Pattern:
             raise CompileError(f"pattern {p.name!r}: bad regex: {e}") from e
         declared = set(rx.groupindex)
         referenced = set(p.node_groups) | set(p.token_groups)
-        for g in (p.src_group, p.dst_group, p.peer_group):
+        for g in (p.source_group, p.destination_group, p.peer_group):
             if g:
                 referenced.add(g)
         missing = referenced - declared
@@ -62,7 +62,7 @@ def _compile_pattern(p) -> _Pattern:
                 raise CompileError(f"pattern {p.name!r}: bad split slot {s!r}")
     return _Pattern(
         matcher=p.matcher, kind=p.kind, direction=p.direction, rx=rx,
-        node_groups=tuple(p.node_groups), src_group=p.src_group, dst_group=p.dst_group,
+        node_groups=tuple(p.node_groups), source_group=p.source_group, destination_group=p.destination_group,
         peer_group=p.peer_group, token_groups=tuple(p.token_groups),
         prefix=p.prefix, sep=p.sep, split_slots=tuple(p.split_slots),
     )
@@ -137,7 +137,7 @@ def compile_spec(spec: SchemaSpec) -> SchemaAdapter:
         codec_clean=spec.cell_codec.clean,
         noisy_kind=spec.noisy_kind,
         demand_kind=spec.demand_kind,
-        link_marker_dir=spec.link_marker_dir,
+        link_marker_direction=spec.link_marker_direction,
         ref_glyphs=dict(onto.ref_glyphs),
         fam_glyphs=dict(onto.fam_glyphs),
     )

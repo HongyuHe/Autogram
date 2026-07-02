@@ -119,14 +119,14 @@ def is_admissible(rule: A.Rule, G) -> tuple:
         return False, "self-referential / reducible comparison"
     if rule.complexity() > G.max_complexity:
         return False, "exceeds max complexity"
-    # dimensional: approximate/exact equality and disequality need both sides measured,
-    # except a measured side compared to the additive identity 0.
+    # dimensional: every comparison needs at least one measured side.  A bare constant may only
+    # be the additive identity 0, which admits one-sided non-negativity / non-positivity laws.
+    lm, rm = _has_measured(atom.left), _has_measured(atom.right)
+    zero_r = isinstance(atom.right, A.Const) and atom.right.value == 0
+    zero_l = isinstance(atom.left, A.Const) and atom.left.value == 0
+    if not ((lm and rm) or (lm and zero_r) or (rm and zero_l)):
+        return False, "dimensionally meaningless comparison"
     if atom.op in ("~=", "==", "!="):
-        lm, rm = _has_measured(atom.left), _has_measured(atom.right)
-        zero_r = isinstance(atom.right, A.Const) and atom.right.value == 0
-        zero_l = isinstance(atom.left, A.Const) and atom.left.value == 0
-        if not ((lm and rm) or (lm and zero_r) or (rm and zero_l)):
-            return False, "dimensionally meaningless comparison"
         # A separation/anti-invariant asserts a *directional asymmetry* between two refs of
         # the SAME base measurement family; cross-family or aggregate disequality is trivially
         # separated, so restrict '!=' to same-family Ref-vs-Ref leaves.
@@ -135,4 +135,7 @@ def is_admissible(rule: A.Rule, G) -> tuple:
                 return False, "separation (!=) only between atomic measured refs"
             if _base_family(atom.left.role) != _base_family(atom.right.role):
                 return False, "separation (!=) only within one measurement family"
+    if atom.op == "<|>":
+        if not (isinstance(atom.left, A.Ref) and isinstance(atom.right, A.Ref)):
+            return False, "existence pairing only between atomic measured refs"
     return True, ""

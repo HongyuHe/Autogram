@@ -39,8 +39,8 @@ class _Pattern:
     direction: str
     rx: Optional["re.Pattern"]
     node_groups: Tuple[str, ...]
-    src_group: str
-    dst_group: str
+    source_group: str
+    destination_group: str
     peer_group: str
     token_groups: Tuple[str, ...]
     prefix: str
@@ -67,9 +67,15 @@ class SchemaAdapter:
     codec_clean: str
     noisy_kind: str
     demand_kind: str
-    link_marker_dir: str
+    link_marker_direction: str
     ref_glyphs: Dict[str, str] = field(default_factory=dict)
     fam_glyphs: Dict[str, str] = field(default_factory=dict)
+
+    def refs_for(self, binder: str) -> Tuple[str, ...]:
+        return tuple(self.ref_roles.get(binder, ()))
+
+    def fams_for(self, binder: str) -> Tuple[str, ...]:
+        return tuple(self.fam_roles.get(binder, ()))
 
     # -- seam 1: name parsing ------------------------------------------------
     def parse_column(self, name: str, nodes) -> Optional[ColumnSemantics]:
@@ -83,8 +89,8 @@ class SchemaAdapter:
                 nodes_t = tuple(groups[g] for g in p.node_groups)
                 return ColumnSemantics(
                     name, p.kind, p.direction, nodes_t,
-                    src=groups.get(p.src_group) if p.src_group else None,
-                    dst=groups.get(p.dst_group) if p.dst_group else None,
+                    source=groups.get(p.source_group) if p.source_group else None,
+                    destination=groups.get(p.destination_group) if p.destination_group else None,
                     peer=groups.get(p.peer_group) if p.peer_group else None,
                 )
             else:  # split
@@ -99,7 +105,7 @@ class SchemaAdapter:
                 kw = {slot_a: a, slot_b: b}
                 return ColumnSemantics(
                     name, p.kind, p.direction, (a, b),
-                    src=kw.get("src"), dst=kw.get("dst"), peer=kw.get("peer"),
+                    source=kw.get("source"), destination=kw.get("destination"), peer=kw.get("peer"),
                 )
         return None
 
@@ -141,8 +147,8 @@ class SchemaAdapter:
             for x in nm.node_list():
                 for c, sem in nm.by_name.items():
                     if (sem.kind == self.noisy_kind
-                            and sem.direction == self.link_marker_dir
-                            and sem.src == x):
+                            and sem.direction == self.link_marker_direction
+                            and sem.source == x):
                         out.append({"X": x, "Y": sem.peer})
             return out
         if strat == "singleton":
@@ -175,10 +181,10 @@ class SchemaAdapter:
 
     @staticmethod
     def _slot(sem: ColumnSemantics, slot: str):
-        if slot == "src":
-            return sem.src
-        if slot == "dst":
-            return sem.dst
+        if slot == "source":
+            return sem.source
+        if slot == "destination":
+            return sem.destination
         if slot == "peer":
             return sem.peer
         if slot == "local":
@@ -201,6 +207,8 @@ class SchemaAdapter:
     # -- seam 4: cell codec --------------------------------------------------
     def decode_observed(self, v) -> float:
         if self.codec_kind == "scalar":
+            return float("nan") if v is None else float(v)
+        if not hasattr(v, "get"):
             return float("nan") if v is None else float(v)
         x = v.get(self.codec_primary)
         return float("nan") if x is None else float(x)

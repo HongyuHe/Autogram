@@ -28,6 +28,8 @@ env/
 .DS_Store
 Thumbs.db
 
+.lavish/
+
 # --- Autogram run artifacts ---
 artifacts/
 # # Prompts are regenerated on every run/dump-prompt and are disposable.

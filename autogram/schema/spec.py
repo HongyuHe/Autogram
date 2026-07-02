@@ -31,7 +31,7 @@ ENUMERATE_STRATEGIES = (
 )
 
 # Bounded predicate slots/operators for family selectors (see :class:`FamilySelector`).
-PRED_SLOTS = ("src", "dst", "peer", "local")     # local == nodes[0]
+PRED_SLOTS = ("source", "destination", "peer", "local")     # local == nodes[0]
 PRED_OPS = ("==", "!=")
 CELL_CODECS = ("dict_gt_hidden", "scalar")
 
@@ -41,13 +41,13 @@ class ColumnPattern:
     """One column-name -> semantics rule (anchored regex, or a known-token split).
 
     ``matcher == "regex"``: ``regex`` is an anchored pattern with named groups; ``node_groups``
-    names the groups (in order) that form the ``nodes`` tuple, and ``src_group`` / ``dst_group``
+    names the groups (in order) that form the ``nodes`` tuple, and ``source_group`` / ``destination_group``
     / ``peer_group`` (when set) name the groups bound to those semantic slots.
 
     ``matcher == "split"``: a column is matched iff it starts with ``prefix``; the remainder is
     split into two node tokens using the *known node universe* (longest-known-prefix, the robust
     rule for tokens that themselves contain the separator, e.g. dotted GEANT names).  The two
-    halves fill ``split_slots`` (default ``("src", "dst")``) and become ``nodes``.
+    halves fill ``split_slots`` (default ``("source", "destination")``) and become ``nodes``.
 
     ``token_groups`` lists the groups (regex) that contribute to the inferred node universe.  For
     a split pattern, splitting is resolved *against* that universe, so it contributes nothing.
@@ -59,14 +59,14 @@ class ColumnPattern:
     # regex matcher
     regex: str = ""
     node_groups: Tuple[str, ...] = ()
-    src_group: str = ""
-    dst_group: str = ""
+    source_group: str = ""
+    destination_group: str = ""
     peer_group: str = ""
     token_groups: Tuple[str, ...] = ()
     # split matcher
     prefix: str = ""
     sep: str = "_"
-    split_slots: Tuple[str, str] = ("src", "dst")
+    split_slots: Tuple[str, str] = ("source", "destination")
 
 
 @dataclass(frozen=True)
@@ -81,7 +81,7 @@ class RoleOntology:
     binders: Tuple[str, ...]
     ref_roles: Dict[str, Tuple[str, ...]]
     fam_roles: Dict[str, Tuple[str, ...]]
-    ops: Tuple[str, ...] = ("~=", "==", "!=", "<=", ">=")
+    ops: Tuple[str, ...] = ("~=", "==", "!=", "<=", ">=", "<|>")
     agg_kinds: Tuple[str, ...] = ("SUM", "MIN", "MAX", "AVG")
     ref_glyphs: Dict[str, str] = field(default_factory=dict)
     fam_glyphs: Dict[str, str] = field(default_factory=dict)
@@ -112,7 +112,7 @@ class FamilySelector:
 
     * ``"*"``                 -- wildcard (always satisfied; used with ``==``),
     * a binding variable name -- e.g. ``"X"`` / ``"Y"`` (compared to the binding value),
-    * ``"@<slot>"``           -- another slot of the *same* column (e.g. ``"@dst"``).
+    * ``"@<slot>"``           -- another slot of the *same* column (e.g. ``"@destination"``).
     """
     binder: str
     family_role: str
@@ -142,7 +142,7 @@ class SchemaSpec:
 
     ``noisy_kind`` names the column ``kind`` that carries injected noise (the ``low_*`` layer in
     CrossCheck); those columns are the ones the noise model treats as noisy and the clean codec
-    reads from.  ``demand_kind`` names the demand-matrix layer (``high_*``).  ``link_marker_dir``
+    reads from.  ``demand_kind`` names the demand-matrix layer (``high_*``).  ``link_marker_direction``
     is the direction string the ``per_directed_link`` strategy keys on to discover directed
     links (CrossCheck: ``"egress"``).
     """
@@ -155,5 +155,5 @@ class SchemaSpec:
     cell_codec: CellCodec = field(default_factory=CellCodec)
     noisy_kind: str = "low"
     demand_kind: str = "high"
-    link_marker_dir: str = "egress"
+    link_marker_direction: str = "egress"
     notes: str = ""

@@ -25,6 +25,7 @@ class Grammar:
     ref_roles: Dict[str, Tuple[str, ...]]      # binder -> single-column roles
     fam_roles: Dict[str, Tuple[str, ...]]      # binder -> family roles
     agg_kinds: Tuple[str, ...] = ("SUM", "MIN", "MAX", "AVG")
+    scale_coeffs: Tuple[float, ...] = (-1.0, 0.5, 2.0)
     max_complexity: int = 12
     max_add_arity: int = 3
     glyphs: Dict[str, str] = field(default_factory=dict)
@@ -37,7 +38,8 @@ class Grammar:
 
 
 def grammar_from_adapter(adapter, max_complexity: int = 12,
-                         max_add_arity: int = 3) -> Grammar:
+                         max_add_arity: int = 3,
+                         scale_coeffs: Tuple[float, ...] = (-1.0, 0.5, 2.0)) -> Grammar:
     """Build the search grammar from a compiled schema adapter (the induced ontology)."""
     return Grammar(
         binders=tuple(adapter.binders),
@@ -45,6 +47,7 @@ def grammar_from_adapter(adapter, max_complexity: int = 12,
         ref_roles={b: tuple(adapter.ref_roles.get(b, ())) for b in adapter.binders},
         fam_roles={b: tuple(adapter.fam_roles.get(b, ())) for b in adapter.binders},
         agg_kinds=tuple(adapter.agg_kinds),
+        scale_coeffs=tuple(scale_coeffs),
         max_complexity=max_complexity,
         max_add_arity=max_add_arity,
     )

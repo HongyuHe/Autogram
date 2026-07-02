@@ -1,0 +1,105 @@
+[forall cell] self >= 0                                          # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall node] 0 ~= demand_self                                   # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.510
+[forall node] 0 ~= SUM(demand_col)                               # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.360
+[forall node] 0 ~= SUM(demand_row)                               # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.360
+[forall node] 0 ~= SUM(fam_egress_to)                            # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.360
+[forall node] 0 ~= SUM(fam_ingress_from)                         # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.360
+[forall node] SUM(demand_col) ~= demand_self                     # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.360
+[forall node] SUM(demand_row) ~= demand_self                     # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.360
+[forall node] SUM(fam_egress_to) ~= demand_self                  # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.360
+[forall node] SUM(fam_ingress_from) ~= demand_self               # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.360
+[forall node] SUM(demand_col) ~= SUM(demand_row)                 # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] SUM(demand_col) ~= SUM(fam_egress_to)              # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] SUM(demand_col) ~= SUM(fam_ingress_from)           # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] SUM(demand_row) ~= SUM(fam_egress_to)              # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] SUM(demand_row) ~= SUM(fam_ingress_from)           # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] SUM(fam_egress_to) ~= SUM(fam_ingress_from)        # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] -1*SUM(demand_col) ~= demand_self                  # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] -1*SUM(demand_row) ~= demand_self                  # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] -1*SUM(fam_egress_to) ~= demand_self               # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] -1*SUM(fam_ingress_from) ~= demand_self            # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] 0.5*SUM(demand_col) ~= demand_self                 # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] 0.5*SUM(demand_row) ~= demand_self                 # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] 0.5*SUM(fam_egress_to) ~= demand_self              # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] 0.5*SUM(fam_ingress_from) ~= demand_self           # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] 0.5*demand_self ~= SUM(demand_col)                 # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] 0.5*demand_self ~= SUM(demand_row)                 # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] 0.5*demand_self ~= SUM(fam_egress_to)              # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] 0.5*demand_self ~= SUM(fam_ingress_from)           # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall node] -1*SUM(demand_col) ~= SUM(demand_row)              # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] -1*SUM(demand_col) ~= SUM(fam_egress_to)           # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] -1*SUM(demand_col) ~= SUM(fam_ingress_from)        # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] -1*SUM(demand_row) ~= SUM(fam_egress_to)           # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] -1*SUM(demand_row) ~= SUM(fam_ingress_from)        # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] -1*SUM(fam_egress_to) ~= SUM(fam_ingress_from)     # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(demand_col) ~= SUM(demand_row)             # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(demand_col) ~= SUM(fam_egress_to)          # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(demand_col) ~= SUM(fam_ingress_from)       # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(demand_row) ~= SUM(demand_col)             # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(demand_row) ~= SUM(fam_egress_to)          # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(demand_row) ~= SUM(fam_ingress_from)       # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(fam_egress_to) ~= SUM(demand_col)          # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(fam_egress_to) ~= SUM(demand_row)          # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(fam_egress_to) ~= SUM(fam_ingress_from)    # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(fam_ingress_from) ~= SUM(demand_col)       # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(fam_ingress_from) ~= SUM(demand_row)       # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] 0.5*SUM(fam_ingress_from) ~= SUM(fam_egress_to)    # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall node] SUM(demand_col) + SUM(demand_row) ~= demand_self   # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(demand_col) + SUM(fam_egress_to) ~= demand_self # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(demand_col) + SUM(fam_ingress_from) ~= demand_self # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(demand_row) + SUM(fam_egress_to) ~= demand_self # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(demand_row) + SUM(fam_ingress_from) ~= demand_self # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(fam_egress_to) + SUM(fam_ingress_from) ~= demand_self # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(demand_row) ~= demand_self + SUM(demand_col)   # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(fam_egress_to) ~= demand_self + SUM(demand_col) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(fam_ingress_from) ~= demand_self + SUM(demand_col) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(demand_col) ~= demand_self + SUM(demand_row)   # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(fam_egress_to) ~= demand_self + SUM(demand_row) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(fam_ingress_from) ~= demand_self + SUM(demand_row) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(demand_col) ~= demand_self + SUM(fam_egress_to) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(demand_row) ~= demand_self + SUM(fam_egress_to) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(fam_ingress_from) ~= demand_self + SUM(fam_egress_to) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(demand_col) ~= demand_self + SUM(fam_ingress_from) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(demand_row) ~= demand_self + SUM(fam_ingress_from) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(fam_egress_to) ~= demand_self + SUM(fam_ingress_from) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.910
+[forall node] SUM(demand_col) + SUM(demand_row) ~= SUM(fam_egress_to) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] SUM(demand_col) + SUM(demand_row) ~= SUM(fam_ingress_from) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] SUM(demand_col) + SUM(fam_egress_to) ~= SUM(demand_row) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] SUM(demand_col) + SUM(fam_egress_to) ~= SUM(fam_ingress_from) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] SUM(demand_col) + SUM(fam_ingress_from) ~= SUM(demand_row) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] SUM(demand_col) + SUM(fam_ingress_from) ~= SUM(fam_egress_to) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] SUM(demand_col) ~= SUM(demand_row) + SUM(fam_egress_to) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] SUM(demand_row) + SUM(fam_egress_to) ~= SUM(fam_ingress_from) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] SUM(demand_col) ~= SUM(demand_row) + SUM(fam_ingress_from) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] SUM(demand_row) + SUM(fam_ingress_from) ~= SUM(fam_egress_to) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] SUM(demand_col) ~= SUM(fam_egress_to) + SUM(fam_ingress_from) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] SUM(demand_row) ~= SUM(fam_egress_to) + SUM(fam_ingress_from) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] m_origination >= 0                                 # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall node] m_termination >= 0                                 # ONE-SIDED  eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+1.561
+[forall network] 0 ~= SUM(all_demand)                            # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.360
+[forall network] 0 ~= SUM(all_m_origination)                     # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.360
+[forall network] 0 ~= SUM(all_m_termination)                     # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.360
+[forall network] SUM(all_demand) ~= SUM(all_m_origination)       # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall network] SUM(all_demand) ~= SUM(all_m_termination)       # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall network] SUM(all_m_origination) ~= SUM(all_m_termination) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.210
+[forall network] -1*SUM(all_demand) ~= SUM(all_m_origination)    # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall network] -1*SUM(all_demand) ~= SUM(all_m_termination)    # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall network] -1*SUM(all_m_origination) ~= SUM(all_m_termination) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall network] 0.5*SUM(all_demand) ~= SUM(all_m_origination)   # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall network] 0.5*SUM(all_demand) ~= SUM(all_m_termination)   # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall network] 0.5*SUM(all_m_origination) ~= SUM(all_demand)   # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall network] 0.5*SUM(all_m_origination) ~= SUM(all_m_termination) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall network] 0.5*SUM(all_m_termination) ~= SUM(all_demand)   # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall network] 0.5*SUM(all_m_termination) ~= SUM(all_m_origination) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+16.060
+[forall network] SUM(all_demand) + SUM(all_m_origination) ~= SUM(all_m_termination) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall network] SUM(all_demand) + SUM(all_m_termination) ~= SUM(all_m_origination) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall network] SUM(all_demand) ~= SUM(all_m_origination) + SUM(all_m_termination) # EXACT      eps=0.05 hold=1.000[1.00,1.00] supp=1.00 mdl=+15.760
+[forall node] m_origination <|> m_termination              # EXISTENCE  eps=1e-09 hold=0.969[0.97,0.97] supp=1.00 mdl=+29.297
+
+# Autogram discovered invariants (observed data only; no catalogue, no oracle)
+# dataset    : abilene_sample_1000
+# run time   : 2026-06-29T18:37:47Z (UTC)
+# git        : 4bcbeee
+# proposer   : enumeration  seed=0  rounds=1
+# statistic  : hold-rate with Wilson confidence interval; MDL is tie-break only
+# portfolio  : 97 invariant(s)
