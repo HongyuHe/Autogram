@@ -33,6 +33,10 @@ def _roles_ok(term: A.Term, binder: str, G) -> bool:
             _roles_ok(t, binder, G) for t in term.terms)
     if isinstance(term, A.Agg):
         return term.kind in G.agg_kinds and term.family_role in G.fams_for(binder)
+    if isinstance(term, A.Mul):
+        return _roles_ok(term.left, binder, G) and _roles_ok(term.right, binder, G)
+    if isinstance(term, A.Div):
+        return _roles_ok(term.num, binder, G) and _roles_ok(term.den, binder, G)
     return False
 
 
@@ -48,6 +52,10 @@ def _has_measured(term: A.Term) -> bool:
         return any(_has_measured(t) for t in term.terms)
     if isinstance(term, A.Agg):
         return True
+    if isinstance(term, A.Mul):
+        return _has_measured(term.left) or _has_measured(term.right)
+    if isinstance(term, A.Div):
+        return _has_measured(term.num) or _has_measured(term.den)
     return False
 
 
@@ -72,6 +80,10 @@ def _leaf_set(term: A.Term) -> set:
         for t in term.terms:
             out |= _leaf_set(t)
         return out
+    if isinstance(term, A.Mul):
+        return _leaf_set(term.left) | _leaf_set(term.right)
+    if isinstance(term, A.Div):
+        return _leaf_set(term.num) | _leaf_set(term.den)
     return set()
 
 
@@ -88,6 +100,10 @@ def _leaf_list(term: A.Term) -> list:
         for t in term.terms:
             out.extend(_leaf_list(t))
         return out
+    if isinstance(term, A.Mul):
+        return _leaf_list(term.left) + _leaf_list(term.right)
+    if isinstance(term, A.Div):
+        return _leaf_list(term.num) + _leaf_list(term.den)
     return []
 
 
@@ -119,6 +135,21 @@ def is_admissible(rule: A.Rule, G) -> tuple:
         return False, "self-referential / reducible comparison"
     if rule.complexity() > G.max_complexity:
         return False, "exceeds max complexity"
+    if max(atom.left.degree(), atom.right.degree()) > getattr(G, "max_degree", 1):
+        return False, "exceeds max polynomial degree"
+    for side in (atom.left, atom.right):
+        if isinstance(side, A.Div) and not _has_measured(side.den):
+            return False, "ratio denominator must be a measured term"
+        if isinstance(side, A.Mul) and not (_has_measured(side.left) and _has_measured(side.right)):
+            return False, "product operands must both be measured"
+    excl = getattr(G, "role_exclusions", ())
+    if excl:
+        roles = set()
+        for leaf in (_leaf_set(atom.left) | _leaf_set(atom.right)):
+            roles.add(leaf[1] if leaf[0] == "r" else leaf[-1])
+        for pair in excl:
+            if len(pair) == 2 and set(pair) <= roles:
+                return False, "excluded role co-occurrence"
     # dimensional: every comparison needs at least one measured side.  A bare constant may only
     # be the additive identity 0, which admits one-sided non-negativity / non-positivity laws.
     lm, rm = _has_measured(atom.left), _has_measured(atom.right)

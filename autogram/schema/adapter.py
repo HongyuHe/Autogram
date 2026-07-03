@@ -1,4 +1,4 @@
-"""The compiled, callable form of a :class:`~autogram.schema.spec.SchemaSpec`.
+"""The compiled, callable form of a :class:`~autogram.schema.spec.GrammarSpec`.
 
 A :class:`SchemaAdapter` is produced by :func:`autogram.schema.compiler.compile_spec` and is
 the single object the engine consults on the *generalised* path.  It reproduces, for an
@@ -68,6 +68,8 @@ class SchemaAdapter:
     noisy_kind: str
     demand_kind: str
     link_marker_direction: str
+    max_degree: int = 1
+    role_exclusions: Tuple[frozenset, ...] = ()
     ref_glyphs: Dict[str, str] = field(default_factory=dict)
     fam_glyphs: Dict[str, str] = field(default_factory=dict)
 

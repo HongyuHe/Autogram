@@ -1,4 +1,4 @@
-"""Trusted compiler: :class:`SchemaSpec` (data) -> :class:`SchemaAdapter` (callable).
+"""Trusted compiler: :class:`GrammarSpec` (data) -> :class:`SchemaAdapter` (callable).
 
 This is the *only* component that turns a declarative spec into something the engine runs, so
 it is the trust boundary.  It is deliberately small and total:
@@ -24,12 +24,12 @@ from .spec import (
     ENUMERATE_STRATEGIES,
     PRED_OPS,
     PRED_SLOTS,
-    SchemaSpec,
+    GrammarSpec,
 )
 
 
 class CompileError(ValueError):
-    """Raised when a :class:`SchemaSpec` is structurally invalid or unsafe to compile."""
+    """Raised when a :class:`GrammarSpec` is structurally invalid or unsafe to compile."""
 
 
 def _compile_pattern(p) -> _Pattern:
@@ -68,7 +68,7 @@ def _compile_pattern(p) -> _Pattern:
     )
 
 
-def _validate_selectors(spec: SchemaSpec) -> None:
+def _validate_selectors(spec: GrammarSpec) -> None:
     for sel in spec.family_selectors:
         for pred in sel.predicates:
             if len(pred) != 3:
@@ -81,7 +81,7 @@ def _validate_selectors(spec: SchemaSpec) -> None:
                 raise CompileError(f"family {sel.family_role!r}: bad op {op!r}")
 
 
-def compile_spec(spec: SchemaSpec) -> SchemaAdapter:
+def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
     """Validate and compile ``spec`` into a runnable :class:`SchemaAdapter`."""
     if not spec.patterns:
         raise CompileError("spec has no column patterns")
@@ -138,6 +138,8 @@ def compile_spec(spec: SchemaSpec) -> SchemaAdapter:
         noisy_kind=spec.noisy_kind,
         demand_kind=spec.demand_kind,
         link_marker_direction=spec.link_marker_direction,
+        max_degree=spec.max_degree,
+        role_exclusions=tuple(spec.role_exclusions),
         ref_glyphs=dict(onto.ref_glyphs),
         fam_glyphs=dict(onto.fam_glyphs),
     )

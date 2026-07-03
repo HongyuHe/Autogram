@@ -1,4 +1,4 @@
-"""Regression tests for real-subagent SchemaSpec completeness checks."""
+"""Regression tests for real-subagent GrammarSpec completeness checks."""
 
 from __future__ import annotations
 

@@ -8,6 +8,7 @@ build/
 dist/
 *.egg
 *.egg-info/
+.vscode/
 
 # --- Virtual environments ---
 .venv/
@@ -43,8 +44,9 @@ artifacts/
 # artifacts/bench_*.json
 # artifacts/**/trace.jsonl
 # artifacts/**/result.json
-# # Human-readable learned-rule files (rules/<dataset>_<time>.txt) are regenerable run outputs.
-# rules/
+
+# --- Local data exploration (not part of the published framework) ---
+data/crosscheck_exploration.ipynb
 
 # --- Docs policy ---
 # Keep only the source papers and the curated Abilene/GEANT invariant catalogue in git.
@@ -53,3 +55,6 @@ docs/**
 !docs/crosscheck_paper.pdf
 !docs/netnomos_paper.pdf
 !docs/abilene_geant_invariants.md
+# User-facing calibration docs (needed to use the published framework)
+!docs/calibration_protocol.md
+!docs/known_invariants.example.yaml

@@ -1,4 +1,4 @@
-"""SchemaSpec interface + trusted compiler/adapter (kept functionality), via induced specs."""
+"""GrammarSpec interface + trusted compiler/adapter (kept functionality), via induced specs."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import pytest
 from autogram.discovery import synth
 from autogram.discovery.induce import induce_spec
 from autogram.schema import CompileError, compile_spec
-from autogram.schema.spec import CellCodec, ColumnPattern, RoleOntology, SchemaSpec
+from autogram.schema.spec import CellCodec, ColumnPattern, RoleOntology, GrammarSpec
 
 
 def test_induced_spec_compiles(adapter):
@@ -27,7 +27,7 @@ def test_compiler_round_trip():
 
 def test_compiler_rejects_bad_strategy():
     spec = induce_spec(synth.make_synthetic(n_entities=4, n_snapshots=2, seed=0).columns)
-    bad = SchemaSpec(
+    bad = GrammarSpec(
         name="bad", patterns=spec.patterns, ontology=spec.ontology,
         ref_templates=spec.ref_templates, family_selectors=spec.family_selectors,
         binder_enumerate={**spec.binder_enumerate, "cell": "no_such_strategy"},
@@ -38,7 +38,7 @@ def test_compiler_rejects_bad_strategy():
 
 def test_compiler_rejects_bad_codec():
     spec = induce_spec(synth.make_synthetic(n_entities=4, n_snapshots=2, seed=0).columns)
-    bad = SchemaSpec(
+    bad = GrammarSpec(
         name="bad", patterns=spec.patterns, ontology=spec.ontology,
         ref_templates=spec.ref_templates, family_selectors=spec.family_selectors,
         binder_enumerate=spec.binder_enumerate, cell_codec=CellCodec(kind="not_a_codec"))
@@ -48,7 +48,7 @@ def test_compiler_rejects_bad_codec():
 
 def test_compiler_rejects_bad_regex():
     onto = RoleOntology(binders=("cell",), ref_roles={"cell": ("self",)}, fam_roles={"cell": ()})
-    bad = SchemaSpec(
+    bad = GrammarSpec(
         name="bad",
         patterns=(ColumnPattern(name="x", matcher="regex", kind="measurement",
                                 direction="o", regex=r"(?P<n>.+"),),

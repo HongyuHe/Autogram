@@ -81,7 +81,7 @@ def knee_coverage(v: np.ndarray) -> float:
 
 
 def fit_band_auto(op: str, rho: np.ndarray, s: np.ndarray,
-                  holdout_frac: float, seed: int):
+                  holdout_frac: float, seed: int, cap: float | None = None):
     """Self-calibrated band fit: set ``eps`` at the residual knee, coverage honest on held-out.
 
     The band edge is the *core's upper value* at the knee (split-conformal when there are
@@ -90,6 +90,12 @@ def fit_band_auto(op: str, rho: np.ndarray, s: np.ndarray,
     quantile that rounds up into the tail.  Returns ``(BandFit, coverage)`` where
     ``coverage`` is the data-chosen operating point.  No ``kappa*`` and no noise constant
     ``eta`` are involved.
+
+    ``cap`` (when given, the global tolerance ceiling) bounds the fitted band from above: the
+    self-calibrated band may tighten per candidate but never *widen* beyond the ceiling.  A
+    spurious pairing whose knee sits deep in the tail must then clear the ceiling band, not an
+    inflated one -- this closes the "widen-to-accept" trap so adaptive acceptance is a subset of
+    the fixed-``cap`` acceptance (never looser, so never a new false positive).
     """
     v = violation_magnitude(op, rho, s)
     n = v.size
@@ -99,9 +105,12 @@ def fit_band_auto(op: str, rho: np.ndarray, s: np.ndarray,
     vc = np.sort(v[cal])
     i = _knee_index(vc)
     eps = float(vc[i])
+    capped = cap is not None and eps > float(cap)
+    if capped:
+        eps = float(cap)
     cov_cal = float(np.mean(v[cal] <= eps + 1e-15))
     k_eval = int(np.count_nonzero(v[ev] <= eps + 1e-15))
     cov_eval = k_eval / ev.size if ev.size else cov_cal
-    coverage = (i + 1) / cal.size
+    coverage = cov_cal if capped else (i + 1) / cal.size
     return BandFit(eps=eps, cov_cal=cov_cal, cov_eval=cov_eval,
                    n_eval=int(ev.size), k_eval=k_eval), coverage

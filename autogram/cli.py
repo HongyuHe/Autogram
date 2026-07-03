@@ -109,6 +109,35 @@ def cmd_clean(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_precheck(args: argparse.Namespace) -> int:
+    from .calibrate import precheck
+    rep = precheck(harness=args.harness, backend=args.schema_backend)
+    print(json.dumps(rep, indent=2))
+    print("\nPRECHECK:", "OK" if rep["ok"] else "FAIL")
+    return 0 if rep["ok"] else 1
+
+
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    from .calibrate import CalibrationConfig, calibrate
+    df = _load_pickle_dataframe(args.input)
+    name = args.name or os.path.splitext(os.path.basename(args.input))[0]
+    cfg = CalibrationConfig(seed=args.seed, max_iterations=args.max_iterations,
+                            validation_frac=args.validation_frac, harness=args.harness,
+                            backend=args.schema_backend, band_mode=args.band_mode,
+                            max_capability_tiers=args.max_capability_tiers,
+                            save_rules=not args.no_save_rules, rules_dir=args.rules_dir)
+    report = calibrate(df, args.known, cfg, name=name)
+    print(json.dumps(report, indent=2))
+    if report.get("rules_file"):
+        print(f"\nlearned invariants written to {report['rules_file']}")
+    if args.out:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+        print(f"wrote {args.out}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="autogram", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -145,6 +174,34 @@ def build_parser() -> argparse.ArgumentParser:
     pc = sub.add_parser("clean", help="remove generated artifacts")
     pc.add_argument("--out", default=r"artifacts\discovery")
     pc.set_defaults(func=cmd_clean)
+
+    pp = sub.add_parser("precheck", help="preflight: verify the harness/subagent/key can induce schemas")
+    pp.add_argument("--harness", choices=sorted(HARNESSES), default="copilot")
+    pp.add_argument("--schema-backend", choices=available_inducer_backends(), default="subagent")
+    pp.set_defaults(func=cmd_precheck)
+
+    pcal = sub.add_parser("calibrate",
+                          help="tune knobs on proxies, discover on your dataset, report known-invariant recall")
+    pcal.add_argument("--input", required=True, help="pickle DataFrame path for your dataset")
+    pcal.add_argument("--known", required=True, help="known_invariants.yaml or .json path")
+    pcal.add_argument("--harness", choices=sorted(HARNESSES), default="copilot")
+    pcal.add_argument("--schema-backend", choices=available_inducer_backends(), default="subagent")
+    pcal.add_argument("--seed", type=int, default=0)
+    pcal.add_argument("--max-iterations", dest="max_iterations", type=int, default=0,
+                      help="0 = run to completion (default)")
+    pcal.add_argument("--validation-frac", dest="validation_frac", type=float, default=0.3)
+    pcal.add_argument("--band-mode", dest="band_mode", choices=["adaptive", "global"],
+                      default="adaptive",
+                      help="per-candidate self-calibrated band (default) or one fixed global tolerance")
+    pcal.add_argument("--max-capability-tiers", dest="max_capability_tiers", type=int, default=3,
+                      help="grammar re-induction tiers (widen aggregations/degree) when recall stalls")
+    pcal.add_argument("--name", default="", help="dataset name for the saved rules file (defaults to the input filename)")
+    pcal.add_argument("--rules-dir", dest="rules_dir", default="rules",
+                      help="directory for the saved learned-invariants .dl file (default: rules)")
+    pcal.add_argument("--no-save-rules", dest="no_save_rules", action="store_true",
+                      help="do not write the learned invariants to a .dl file (they still appear in --out)")
+    pcal.add_argument("--out", default="", help="optional path to write the JSON report")
+    pcal.set_defaults(func=cmd_calibrate)
     return p
 
 

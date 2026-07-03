@@ -79,6 +79,17 @@ def eval_term(term: A.Term, binder: str, binding: dict, frame: Frame,
             return mat.min(axis=1)
         if term.kind == "MAX":
             return mat.max(axis=1)
+    if isinstance(term, A.Mul):
+        left = eval_term(term.left, binder, binding, frame, nm)
+        right = eval_term(term.right, binder, binding, frame, nm)
+        return None if left is None or right is None else left * right
+    if isinstance(term, A.Div):
+        num = eval_term(term.num, binder, binding, frame, nm)
+        den = eval_term(term.den, binder, binding, frame, nm)
+        if num is None or den is None:
+            return None
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(den == 0.0, np.nan, num / den)
     raise TypeError(f"unknown term {term!r}")
 
 

@@ -1,6 +1,6 @@
 """Declarative, JSON-serialisable schema description (the data an LLM/heuristic emits).
 
-A :class:`SchemaSpec` is **data, not code**.  Every field is a primitive, a tuple of
+A :class:`GrammarSpec` is **data, not code**.  Every field is a primitive, a tuple of
 primitives, or a tuple of small frozen dataclasses, so a spec can be serialised to/from JSON
 and validated statically before it is ever used (``schema/validate.py``).  The compiler
 (:func:`autogram.schema.compiler.compile_spec`) interprets these declarations with a fixed,
@@ -82,7 +82,7 @@ class RoleOntology:
     ref_roles: Dict[str, Tuple[str, ...]]
     fam_roles: Dict[str, Tuple[str, ...]]
     ops: Tuple[str, ...] = ("~=", "==", "!=", "<=", ">=", "<|>")
-    agg_kinds: Tuple[str, ...] = ("SUM", "MIN", "MAX", "AVG")
+    agg_kinds: Tuple[str, ...] = ("SUM",)
     ref_glyphs: Dict[str, str] = field(default_factory=dict)
     fam_glyphs: Dict[str, str] = field(default_factory=dict)
 
@@ -137,7 +137,7 @@ class CellCodec:
 
 
 @dataclass(frozen=True)
-class SchemaSpec:
+class GrammarSpec:
     """A complete, bounded description of a dataset schema (parser + ontology + grounding).
 
     ``noisy_kind`` names the column ``kind`` that carries injected noise (the ``low_*`` layer in
@@ -156,4 +156,6 @@ class SchemaSpec:
     noisy_kind: str = "low"
     demand_kind: str = "high"
     link_marker_direction: str = "egress"
+    max_degree: int = 1                         # proposer opt-in: >=2 enables products/ratios (item 6)
+    role_exclusions: Tuple[frozenset, ...] = ()  # proposer blocklist of role pairs (item 2)
     notes: str = ""

@@ -17,7 +17,9 @@ class DiscoveryConfig:
     Z3 handles logical truth, equivalence and subsumption; MDL is only a final tie-breaker.
     """
 
-    tolerance: float = 0.05             # dimensionless epsilon for ~=, ==, <=, >=
+    tolerance: float = 0.05             # dimensionless epsilon (fallback / global-band relative tolerance)
+    band_mode: str = "adaptive"         # DEFAULT "adaptive" (per-rule knee band, item 4); "global" = one fixed tolerance
+    band_holdout_frac: float = 0.3      # split-conformal holdout for the adaptive band
     separation_tolerance: float = 1e-6  # minimum relative gap for != separations
     presence_tolerance: float = 1e-9    # relative non-zero cutoff for <|> pairings
     hold_rate_threshold: float = 0.62   # Wilson lower bound required for approximate-law acceptance

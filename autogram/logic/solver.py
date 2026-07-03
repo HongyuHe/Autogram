@@ -37,6 +37,14 @@ def _term_expr(term: A.Term, env: Dict[Tuple, z3.ArithRef]) -> z3.ArithRef:
         if not term.terms:
             return z3.RealVal("0")
         return sum((_term_expr(t, env) for t in term.terms), z3.RealVal("0"))
+    if isinstance(term, A.Mul):
+        return _term_expr(term.left, env) * _term_expr(term.right, env)
+    if isinstance(term, A.Div):
+        # ratios are opaque fresh reals for the (sound but incomplete) screening
+        key = ("div", term.unparse())
+        if key not in env:
+            env[key] = z3.Real(_var_name(key))
+        return env[key]
     raise TypeError(f"unknown term {term!r}")
 
 

@@ -8,7 +8,7 @@ checkable, and trivially terminating.
 
 The AST carries **no** dataset-specific vocabulary.  Binders, single-column *roles* and
 family *roles* are not enumerated here; they are supplied by an *induced* schema
-(:class:`autogram.schema.spec.SchemaSpec` -> :class:`autogram.dsl.grammar.Grammar`).  A
+(:class:`autogram.schema.spec.GrammarSpec` -> :class:`autogram.dsl.grammar.Grammar`).  A
 ``Ref``/``Agg`` simply names a role string; the induced schema decides which role strings are
 legal for which binder and how to ground them.  This is what lets the same AST describe
 invariants on a dataset it was never tuned for.
@@ -45,6 +45,9 @@ class Ref:
     def complexity(self) -> int:
         return 1
 
+    def degree(self) -> int:
+        return 1
+
     def unparse(self) -> str:
         return self.role
 
@@ -55,6 +58,9 @@ class Const:
 
     def complexity(self) -> int:
         return 1
+
+    def degree(self) -> int:
+        return 0
 
     def unparse(self) -> str:
         v = self.value
@@ -70,6 +76,9 @@ class Scale:
     def complexity(self) -> int:
         return 1 + self.term.complexity()
 
+    def degree(self) -> int:
+        return self.term.degree()
+
     def unparse(self) -> str:
         c = self.coeff
         cs = str(int(c)) if float(c).is_integer() else f"{c:g}"
@@ -84,6 +93,9 @@ class Add:
     def complexity(self) -> int:
         return 1 + sum(t.complexity() for t in self.terms)
 
+    def degree(self) -> int:
+        return max((t.degree() for t in self.terms), default=0)
+
     def unparse(self) -> str:
         return " + ".join(t.unparse() for t in self.terms)
 
@@ -97,11 +109,49 @@ class Agg:
     def complexity(self) -> int:
         return 2
 
+    def degree(self) -> int:
+        return 1
+
     def unparse(self) -> str:
         return f"{self.kind}({self.family_role})"
 
 
-Term = Union[Ref, Const, Scale, Add, Agg]
+@dataclass(frozen=True)
+class Mul:
+    """Product of two measured terms ``left * right`` (nonlinear; raises the polynomial degree)."""
+    left: "Term"
+    right: "Term"
+
+    def complexity(self) -> int:
+        return 1 + self.left.complexity() + self.right.complexity()
+
+    def degree(self) -> int:
+        return self.left.degree() + self.right.degree()
+
+    def unparse(self) -> str:
+        return f"({self.left.unparse()} * {self.right.unparse()})"
+
+
+@dataclass(frozen=True)
+class Div:
+    """Ratio ``num / den`` (den must be non-zero; nonlinear).
+
+    Points where ``den == 0`` ground to NaN and are dropped from the residual population.
+    """
+    num: "Term"
+    den: "Term"
+
+    def complexity(self) -> int:
+        return 1 + self.num.complexity() + self.den.complexity()
+
+    def degree(self) -> int:
+        return self.num.degree() + self.den.degree()
+
+    def unparse(self) -> str:
+        return f"({self.num.unparse()} / {self.den.unparse()})"
+
+
+Term = Union[Ref, Const, Scale, Add, Agg, Mul, Div]
 
 
 # ---------------------------------------------------------------------------

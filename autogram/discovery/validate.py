@@ -15,7 +15,7 @@ from ..dsl import ast as A
 from ..dsl.binders import enumerate_bindings, resolve_family, resolve_ref
 from . import synth as S
 from .induce import SchemaInducer, make_inducer
-from .loop import DiscoveryResult, discover, discover_dataframe
+from .loop import DiscoveryResult, discover
 
 
 def _operand_sig(rule, binder, binding, nm):
@@ -200,25 +200,32 @@ def plant_and_recover(noise_levels: Sequence[float] = (0.0, 0.02),
 
 
 def null_accepted(n_entities: int = 4, n_snapshots: int = 160, seed: int = 0,
-                  inducer: Optional[SchemaInducer] = None) -> int:
-    data = S.make_null(n_entities=n_entities, n_snapshots=n_snapshots, seed=seed)
+                  inducer: Optional[SchemaInducer] = None, regime=None) -> int:
+    # The always-on false-discovery control proxy comes from the (wired) RegimeSpec when given.
+    if regime is not None:
+        from .regime import generate_null as _regime_null
+        data = _regime_null(seed=seed, n_entities=n_entities, n_snapshots=n_snapshots)
+    else:
+        data = S.make_null(n_entities=n_entities, n_snapshots=n_snapshots, seed=seed)
     res = discover(data.columns, data.matrix, inducer=inducer or make_inducer("subagent"),
                    discovery_cfg=_fast_eval(seed), search_cfg=_small_search(seed),
                    name="null", timestamps=data.timestamps)
     return len([e for e in res.portfolio if e.rule.atom.op in ("~=", "==")])
 
 
-def tune_threshold_tolerance(seed: int = 0) -> dict:
-    """Jointly pick a tolerance/threshold pair on the approximate-offset proxy."""
+def _offset_sweep(thresholds, tolerances, data, seed):
+    # Induce the proxy schema ONCE, then re-evaluate across the (threshold, tolerance) grid.
+    # The induced grammar depends only on the synthetic column names, not on the numeric knobs
+    # being swept, so re-inducing per grid cell was pure redundant cost (and a flakiness source).
+    from .loop import prepare_columns, run_prepared
+    ds, G, _spec = prepare_columns(data.columns, data.matrix, inducer=make_inducer("subagent"),
+                                   search_cfg=_small_search(seed, "offset_pair"),
+                                   name="tune_offset", timestamps=data.timestamps)
     best = None
-    for threshold, tolerance in itertools.product((0.58, 0.62, 0.66, 0.72), (0.005, 0.01, 0.02, 0.05)):
-        data = S.make_synthetic(n_entities=3, n_snapshots=120, noise=0.0, seed=seed,
-                                families=("offset_pair",), offset_hold_rate=0.67,
-                                offset_factor=0.98)
-        res = discover(data.columns, data.matrix, inducer=make_inducer("subagent"),
-                       discovery_cfg=_fast_eval(seed, "offset_pair", tolerance, threshold),
-                       search_cfg=_small_search(seed, "offset_pair"),
-                       name="tune_offset", timestamps=data.timestamps)
+    for threshold, tolerance in itertools.product(thresholds, tolerances):
+        res = run_prepared(ds, G,
+                           discovery_cfg=_fast_eval(seed, "offset_pair", tolerance, threshold),
+                           search_cfg=_small_search(seed, "offset_pair"))
         rec = score_recovery(res, data.planted)
         compact = len(res.portfolio) < 120 and not scaled_slack_rules(res)
         ok = rec.offset_pair >= 0.8 and compact
@@ -232,7 +239,45 @@ def tune_threshold_tolerance(seed: int = 0) -> dict:
         }
         if best is None or score > best[0]:
             best = (score, candidate)
-    return best[1]
+    return best
+
+
+def tune_threshold_tolerance(seed: int = 0, max_expansions: int = 3,
+                             null_floor: float = 0.5, regime=None) -> dict:
+    """Jointly pick a tolerance/threshold pair on the approximate-offset proxy.
+
+    Starts on a base grid and, if no pair fits, widens the ranges (threshold down toward the
+    ``null_floor``, tolerance up) and re-sweeps -- so calibration adapts to datasets whose
+    operating point sits outside the shipped grid (item 3).  Expansion is bounded and the
+    threshold never drops below the false-discovery ``null_floor``.
+
+    When a ``regime`` (RegimeSpec) is supplied the approximate-offset proxy is generated from its
+    ``offset_pair`` entry, so the tuner's synthetic data is the wired, editable proxy suite rather
+    than a hard-coded generator.
+    """
+    if regime is not None:
+        from .regime import generate as _regime_generate
+        offset = next((e for e in regime.active_entries() if e.shape == "offset_pair"), None)
+        data = (_regime_generate(offset, seed=seed) if offset is not None
+                else S.make_synthetic(n_entities=3, n_snapshots=120, noise=0.0, seed=seed,
+                                      families=("offset_pair",), offset_hold_rate=0.67, offset_factor=0.98))
+    else:
+        data = S.make_synthetic(n_entities=3, n_snapshots=120, noise=0.0, seed=seed,
+                                families=("offset_pair",), offset_hold_rate=0.67, offset_factor=0.98)
+    thresholds = [0.58, 0.62, 0.66, 0.72]
+    tolerances = [0.005, 0.01, 0.02, 0.05]
+    best = _offset_sweep(thresholds, tolerances, data, seed)
+    expansions = 0
+    while not best[1]["ok"] and expansions < max_expansions:
+        expansions += 1
+        new_thr = max(null_floor, round(min(thresholds) - 0.04, 4))
+        new_tol = round(max(tolerances) * 2.0, 4)
+        thresholds = sorted({t for t in thresholds + [new_thr] if t >= null_floor})
+        tolerances = sorted(set(tolerances + [new_tol]))
+        best = _offset_sweep(thresholds, tolerances, data, seed)
+    result = dict(best[1])
+    result["expansions"] = expansions
+    return result
 
 
 def validate_runtime_config(discovery: DiscoveryConfig, search: SearchConfig, seed: int = 0,
@@ -271,21 +316,6 @@ def proxy_tune(seed: int = 0) -> dict:
         "family_ok": family_ok,
         "ok": all(family_ok.values()) and all(runtime_recovery.values()),
     }
-
-
-def frozen_crosscheck_eval(frames: Dict[str, object], seed: int = 0) -> dict:
-    tuned = proxy_tune(seed)
-    out = {}
-    for name, df in frames.items():
-        res = discover_dataframe(df, inducer=make_inducer("subagent"),
-                                 discovery_cfg=tuned["discovery"], search_cfg=tuned["search"],
-                                 name=name)
-        out[name] = {
-            "accepted": len(res.portfolio),
-            "rules": [e.rule.unparse() for e in res.portfolio],
-            "families": structural_families(res),
-        }
-    return out
 
 
 def structural_families(result: DiscoveryResult) -> List[str]:

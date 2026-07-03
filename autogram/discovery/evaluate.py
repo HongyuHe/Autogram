@@ -13,7 +13,7 @@ import numpy as np
 from ..config import DiscoveryConfig
 from ..dsl import ast as A
 from ..dsl.evaluate import ground
-from ..evaluator.band import violation_magnitude
+from ..evaluator.band import fit_band_auto, violation_magnitude
 from ..evaluator.metrics import mdl_gain, wilson, z_for_alpha
 from ..logic.solver import is_trivial
 
@@ -111,7 +111,14 @@ class DataOnlyEvaluator:
             eps = cfg.separation_tolerance
             holds = rel > eps
         else:
-            eps = cfg.tolerance
+            if cfg.band_mode == "adaptive":
+                # item 4: per-candidate self-calibrated band (knee + split-conformal holdout),
+                # capped at the global tolerance so it can only *tighten*, never widen-to-accept.
+                bf, _cov = fit_band_auto(op, g.rho, g.scale, cfg.band_holdout_frac, cfg.seed,
+                                         cap=cfg.tolerance)
+                eps = max(float(bf.eps), 1e-9)
+            else:
+                eps = cfg.tolerance
             holds = violation_magnitude(op, g.rho, g.scale) <= eps + 1e-15
         k = int(np.count_nonzero(holds))
         z = z_for_alpha(cfg.ci_alpha)

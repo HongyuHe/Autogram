@@ -1,0 +1,39 @@
+# Example known-invariants file for `autogram calibrate`.
+# Describe each known invariant as a relation over your REAL variable names.
+# No knowledge of Autogram's internal roles is needed.
+#
+# Supported shapes (op / rhs):
+#   ~= or ==  with a variable name  -> pairwise equality
+#   ~= or ==  with {sum: [vars...]} -> reference equals a family sum
+#   ~= or ==  with 0                -> zero
+#   <|>       with a variable name  -> presence pairing (present together / absent together)
+#   >= or <=  with 0                -> one-sided non-negativity / non-positivity
+#
+# The names below use generic entities A/B/C and a directed quantity `flow`;
+# substitute your own variable names (whatever structure they carry).
+
+invariants:
+  - name: two_end_agreement          # the A->B quantity equals the same link read at B
+    op: "=="
+    lhs: "flow_A_to_B"
+    rhs: "flow_B_from_A"
+
+  - name: total_is_group_sum          # a unit's total-out equals the sum of its outgoing flows
+    op: "~="
+    lhs: "out_A"
+    rhs: { sum: ["flow_A_to_B", "flow_A_to_C", "flow_A_to_D"] }
+
+  - name: zero_self_flow
+    op: "=="
+    lhs: "flow_A_to_A"
+    rhs: 0
+
+  - name: link_presence_symmetry
+    op: "<|>"
+    lhs: "flow_A_to_B"
+    rhs: "flow_B_to_A"
+
+  - name: nonnegative_flow
+    op: ">="
+    lhs: "flow_A_to_B"
+    rhs: 0

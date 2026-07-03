@@ -93,9 +93,7 @@ class EnumerationProposer:
             if t.complexity() <= self.G.max_complexity:
                 terms[_term_key(t)] = t
         for fam in self.G.fams_for(binder):
-            for kind in ("SUM",):
-                if kind not in self.G.agg_kinds:
-                    continue
+            for kind in self.G.agg_kinds:          # proposer-chosen: SUM/AVG/MIN/MAX
                 t = A.Agg(kind, fam)
                 if t.complexity() <= self.G.max_complexity:
                     terms[_term_key(t)] = t
@@ -112,7 +110,9 @@ class EnumerationProposer:
 
     def _add_terms_for(self, binder: str) -> List[A.Term]:
         refs = [A.Ref(r) for r in self.G.refs_for(binder)]
-        aggs = [A.Agg("SUM", fam) for fam in self.G.fams_for(binder) if "SUM" in self.G.agg_kinds]
+        aggs = [A.Agg(kind, fam)
+                for fam in self.G.fams_for(binder)
+                for kind in self.G.agg_kinds]        # proposer-chosen aggregations
         leaves = refs + aggs
         terms: Dict[str, A.Term] = {}
         for arity in range(2, max(1, self.G.max_add_arity) + 1):
@@ -134,7 +134,9 @@ class EnumerationProposer:
             base_terms = self._base_terms_for(binder)
             scaled_terms = self._scaled_terms_for(base_terms)
             add_terms = self._add_terms_for(binder)
-            measured = base_terms + add_terms
+            nonlinear_terms = (self._nonlinear_terms_for(base_terms)
+                               if self.G.max_degree >= 2 else [])
+            measured = base_terms + add_terms + nonlinear_terms
             simple_terms = [zero] + base_terms
             for t in measured:
                 yield A.Rule(binder, A.Compare(t, ">=", zero))
@@ -163,6 +165,30 @@ class EnumerationProposer:
                         continue
                     for op in ("~=", "==", "<=", ">="):
                         yield A.Rule(binder, A.Compare(left, op, right))
+            # nonlinear (product/ratio) forms compared to base terms and zero
+            for left in nonlinear_terms:
+                for right in simple_terms:
+                    for op in ("~=", "==", "<=", ">="):
+                        yield A.Rule(binder, A.Compare(left, op, right))
+
+    def _nonlinear_terms_for(self, base_terms: Sequence[A.Term]) -> List[A.Term]:
+        """Products a*b (a!=b) and ratios a/b, gated by the grammar's degree cap (item 6)."""
+        terms: Dict[str, A.Term] = {}
+        leaves = list(base_terms)
+        for i, a in enumerate(leaves):
+            for j, b in enumerate(leaves):
+                if i == j:
+                    continue
+                if i < j:
+                    m = A.Mul(a, b)
+                    if (m.degree() <= self.G.max_degree
+                            and m.complexity() <= self.G.max_complexity):
+                        terms[_term_key(m)] = m
+                d = A.Div(a, b)
+                if (d.degree() <= self.G.max_degree
+                        and d.complexity() <= self.G.max_complexity):
+                    terms[_term_key(d)] = d
+        return [terms[k] for k in sorted(terms)]
 
     def _enumerate(self) -> List[A.Rule]:
         out: List[A.Rule] = []

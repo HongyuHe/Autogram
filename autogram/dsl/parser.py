@@ -23,6 +23,10 @@ def term_to_dict(t: A.Term) -> dict:
         return {"k": "Add", "terms": [term_to_dict(x) for x in t.terms]}
     if isinstance(t, A.Agg):
         return {"k": "Agg", "kind": t.kind, "family_role": t.family_role}
+    if isinstance(t, A.Mul):
+        return {"k": "Mul", "left": term_to_dict(t.left), "right": term_to_dict(t.right)}
+    if isinstance(t, A.Div):
+        return {"k": "Div", "num": term_to_dict(t.num), "den": term_to_dict(t.den)}
     raise TypeError(f"unknown term {t!r}")
 
 
@@ -38,6 +42,10 @@ def term_from_dict(d: dict) -> A.Term:
         return A.Add(tuple(term_from_dict(x) for x in d["terms"]))
     if k == "Agg":
         return A.Agg(d["kind"], d["family_role"])
+    if k == "Mul":
+        return A.Mul(term_from_dict(d["left"]), term_from_dict(d["right"]))
+    if k == "Div":
+        return A.Div(term_from_dict(d["num"]), term_from_dict(d["den"]))
     raise ValueError(f"unknown term kind {k!r}")
 
 

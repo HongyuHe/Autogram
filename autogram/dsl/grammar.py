@@ -24,10 +24,12 @@ class Grammar:
     ops: Tuple[str, ...]
     ref_roles: Dict[str, Tuple[str, ...]]      # binder -> single-column roles
     fam_roles: Dict[str, Tuple[str, ...]]      # binder -> family roles
-    agg_kinds: Tuple[str, ...] = ("SUM", "MIN", "MAX", "AVG")
+    agg_kinds: Tuple[str, ...] = ("SUM",)
     scale_coeffs: Tuple[float, ...] = (-1.0, 0.5, 2.0)
     max_complexity: int = 12
     max_add_arity: int = 3
+    max_degree: int = 1                          # 1 = linear; >=2 enables Mul/Div (item 6)
+    role_exclusions: Tuple[frozenset, ...] = ()  # role pairs that may not co-occur (item 2)
     glyphs: Dict[str, str] = field(default_factory=dict)
 
     def refs_for(self, binder: str) -> Tuple[str, ...]:
@@ -50,4 +52,6 @@ def grammar_from_adapter(adapter, max_complexity: int = 12,
         scale_coeffs=tuple(scale_coeffs),
         max_complexity=max_complexity,
         max_add_arity=max_add_arity,
+        max_degree=getattr(adapter, "max_degree", 1),
+        role_exclusions=getattr(adapter, "role_exclusions", ()),
     )

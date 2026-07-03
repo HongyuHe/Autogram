@@ -1,7 +1,7 @@
 """LLM-style schema induction from observable column names.
 
 v2 exposes exactly two induction backends: ``subagent`` and ``openai``.  Both return the same
-bounded :class:`SchemaSpec` data contract.  The subagent backend is mandatory and concrete: it
+bounded :class:`GrammarSpec` data contract.  The subagent backend is mandatory and concrete: it
 invokes a real long-context agentic-CLI subagent by default (Copilot, Codex, or Claude -- selected
 by harness, Copilot by default), or a caller-supplied responder that does the same.  If no real
 responder/transport is available, induction raises a hard error.
@@ -26,7 +26,7 @@ from ..schema.spec import (
     PRED_SLOTS,
     RefTemplate,
     RoleOntology,
-    SchemaSpec,
+    GrammarSpec,
 )
 from .subagent import AutogramSubagentRunner
 
@@ -44,7 +44,7 @@ def available_inducer_backends() -> tuple[str, str]:
 class SchemaInducer:
     backend = ""
 
-    def induce(self, columns: Sequence[str], sample_rows: Optional[Sequence[dict]] = None) -> SchemaSpec:  # pragma: no cover
+    def induce(self, columns: Sequence[str], sample_rows: Optional[Sequence[dict]] = None) -> GrammarSpec:  # pragma: no cover
         raise NotImplementedError
 
 
@@ -67,9 +67,9 @@ class SubagentSchemaInducer(SchemaInducer):
         else:
             self.responder = responder
         self.harness = harness
-        self.max_attempts = max(1, int(max_attempts or os.environ.get("AUTOGRAM_SUBAGENT_MAX_ATTEMPTS", "3")))
+        self.max_attempts = max(1, int(max_attempts or os.environ.get("AUTOGRAM_SUBAGENT_MAX_ATTEMPTS", "5")))
 
-    def induce(self, columns, sample_rows=None) -> SchemaSpec:
+    def induce(self, columns, sample_rows=None) -> GrammarSpec:
         if self.responder is None:
             raise RuntimeError(
                 "Subagent schema induction requires a real subagent responder/transport; "
@@ -113,13 +113,13 @@ class SubagentSchemaInducer(SchemaInducer):
                     payload = self.responder(_completeness_repair_prompt(prompt, raw, last_error))
                     continue
                 break
-            except Exception as exc:  # model returned malformed JSON or an invalid SchemaSpec
+            except Exception as exc:  # model returned malformed JSON or an invalid GrammarSpec
                 last_error = exc
                 if attempt + 1 < self.max_attempts:
                     payload = self.responder(_repair_prompt(prompt, payload, exc))
                     continue
                 break
-        raise RuntimeError("Subagent returned invalid or incomplete SchemaSpec JSON; no offline fallback is available") from last_error
+        raise RuntimeError("Subagent returned invalid or incomplete GrammarSpec JSON; no offline fallback is available") from last_error
 
     def to_json_spec(self, columns, sample_rows=None) -> str:
         return json.dumps(_spec_to_json(self.induce(columns, sample_rows)))
@@ -134,7 +134,7 @@ class OpenAISchemaInducer(SchemaInducer):
         self.responder = responder
         self.model = model
 
-    def induce(self, columns, sample_rows=None) -> SchemaSpec:
+    def induce(self, columns, sample_rows=None) -> GrammarSpec:
         prompt = _schema_prompt(columns, sample_rows)
         if self.responder is not None:
             payload = self.responder(prompt)
@@ -156,7 +156,7 @@ class OpenAISchemaInducer(SchemaInducer):
                 spec = _spec_from_json(repaired)
                 _validate_schema_completeness(spec, columns)
                 return spec
-            raise RuntimeError("OpenAI returned incomplete SchemaSpec JSON") from exc
+            raise RuntimeError("OpenAI returned incomplete GrammarSpec JSON") from exc
 
 
 def make_inducer(backend: str = "subagent", **kwargs) -> SchemaInducer:
@@ -167,7 +167,7 @@ def make_inducer(backend: str = "subagent", **kwargs) -> SchemaInducer:
     raise ValueError(f"unknown schema inducer backend {backend!r}; expected one of {_BACKENDS}")
 
 
-def induce_spec(columns: Sequence[str], inducer: Optional[SchemaInducer] = None, sample_rows=None) -> SchemaSpec:
+def induce_spec(columns: Sequence[str], inducer: Optional[SchemaInducer] = None, sample_rows=None) -> GrammarSpec:
     return (inducer or make_inducer("subagent")).induce(columns, sample_rows)
 
 
@@ -178,13 +178,13 @@ def induce_adapter(columns: Sequence[str], inducer: Optional[SchemaInducer] = No
 def _schema_prompt(columns, sample_rows) -> str:
     head = "\n".join(list(columns)[:500])
     return (
-        "Return ONLY valid JSON for an Autogram SchemaSpec. This is NOT a SQL/database schema. "
+        "Return ONLY valid JSON for an Autogram GrammarSpec. This is NOT a SQL/database schema. "
         "Use ONLY the exact column names between EXACT_COLUMNS_BEGIN and EXACT_COLUMNS_END; "
         "ignore all other context and never invent id/title/status columns.\n\n"
         "EXACT_COLUMNS_BEGIN\n" + head + "\nEXACT_COLUMNS_END\n\n"
         "Top-level keys MUST be exactly: name, patterns, ontology, ref_templates, "
         "family_selectors, binder_enumerate, cell_codec, noisy_kind, demand_kind, "
-        "link_marker_direction, notes. The object must contain key 'ontology'.\n\n"
+        "link_marker_direction, max_degree, role_exclusions, notes. The object must contain key 'ontology'.\n\n"
         "ColumnPattern fields: name, matcher, kind, direction, regex, node_groups, source_group, "
         "destination_group, peer_group, token_groups, prefix, sep, split_slots. Use matcher='regex' and "
         "anchored regexes. Ontology fields: binders, ref_roles, fam_roles, ops, agg_kinds, "
@@ -230,7 +230,16 @@ def _schema_prompt(columns, sample_rows) -> str:
         "columns, but demand columns with punctuation still need whole-token matching. "
         "Preserve observed kind and direction spellings exactly in regexes and templates. "
         "Use cell_codec {'kind':'dict_gt_hidden','primary':'ground_truth','clean':'hidden_ground_truth'}, "
-        "ops ['~=','==','!=','<=','>=','<|>'], and agg_kinds ['SUM','MIN','MAX','AVG']. "
+        "ops ['~=','==','!=','<=','>=','<|>'], and agg_kinds — a JSON array of the aggregations "
+        "meaningful for this dataset: always include 'SUM'; add 'MIN'/'MAX'/'AVG' ONLY when "
+        "extremal or mean relationships across a family are plausible from the column semantics. "
+        "Set max_degree to 1 (linear) by DEFAULT; set it to 2 ONLY if ratio or product "
+        "relationships are plausible from the column semantics (e.g. a rate = count/duration, or "
+        "an area = width*height). "
+        "Set role_exclusions to a JSON array of two-element arrays [roleA, roleB]: pairs of ref "
+        "roles whose real-world quantities are semantically unrelated and must NOT be compared or "
+        "combined in one formula (a blocklist; leave [] unless two roles are clearly unrelated, "
+        "e.g. a temperature vs a packet count). "
         "The binder_enumerate object should look like {'cell':'per_measured_col','node':'per_node',"
         "'network':'singleton','link':'per_directed_link'} when link exists."
     )
@@ -238,7 +247,7 @@ def _schema_prompt(columns, sample_rows) -> str:
 
 def _repair_prompt(original_prompt: str, bad_payload: str, error: Exception) -> str:
     return (
-        "Your previous Autogram SchemaSpec response was invalid. Return ONLY corrected valid "
+        "Your previous Autogram GrammarSpec response was invalid. Return ONLY corrected valid "
         "JSON for the same task. Use double-quoted JSON keys/strings; escape regex backslashes "
         "as JSON strings; include the top-level key 'ontology'. Do not add markdown.\n\n"
         f"Validation error: {type(error).__name__}: {error}\n\n"
@@ -249,7 +258,7 @@ def _repair_prompt(original_prompt: str, bad_payload: str, error: Exception) -> 
 
 def _completeness_repair_prompt(original_prompt: str, bad_payload, error: Exception) -> str:
     return (
-        "Your previous Autogram SchemaSpec was valid JSON but incomplete on the real columns. "
+        "Your previous Autogram GrammarSpec was valid JSON but incomplete on the real columns. "
         "Return ONLY corrected JSON for the same task. Preserve the real model-induced schema, "
         "but fix directed measured link patterns so '<kind>_<X>_<connector>_<Y>' sets "
         "peer_group to the second entity group, and every declared binder grounds at least one "
@@ -276,7 +285,7 @@ def _load_json_object(payload: str | dict) -> dict:
         return json.loads(text[start:end + 1])
 
 
-def _spec_to_json(spec: SchemaSpec) -> dict:
+def _spec_to_json(spec: GrammarSpec) -> dict:
     return {
         "name": spec.name,
         "patterns": [p.__dict__ for p in spec.patterns],
@@ -296,6 +305,8 @@ def _spec_to_json(spec: SchemaSpec) -> dict:
         "noisy_kind": spec.noisy_kind,
         "demand_kind": spec.demand_kind,
         "link_marker_direction": spec.link_marker_direction,
+        "max_degree": spec.max_degree,
+        "role_exclusions": [sorted(p) for p in spec.role_exclusions],
         "notes": spec.notes,
     }
 
@@ -506,41 +517,73 @@ def _repair_measured_pair_patterns_from_entities(payload: dict, entities: set[st
     alt = "|".join(re.escape(entity) for entity in sorted(entities, key=lambda x: (-len(x), x)))
     notes: list[str] = []
     for p in repaired.get("patterns", []):
+        if p.get("kind") != noisy_kind:
+            continue
         direction = str(p.get("direction") or "")
         if not direction or direction in ("demand", "directed", "link"):
             continue
         nodes = _payload_node_groups(p)
-        if len(nodes) < 2 and not p.get("peer_group"):
-            continue
-        regex = rf"^{re.escape(noisy_kind)}_(?P<source>(?:{alt}))_{re.escape(direction)}_(?P<peer>(?:{alt}))$"
-        changed = (
-            p.get("kind") != noisy_kind
-            or p.get("direction") != direction
-            or p.get("matcher") != "regex"
-            or p.get("regex") != regex
-            or tuple(p.get("node_groups") or ()) != ("source", "peer")
-            or p.get("source_group") != "source"
-            or p.get("peer_group") != "peer"
-            or tuple(p.get("token_groups") or ()) != ("source", "peer")
-        )
-        p.update({
-            "matcher": "regex",
-            "kind": noisy_kind,
-            "direction": direction,
-            "regex": regex,
-            "node_groups": ["source", "peer"],
-            "source_group": "source",
-            "destination_group": "",
-            "peer_group": "peer",
-            "token_groups": ["source", "peer"],
-            "prefix": "",
-            "sep": "_",
-            "split_slots": ["source", "peer"],
-        })
-        if changed:
-            notes.append(
-                f"{p.get('name') or direction}: measured_pair_regex_entities={len(entities)}"
+        is_directed = len(nodes) >= 2 or bool(p.get("peer_group"))
+        if is_directed:
+            # directed measured column: <kind>_<source>_<direction>_<peer>
+            regex = rf"^{re.escape(noisy_kind)}_(?P<source>(?:{alt}))_{re.escape(direction)}_(?P<peer>(?:{alt}))$"
+            changed = (
+                p.get("kind") != noisy_kind
+                or p.get("direction") != direction
+                or p.get("matcher") != "regex"
+                or p.get("regex") != regex
+                or tuple(p.get("node_groups") or ()) != ("source", "peer")
+                or p.get("source_group") != "source"
+                or p.get("peer_group") != "peer"
+                or tuple(p.get("token_groups") or ()) != ("source", "peer")
             )
+            p.update({
+                "matcher": "regex",
+                "kind": noisy_kind,
+                "direction": direction,
+                "regex": regex,
+                "node_groups": ["source", "peer"],
+                "source_group": "source",
+                "destination_group": "",
+                "peer_group": "peer",
+                "token_groups": ["source", "peer"],
+                "prefix": "",
+                "sep": "_",
+                "split_slots": ["source", "peer"],
+            })
+            if changed:
+                notes.append(
+                    f"{p.get('name') or direction}: measured_pair_regex_entities={len(entities)}"
+                )
+        else:
+            # single-node measured column: <kind>_<node>_<direction> (e.g. origination/termination).
+            # Rebuilt from the structural entity set so a truncating LLM boundary class
+            # (e.g. [A-Z]+ clipping 'ATLAM5' -> 'ATLAM') cannot drop the node token.
+            regex = rf"^{re.escape(noisy_kind)}_(?P<source>(?:{alt}))_{re.escape(direction)}$"
+            changed = (
+                p.get("matcher") != "regex"
+                or p.get("regex") != regex
+                or tuple(p.get("node_groups") or ()) != ("source",)
+                or p.get("source_group") != "source"
+            )
+            p.update({
+                "matcher": "regex",
+                "kind": noisy_kind,
+                "direction": direction,
+                "regex": regex,
+                "node_groups": ["source"],
+                "source_group": "source",
+                "destination_group": "",
+                "peer_group": "",
+                "token_groups": ["source"],
+                "prefix": "",
+                "sep": "_",
+                "split_slots": ["source"],
+            })
+            if changed:
+                notes.append(
+                    f"{p.get('name') or direction}: measured_single_regex_entities={len(entities)}"
+                )
     return repaired, notes
 
 
@@ -551,7 +594,7 @@ def _nondegenerate_bindings(bindings: Sequence[dict]) -> list[dict]:
     ]
 
 
-def _validate_schema_completeness(spec: SchemaSpec, columns: Sequence[str]) -> None:
+def _validate_schema_completeness(spec: GrammarSpec, columns: Sequence[str]) -> None:
     adapter = compile_spec(spec)
     nm = NameModel.from_columns_with_adapter(columns, adapter)
     errors: list[str] = []
@@ -648,7 +691,7 @@ def _log_schema_event(event: str, payload: dict) -> None:
         pass
 
 
-def _spec_from_json(payload) -> SchemaSpec:
+def _spec_from_json(payload) -> GrammarSpec:
     onto = payload["ontology"]
     noisy_kind = payload.get("noisy_kind", "measurement")
     demand_kind = payload.get("demand_kind", "demand")
@@ -669,7 +712,7 @@ def _spec_from_json(payload) -> SchemaSpec:
                                  ((t.binder, t.role) for t in ref_templates))
     fam_roles = _canonical_roles(_role_map(onto["fam_roles"], "fam_roles"), binders,
                                  ((s.binder, s.family_role) for s in family_selectors))
-    return SchemaSpec(
+    return GrammarSpec(
         name=payload.get("name", "induced"),
         patterns=patterns,
         ontology=RoleOntology(
@@ -677,7 +720,7 @@ def _spec_from_json(payload) -> SchemaSpec:
             ref_roles=ref_roles,
             fam_roles=fam_roles,
             ops=tuple(onto.get("ops", ("~=", "==", "!=", "<=", ">=", "<|>"))),
-            agg_kinds=tuple(onto.get("agg_kinds", ("SUM", "MIN", "MAX", "AVG"))),
+            agg_kinds=tuple(onto.get("agg_kinds", ("SUM",))),
             ref_glyphs=dict(onto.get("ref_glyphs", {})),
             fam_glyphs=dict(onto.get("fam_glyphs", {})),
         ),
@@ -688,6 +731,12 @@ def _spec_from_json(payload) -> SchemaSpec:
         noisy_kind=noisy_kind,
         demand_kind=demand_kind,
         link_marker_direction=(link_directions[0] if link_directions else payload.get("link_marker_direction") or _first_link_direction(ref_templates) or "demand"),
+        max_degree=int(payload.get("max_degree", 1) or 1),
+        role_exclusions=tuple(
+            frozenset(str(x) for x in pair)
+            for pair in payload.get("role_exclusions", []) or []
+            if isinstance(pair, (list, tuple)) and len(pair) == 2
+        ),
         notes=payload.get("notes", ""),
     )
 

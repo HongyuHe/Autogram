@@ -1,4 +1,4 @@
-"""Concrete long-context subagent transport for SchemaSpec induction.
+"""Concrete long-context subagent transport for GrammarSpec induction.
 
 The transport shells out to an agentic coding CLI running in headless / non-interactive mode and
 returns its raw response text.  Three harnesses are supported and selected by the

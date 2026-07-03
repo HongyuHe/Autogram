@@ -92,11 +92,23 @@ def discover(columns: Sequence[str], matrix: np.ndarray, *,
     scfg = search_cfg or SearchConfig()
     if inducer is None:
         inducer = make_inducer("subagent", responder=llm_responder) if llm_responder is not None else make_inducer("subagent")
+    ds, G, _spec = prepare_columns(columns, matrix, inducer=inducer, search_cfg=scfg,
+                                   name=name, timestamps=timestamps, sample_rows=sample_rows)
+    return run_prepared(ds, G, discovery_cfg=dcfg, search_cfg=scfg, proposer=proposer)
+
+
+def prepare_columns(columns: Sequence[str], matrix: np.ndarray, *,
+                    inducer: Optional[SchemaInducer] = None,
+                    search_cfg: Optional[SearchConfig] = None,
+                    name: str = "synthetic", timestamps=None, sample_rows=None):
+    """Induce the schema and build ``(dataset, grammar, spec)`` once from a numeric matrix."""
+    scfg = search_cfg or SearchConfig()
+    inducer = inducer or make_inducer("subagent")
     spec = induce_spec(columns, inducer, sample_rows)
     adapter = compile_spec(spec)
     ds = _dataset_from_columns(columns, matrix, adapter, name, timestamps)
     G = grammar_from_adapter(adapter, scfg.max_complexity, scfg.max_add_arity)
-    return _run_dataset(ds, G, proposer=proposer, dcfg=dcfg, scfg=scfg)
+    return ds, G, spec
 
 
 def discover_dataframe(df, *, inducer: Optional[SchemaInducer] = None,
@@ -106,12 +118,46 @@ def discover_dataframe(df, *, inducer: Optional[SchemaInducer] = None,
     """Run discovery on a pandas DataFrame, decoding only observed ``ground_truth`` values."""
     dcfg = discovery_cfg or DiscoveryConfig()
     scfg = search_cfg or SearchConfig()
+    ds, G, _spec = prepare_dataframe(df, inducer=inducer, search_cfg=scfg, name=name)
+    return run_prepared(ds, G, discovery_cfg=dcfg, search_cfg=scfg, proposer=proposer)
+
+
+def prepare_dataframe(df, *, inducer: Optional[SchemaInducer] = None,
+                      search_cfg: Optional[SearchConfig] = None, name: str = "dataframe"):
+    """Induce the schema and build ``(dataset, grammar, spec)`` once.
+
+    Separating induction (one expensive/non-deterministic LLM call) from evaluation lets a
+    calibration loop re-score the *same* induced grammar under many generic-knob settings
+    (tolerance/threshold/band) without re-inducing -- the schema is a property of the dataset's
+    column names, not of the numeric thresholds being tuned.
+    """
+    scfg = search_cfg or SearchConfig()
     inducer = inducer or make_inducer("subagent")
     spec = induce_spec(list(df.columns), inducer, sample_rows=None)
+    ds, G = build_dataframe_grammar(df, spec, search_cfg=scfg, name=name)
+    return ds, G, spec
+
+
+def build_dataframe_grammar(df, spec, *, search_cfg: Optional[SearchConfig] = None,
+                            name: str = "dataframe"):
+    """Compile a (possibly capability-widened) spec into ``(dataset, grammar)`` -- no induction.
+
+    Used by the calibration loop's grammar re-induction tier: after a fresh induction is widened
+    (more aggregations / higher degree), this rebuilds the runnable grammar from the edited spec.
+    """
+    scfg = search_cfg or SearchConfig()
     adapter = compile_spec(spec)
     timestamps = df["timestamp"].values if "timestamp" in df.columns else None
     ds = load_dataframe(df, adapter, name, timestamps=timestamps)
     G = grammar_from_adapter(adapter, scfg.max_complexity, scfg.max_add_arity)
+    return ds, G
+
+
+def run_prepared(ds: Dataset, G: Grammar, *, discovery_cfg: Optional[DiscoveryConfig] = None,
+                 search_cfg: Optional[SearchConfig] = None, proposer=None) -> DiscoveryResult:
+    """Enumerate + evaluate on an already-prepared ``(dataset, grammar)`` (no induction)."""
+    dcfg = discovery_cfg or DiscoveryConfig()
+    scfg = search_cfg or SearchConfig()
     return _run_dataset(ds, G, proposer=proposer, dcfg=dcfg, scfg=scfg)
 
 
