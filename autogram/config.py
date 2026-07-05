@@ -27,6 +27,16 @@ class DiscoveryConfig:
     subsample: int = 0                  # 0 => use every grounded point
     seed: int = 0
 
+    # Per-rule acceptance threshold (per-law precision gate). DEFAULT "per_rule" raises the
+    # bar for structurally fragile candidates; "global" reproduces the flat hold_rate_threshold.
+    threshold_policy: str = "per_rule"
+    thr_base_complexity: int = 6        # no complexity penalty at/below this AST size
+    thr_complexity_penalty: float = 0.01   # added per unit of complexity above the baseline
+    thr_separation_penalty: float = 0.05   # scaled by fitted eps / tolerance cap (adaptive band only)
+    thr_min_bindings: int = 8           # below this many bindings, apply a fragility penalty
+    thr_low_support_penalty: float = 0.03
+    thr_ceiling: float = 0.95           # per-rule bar never exceeds this
+
 
 @dataclass
 class SearchConfig:

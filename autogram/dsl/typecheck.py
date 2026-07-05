@@ -133,9 +133,11 @@ def is_admissible(rule: A.Rule, G) -> tuple:
         return False, "self-referential / reducible comparison"
     if _has_duplicate_leaf(atom.left) or _has_duplicate_leaf(atom.right):
         return False, "self-referential / reducible comparison"
-    if rule.complexity() > G.max_complexity:
+    cap_c = G.complexity_cap(rule.binder) if hasattr(G, "complexity_cap") else getattr(G, "max_complexity", 12)
+    if rule.complexity() > cap_c:
         return False, "exceeds max complexity"
-    if max(atom.left.degree(), atom.right.degree()) > getattr(G, "max_degree", 1):
+    cap_d = G.degree_cap(rule.binder) if hasattr(G, "degree_cap") else getattr(G, "max_degree", 1)
+    if max(atom.left.degree(), atom.right.degree()) > cap_d:
         return False, "exceeds max polynomial degree"
     for side in (atom.left, atom.right):
         if isinstance(side, A.Div) and not _has_measured(side.den):

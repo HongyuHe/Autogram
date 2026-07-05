@@ -21,6 +21,8 @@ import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import numpy as np
+
 from ..dsl import ast as A
 from ..dsl.binders import enumerate_bindings, resolve_ref
 from .loop import DiscoveryResult
@@ -94,9 +96,73 @@ def _one_sided_columns(result: DiscoveryResult, op: str) -> set:
     return cols
 
 
-def recover_known(result: DiscoveryResult, known: List[KnownInvariant]) -> dict:
-    """Report per-invariant recovery + aggregate recall of the user's known invariants."""
+def _col_scale(frame, col: str) -> float:
+    """Robust magnitude (median absolute value) of a column's observed data.
+
+    Returns 0.0 for a column the frame does not carry, so an unknown column is never treated as
+    negligible (it is kept, which keeps matching conservative).
+    """
+    if not frame.has(col):
+        return 0.0
+    v = frame.col(col)
+    if v.size == 0:
+        return 0.0
+    v = v[~np.isnan(v)]
+    return float(np.median(np.abs(v))) if v.size else 0.0
+
+
+def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset:
+    """Drop summed columns whose observed data is negligible against the anchor's scale.
+
+    A column that is (near-)zero across all observations adds ~0 to a sum, so removing it leaves
+    the sum -- and therefore the equality it feeds -- unchanged.  Two groupings that differ only by
+    such columns describe the *same* physical fact.  The negligibility scale is anchored on the
+    reference (left-hand side) column, so the test is dimensionless and dataset-agnostic.  We never
+    reduce a whole group to empty (that would collapse distinct laws), and unknown columns are kept.
+    """
+    scale = _col_scale(frame, anchor_col)
+    if scale <= 0.0:
+        return frozenset(cols)                       # no usable anchor scale -> do not canonicalize
+    thresh = zero_tol * scale
+    kept = frozenset(c for c in cols
+                     if not (frame.has(c) and _col_scale(frame, c) < thresh))
+    return kept if kept else frozenset(cols)         # never canonicalize an entire group away
+
+
+def _canonicalize(sig, frame, zero_tol: float):
+    """Map a relation signature to a data-canonical form (near-zero sum members removed).
+
+    Only the sum-shaped signatures carry groupings, so only they are canonicalized; pairwise,
+    zero, presence and one-sided signatures pass through unchanged.  The transform is idempotent
+    and strictly widens matching: anything that matched exactly still matches after canonicalizing.
+    """
+    if not isinstance(sig, tuple) or not sig:
+        return sig
+    if sig[0] == "ref_sum":
+        ref_col, cols = sig[1]
+        return ("ref_sum", (ref_col, _drop_negligible(cols, ref_col, frame, zero_tol)))
+    if sig[0] == "agg_ref_balance":
+        sides = frozenset(
+            (ref, _drop_negligible(fam, ref, frame, zero_tol)) for (ref, fam) in sig[1]
+        )
+        return ("agg_ref_balance", sides)
+    return sig
+
+
+def recover_known(result: DiscoveryResult, known: List[KnownInvariant],
+                  zero_tol: float = 1e-4) -> dict:
+    """Report per-invariant recovery + aggregate recall of the user's known invariants.
+
+    A known invariant counts as recovered iff the learned portfolio contains a rule with the same
+    *data-canonical* relation signature.  Canonicalization removes provably-negligible (near-zero)
+    columns from any summed grouping (``zero_tol`` is the drop threshold, relative to the reference
+    column's scale), so a known sum written over a slightly different column set -- e.g. one that
+    includes a structurally-zero self term the induced grammar omits -- still matches the physically
+    identical law the engine found.  Set ``zero_tol=0`` to require exact column-set matches.
+    """
+    frame = result.dataset.observed
     rels = portfolio_relations(result)
+    canon_rels = {_canonicalize(s, frame, zero_tol) for s in rels}
     ge_cols = _one_sided_columns(result, ">=")
     le_cols = _one_sided_columns(result, "<=")
     report: List[dict] = []
@@ -109,7 +175,7 @@ def recover_known(result: DiscoveryResult, known: List[KnownInvariant]) -> dict:
         elif sig[0] == "one_sided":
             recovered = inv.lhs in (ge_cols if sig[2] == ">=" else le_cols)
         else:
-            recovered = sig in rels
+            recovered = _canonicalize(sig, frame, zero_tol) in canon_rels
         n_ok += int(recovered)
         report.append({"name": inv.name, "op": inv.op, "recovered": bool(recovered),
                        "signature": str(sig)})

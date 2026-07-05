@@ -12,12 +12,35 @@ def _rule(binder, left, op, right):
 
 
 def test_accepts_two_end_agreement_by_hold_rate(dataset):
-    ev = DataOnlyEvaluator(dataset, DiscoveryConfig(seed=0, hold_rate_threshold=0.9))
+    # Isolates the hold-rate acceptance path; pin the flat threshold so the per-rule precision
+    # policy (covered by test_per_rule_threshold_*) does not interact with this thin margin.
+    ev = DataOnlyEvaluator(dataset, DiscoveryConfig(seed=0, hold_rate_threshold=0.9,
+                                                    threshold_policy="global"))
     res = ev.evaluate(_rule("link", A.Ref("o1"), "~=", A.Ref("o0_rev")))
     assert res.accepted
     assert res.hold_rate_lo >= 0.9
     assert res.statistic == "hold_rate"
     assert res.strictness in ("exact", "soft", "loose")
+
+
+def test_per_rule_threshold_raises_bar_for_low_support(dataset):
+    rule = _rule("link", A.Ref("o1"), "~=", A.Ref("o0_rev"))
+    # global policy uses the flat bar verbatim, so the razor-thin margin clears 0.9.
+    g = DataOnlyEvaluator(dataset, DiscoveryConfig(seed=0, hold_rate_threshold=0.9,
+                                                   threshold_policy="global")).evaluate(rule)
+    assert g.threshold == 0.9 and g.accepted
+    # precision-aware (default) raises the per-rule bar for this fragile (low-support) grounding,
+    # so the same near-miss hold-rate no longer clears it -- a per-law precision gate in action.
+    p = DataOnlyEvaluator(dataset, DiscoveryConfig(seed=0, hold_rate_threshold=0.9)).evaluate(rule)
+    assert p.threshold > g.threshold
+    assert not p.accepted
+
+
+def test_global_threshold_policy_matches_flat_bar(dataset):
+    ev = DataOnlyEvaluator(dataset, DiscoveryConfig(seed=0, hold_rate_threshold=0.62,
+                                                    threshold_policy="global"))
+    res = ev.evaluate(_rule("node", A.Agg("SUM", "demand_row"), "~=", A.Ref("measurement_source")))
+    assert res.threshold == 0.62
 
 
 def test_accepts_origination_row_sum(dataset):

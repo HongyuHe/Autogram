@@ -160,4 +160,4 @@ Autogram recovers laws that are **expressible in the induced grammar** and **sta
 uv run pytest tests -q
 ```
 
-Tests exercise the real subagent induction path by default, so the harness must be installed and authenticated. Autogram is version 0.3.0.
+Tests exercise the real subagent induction path by default, so the harness must be installed and authenticated. Autogram is version 0.4.0.

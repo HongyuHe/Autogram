@@ -1,6 +1,6 @@
 [project]
 name = "autogram-analysis"
-version = "0.3.0"
+version = "0.4.0"
 requires-python = ">=3.12"
 # Single uv-managed environment for both the analysis notebooks and the `autogram` P3 engine.
 # `uv sync` provisions the .venv from this file + uv.lock; `uv run ...` executes against it.

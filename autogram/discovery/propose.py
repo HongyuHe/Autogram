@@ -87,38 +87,42 @@ class EnumerationProposer:
         return list(self._cache)
 
     def _base_terms_for(self, binder: str) -> List[A.Term]:
+        cap = self.G.complexity_cap(binder)
         terms: Dict[str, A.Term] = {}
         for role in self.G.refs_for(binder):
             t = A.Ref(role)
-            if t.complexity() <= self.G.max_complexity:
+            if t.complexity() <= cap:
                 terms[_term_key(t)] = t
         for fam in self.G.fams_for(binder):
             for kind in self.G.agg_kinds:          # proposer-chosen: SUM/AVG/MIN/MAX
                 t = A.Agg(kind, fam)
-                if t.complexity() <= self.G.max_complexity:
+                if t.complexity() <= cap:
                     terms[_term_key(t)] = t
         return [terms[k] for k in sorted(terms)]
 
-    def _scaled_terms_for(self, base_terms: Sequence[A.Term]) -> List[A.Term]:
+    def _scaled_terms_for(self, binder: str, base_terms: Sequence[A.Term]) -> List[A.Term]:
+        cap = self.G.complexity_cap(binder)
         terms: Dict[str, A.Term] = {}
         for t in base_terms:
             for coeff in self.G.scale_coeffs:
                 st = normalize_term(A.Scale(float(coeff), t))
-                if st.complexity() <= self.G.max_complexity:
+                if st.complexity() <= cap:
                     terms[_term_key(st)] = st
         return [terms[k] for k in sorted(terms)]
 
     def _add_terms_for(self, binder: str) -> List[A.Term]:
+        comp_cap = self.G.complexity_cap(binder)
+        arity_cap = self.G.add_arity_cap(binder)
         refs = [A.Ref(r) for r in self.G.refs_for(binder)]
         aggs = [A.Agg(kind, fam)
                 for fam in self.G.fams_for(binder)
                 for kind in self.G.agg_kinds]        # proposer-chosen aggregations
         leaves = refs + aggs
         terms: Dict[str, A.Term] = {}
-        for arity in range(2, max(1, self.G.max_add_arity) + 1):
+        for arity in range(2, max(1, arity_cap) + 1):
             for combo in itertools.combinations(leaves, arity):
                 at = normalize_term(A.Add(tuple(combo)))
-                if at.complexity() <= self.G.max_complexity:
+                if at.complexity() <= comp_cap:
                     terms[_term_key(at)] = at
         return [terms[k] for k in sorted(terms)]
 
@@ -132,10 +136,10 @@ class EnumerationProposer:
         for binder in self.G.binders:
             zero = A.Const(0.0)
             base_terms = self._base_terms_for(binder)
-            scaled_terms = self._scaled_terms_for(base_terms)
+            scaled_terms = self._scaled_terms_for(binder, base_terms)
             add_terms = self._add_terms_for(binder)
-            nonlinear_terms = (self._nonlinear_terms_for(base_terms)
-                               if self.G.max_degree >= 2 else [])
+            nonlinear_terms = (self._nonlinear_terms_for(binder, base_terms)
+                               if self.G.degree_cap(binder) >= 2 else [])
             measured = base_terms + add_terms + nonlinear_terms
             simple_terms = [zero] + base_terms
             for t in measured:
@@ -171,8 +175,10 @@ class EnumerationProposer:
                     for op in ("~=", "==", "<=", ">="):
                         yield A.Rule(binder, A.Compare(left, op, right))
 
-    def _nonlinear_terms_for(self, base_terms: Sequence[A.Term]) -> List[A.Term]:
-        """Products a*b (a!=b) and ratios a/b, gated by the grammar's degree cap (item 6)."""
+    def _nonlinear_terms_for(self, binder: str, base_terms: Sequence[A.Term]) -> List[A.Term]:
+        """Products a*b (a!=b) and ratios a/b, gated by the binder's degree cap (item 6)."""
+        deg_cap = self.G.degree_cap(binder)
+        comp_cap = self.G.complexity_cap(binder)
         terms: Dict[str, A.Term] = {}
         leaves = list(base_terms)
         for i, a in enumerate(leaves):
@@ -181,12 +187,12 @@ class EnumerationProposer:
                     continue
                 if i < j:
                     m = A.Mul(a, b)
-                    if (m.degree() <= self.G.max_degree
-                            and m.complexity() <= self.G.max_complexity):
+                    if (m.degree() <= deg_cap
+                            and m.complexity() <= comp_cap):
                         terms[_term_key(m)] = m
                 d = A.Div(a, b)
-                if (d.degree() <= self.G.max_degree
-                        and d.complexity() <= self.G.max_complexity):
+                if (d.degree() <= deg_cap
+                        and d.complexity() <= comp_cap):
                     terms[_term_key(d)] = d
         return [terms[k] for k in sorted(terms)]
 
@@ -195,7 +201,7 @@ class EnumerationProposer:
         seen = set()
         for raw in self._candidate_rules():
             rule = normalize_rule(raw)
-            if rule.complexity() > self.G.max_complexity:
+            if rule.complexity() > self.G.complexity_cap(rule.binder):
                 continue
             ok, _ = is_admissible(rule, self.G)
             if not ok:

@@ -133,6 +133,64 @@ def _widen_spec(spec, *, all_aggs: bool = False, max_degree: Optional[int] = Non
     return replace(spec, ontology=onto, max_degree=md, role_exclusions=excl)
 
 
+def _merge_specs(base, new):
+    """Union two specs' search spaces so re-induction can only *grow* the grammar (item 2).
+
+    A fresh induction each tier is non-deterministic: a role/pattern/family present in an earlier
+    tier can be absent from a later proposal, so a bare re-induction does **not** guarantee the
+    "search space strictly grows" property the tiers rely on.  This folds the new proposal into the
+    accumulated ``base`` spec, keeping ``base`` authoritative on every conflict so no existing
+    grounding is silently redefined, and only *adding* what ``new`` proposes:
+
+    * ``patterns`` / ``ref_templates`` / ``family_selectors`` -- base kept; a new entry is appended
+      only when its identity key (pattern name, ``(binder, role)``, ``(binder, family_role)``) is
+      unseen, so a shared role keeps ``base``'s grounding.
+    * ``ontology`` -- binders, per-binder ref/family roles, ops and agg kinds are unioned; base
+      glyphs win.
+    * ``binder_enumerate`` -- base strategy wins per binder; new binders are added.  ``max_degree``
+      is the max of the two.
+    * ``role_exclusions`` and all dataset-level constants (codec, kinds, link marker, name) are
+      taken from ``base`` unchanged.
+
+    The result therefore admits **every** rule ``base`` did (a genuine superset) plus the novel
+    vocabulary ``new`` contributes -- regardless of what the fresh proposal omitted.
+    """
+    seen_pat = {p.name for p in base.patterns}
+    patterns = base.patterns + tuple(p for p in new.patterns if p.name not in seen_pat)
+
+    seen_ref = {(t.binder, t.role) for t in base.ref_templates}
+    ref_templates = base.ref_templates + tuple(
+        t for t in new.ref_templates if (t.binder, t.role) not in seen_ref)
+
+    seen_fam = {(s.binder, s.family_role) for s in base.family_selectors}
+    family_selectors = base.family_selectors + tuple(
+        s for s in new.family_selectors if (s.binder, s.family_role) not in seen_fam)
+
+    ob, on = base.ontology, new.ontology
+
+    def _union_roles(a, b):
+        out = {k: tuple(v) for k, v in a.items()}
+        for k, v in b.items():
+            out[k] = tuple(dict.fromkeys(tuple(out.get(k, ())) + tuple(v)))
+        return out
+
+    ontology = replace(
+        ob,
+        binders=tuple(dict.fromkeys(tuple(ob.binders) + tuple(on.binders))),
+        ref_roles=_union_roles(ob.ref_roles, on.ref_roles),
+        fam_roles=_union_roles(ob.fam_roles, on.fam_roles),
+        ops=tuple(dict.fromkeys(tuple(ob.ops) + tuple(on.ops))),
+        agg_kinds=tuple(dict.fromkeys(tuple(ob.agg_kinds) + tuple(on.agg_kinds))),
+        ref_glyphs={**on.ref_glyphs, **ob.ref_glyphs},
+        fam_glyphs={**on.fam_glyphs, **ob.fam_glyphs},
+    )
+
+    return replace(base, patterns=patterns, ontology=ontology,
+                   ref_templates=ref_templates, family_selectors=family_selectors,
+                   binder_enumerate={**new.binder_enumerate, **base.binder_enumerate},
+                   max_degree=max(base.max_degree, new.max_degree))
+
+
 def _spec_summary(spec, tier: int, caps: dict) -> dict:
     onto = spec.ontology
     return {
@@ -187,13 +245,19 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     reinductions = 0
     prev_tier_best = -1.0
     global_iter = 0
+    accumulated = None     # running union of induced specs -> re-induction can only grow it (item 2)
     for ti, caps in enumerate(tiers):
         spec = induce_spec(list(df.columns), inducer)     # (re-)propose the grammar
         if ti > 0:
             reinductions += 1
+            # Fold the fresh (non-deterministic) proposal back into the accumulated grammar so a
+            # later tier can never drop a role/pattern an earlier tier already had -- this is what
+            # makes "the search space strictly grows" across tiers actually hold (item 2).
+            spec = _merge_specs(accumulated, spec)
         spec = _widen_spec(spec, all_aggs=caps.get("all_aggs", False),
                            max_degree=caps.get("max_degree"),
                            drop_exclusions=caps.get("drop_exclusions", False))
+        accumulated = spec
         grammar_specs.append(_spec_summary(spec, ti, caps))
         ds, G = build_dataframe_grammar(df, spec, search_cfg=scfg, name=name)
 

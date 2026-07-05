@@ -15,6 +15,7 @@ from ..dsl import ast as A
 from ..dsl.evaluate import ground
 from ..evaluator.band import fit_band_auto, violation_magnitude
 from ..evaluator.metrics import mdl_gain, wilson, z_for_alpha
+from ..evaluator.threshold import rule_threshold
 from ..logic.solver import is_trivial
 
 
@@ -35,6 +36,7 @@ class Evaluation:
     strictness: str
     descriptor: tuple
     # Compatibility aliases for export/report callers.
+    threshold: float = 0.0
     coverage: float = 0.0
     coverage_lo: float = 0.0
     coverage_hi: float = 0.0
@@ -126,13 +128,16 @@ class DataOnlyEvaluator:
         gain = mdl_gain(rule, eps, rel)
         strict = _strictness(op, eps, rel, holds)
         descriptor = (rule.binder, rule.length())
-        ok = lo >= cfg.hold_rate_threshold
-        reason = "hold-rate above Wilson threshold" if ok else "hold-rate Wilson lower bound below threshold"
+        thr = rule_threshold(cfg, op=op, strictness=strict, complexity=rule.complexity(),
+                             n_bindings=g.n_bindings, eps=eps)
+        ok = lo >= thr
+        reason = ("hold-rate above Wilson threshold" if ok
+                  else "hold-rate Wilson lower bound below threshold")
         return Evaluation(
             rule=rule, accepted=ok, reason=reason, eps=eps,
             hold_rate=phat, hold_rate_lo=lo, hold_rate_hi=hi, statistic="hold_rate",
             support=g.support, n_points=g.n_points, n_bindings=g.n_bindings,
-            mdl_gain=gain, strictness=strict, descriptor=descriptor)
+            mdl_gain=gain, strictness=strict, descriptor=descriptor, threshold=thr)
 
     def _reject(self, rule: A.Rule, reason: str) -> Evaluation:
         return Evaluation(
