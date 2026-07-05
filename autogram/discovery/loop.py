@@ -31,8 +31,9 @@ class DiscoveryResult:
     def report(self) -> str:
         lines = [f"Discovered invariants on {self.dataset.name!r} "
                  f"({len(self.portfolio)} accepted, exhaustive enumeration):", "-" * 78]
+        adapter = getattr(self.dataset.name_model, "adapter", None)
         for ev in self.portfolio:
-            lines.append("  " + ev.summary())
+            lines.append("  " + ev.summary(adapter))
         if not self.portfolio:
             lines.append("  (none)")
         if self.diagnostics:

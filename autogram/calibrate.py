@@ -2,7 +2,7 @@
 
 ``calibrate`` runs the whole loop to completion. It tunes the engine's generic knobs on a wired,
 editable synthetic-proxy suite (a `RegimeSpec`), (re-)proposes a grammar, iterates a generic-knob
-relaxation ladder (per-candidate *adaptive* band by default), and, when recall **stalls**,
+relaxation ladder (one fixed *global* band by default), and, when recall **stalls**,
 re-induces the grammar with **widened capabilities** (more aggregations, then products/ratios).
 It reports recovery of the user's known invariants -- recall on a held-out validation split so it
 cannot be fit to. The objective is recall *subject to* a false-discovery ceiling (null
@@ -35,7 +35,7 @@ class CalibrationConfig:
     harness: str = "copilot"
     backend: str = "subagent"
     null_floor: float = 0.5              # threshold never drops below the false-discovery floor
-    band_mode: str = "adaptive"          # DEFAULT: per-candidate self-calibrated band (item 4)
+    band_mode: str = "global"            # DEFAULT: one fixed tolerance (shared-dial regime); "adaptive" = per-candidate knee band
     max_capability_tiers: int = 3        # grammar re-induction tiers when recall stalls
     regime: Optional[RegimeSpec] = None  # wired, editable synthetic-proxy suite (item 7)
     save_rules: bool = True              # persist the learned portfolio to <rules_dir>/<name>_<ts>.dl
@@ -87,14 +87,17 @@ def _knob_schedule(base: DiscoveryConfig, null_floor: float = 0.5) -> List[Disco
     """The Tuner's generic-knob relaxation ladder (tight -> loose).
 
     Every step touches only dataset-agnostic knobs (band mode, tolerance, hold-rate threshold) --
-    never the user's specific invariants.  The per-candidate **adaptive** band (``base.band_mode``)
-    is exercised first; later rungs lower the threshold and then fall back to a fixed **global**
-    band, which helps systematic-offset laws (e.g. I5/I6) whose whole population sits at one scale.
+    never the user's specific invariants.  The base band mode (``base.band_mode``, **global** by
+    default) is exercised first; later rungs lower the threshold and then widen to a looser fixed
+    **global** band, which helps systematic-offset laws (e.g. I5/I6) whose whole population sits at
+    one scale.
     """
-    wide = max(base.tolerance, 0.05)
+    wide = max(2.0 * base.tolerance, 0.1)   # genuinely looser than the base band, so the fallback
+                                            # rungs are real relaxations and not no-ops when the base
+                                            # is already a fixed global band (the new default)
     low = max(null_floor, min(base.hold_rate_threshold, 0.60))
     ladder = [
-        base,                                                            # default band (adaptive), tuned knobs
+        base,                                                            # base band (global by default), tuned knobs
         replace(base, hold_rate_threshold=low),                          # lower threshold
         replace(base, band_mode="global", tolerance=wide),               # fixed global-band fallback
         replace(base, band_mode="global", tolerance=wide, hold_rate_threshold=low),
@@ -211,7 +214,7 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     """Full calibration loop: tune knobs on proxies, (re-)propose a grammar, iterate, report recall.
 
     Objective: recall on a *held-out* validation split, subject to a false-discovery ceiling
-    (null acceptance) -- never recall alone.  Enabled by default: the per-candidate adaptive band,
+    (null acceptance) -- never recall alone.  Enabled by default: one fixed global band,
     the wired RegimeSpec proxy suite, and grammar re-induction with widened capabilities on stall.
     The learned portfolio is persisted to ``<rules_dir>/<name>_<timestamp>.dl`` and echoed into the
     returned report as ``learned_invariants``.
@@ -296,9 +299,13 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     if cfg.save_rules:
         rules_file = write_rules_dl(best_res, name, out_dir=cfg.rules_dir,
                                     seed=cfg.seed, proposer="enumeration", git=_git_short())
+    from .discovery.export import _adapter_of
+    from .dsl.render import render_rule
+    adapter = _adapter_of(best_res)
     learned_invariants = [
         {
             "rule": ev.rule.unparse(),
+            "rule_explicit": render_rule(ev.rule, adapter),
             "hold_rate": round(ev.hold_rate, 4),
             "hold_rate_ci": [round(ev.hold_rate_lo, 4), round(ev.hold_rate_hi, 4)],
             "eps": ev.eps,

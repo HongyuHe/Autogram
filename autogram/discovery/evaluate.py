@@ -54,8 +54,9 @@ class Evaluation:
         self.support_margin = self.hold_rate_lo
         self.stability_margin = self.hold_rate_lo
 
-    def summary(self) -> str:
-        return (f"{self.rule.unparse():<54s} {self.strictness:<10s} "
+    def summary(self, adapter=None) -> str:
+        from ..dsl.render import render_rule
+        return (f"{render_rule(self.rule, adapter):<54s} {self.strictness:<10s} "
                 f"hold={self.hold_rate:.3f}[{self.hold_rate_lo:.2f},{self.hold_rate_hi:.2f}] "
                 f"mdl={self.mdl_gain:+.2f} {self.reason}")
 

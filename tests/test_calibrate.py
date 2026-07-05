@@ -21,9 +21,9 @@ def _mini_spec(agg=("SUM",), max_degree=1, role_exclusions=()):
                        max_degree=max_degree, role_exclusions=role_exclusions)
 
 
-def test_default_band_mode_is_adaptive():
-    assert DiscoveryConfig().band_mode == "adaptive"
-    assert CalibrationConfig().band_mode == "adaptive"
+def test_default_band_mode_is_global():
+    assert DiscoveryConfig().band_mode == "global"
+    assert CalibrationConfig().band_mode == "global"
     assert CalibrationConfig().max_capability_tiers == 3
 
 
@@ -61,6 +61,17 @@ def test_knob_schedule_exercises_adaptive_first_then_global():
     ladder = _knob_schedule(base, null_floor=0.5)
     assert ladder[0].band_mode == "adaptive"               # adaptive is exercised first
     assert any(c.band_mode == "global" for c in ladder)    # global fallback is present
+
+
+def test_knob_schedule_global_base_has_distinct_rungs():
+    # With the default global base, the fallback rungs must genuinely loosen (wider tolerance),
+    # not duplicate the base config -- otherwise calibration re-runs identical configs for nothing.
+    base = DiscoveryConfig(seed=0, tolerance=0.05, hold_rate_threshold=0.62, band_mode="global")
+    ladder = _knob_schedule(base, null_floor=0.5)
+    keys = {(c.band_mode, round(c.tolerance, 4), round(c.hold_rate_threshold, 4)) for c in ladder}
+    assert len(keys) == len(ladder)                        # no duplicate (mode, tol, thr) rungs
+    assert all(c.band_mode == "global" for c in ladder)    # every rung stays in the default mode
+    assert max(c.tolerance for c in ladder) > base.tolerance   # a genuinely looser rung exists
 
 
 def test_spec_summary_reports_capabilities():

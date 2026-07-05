@@ -45,6 +45,8 @@ artifacts/
 # artifacts/**/trace.jsonl
 # artifacts/**/result.json
 
+presentation/
+
 # --- Local data exploration (not part of the published framework) ---
 data/crosscheck_exploration.ipynb
 

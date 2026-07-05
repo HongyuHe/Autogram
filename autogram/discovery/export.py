@@ -7,14 +7,26 @@ from datetime import datetime, timezone
 from typing import Optional
 
 
+def _adapter_of(result):
+    """The compiled schema adapter behind a DiscoveryResult (or ``None`` for hand-built results)."""
+    return getattr(getattr(getattr(result, "dataset", None), "name_model", None), "adapter", None)
+
+
 def portfolio_to_dl(result, name: str, *, seed: int = 0, proposer: str = "enumeration", git: str = "unknown") -> str:
+    from ..dsl.render import render_rule
+
+    # Explicit rendering names each binder's bound variable(s) and expands every role/family to its
+    # grounding template, so a saved rule is self-contained (falls back to the compact form when the
+    # dataset adapter is unavailable, e.g. a hand-built result).
+    adapter = _adapter_of(result)
+    rendered = [(render_rule(ev.rule, adapter), ev) for ev in result.portfolio]
+    width = max((len(rule) for rule, _ in rendered), default=0) + 1
     lines = []
-    for ev in result.portfolio:
-        rule = ev.rule.unparse()
+    for rule, ev in rendered:
         meta = (f"# {ev.strictness.upper():<10s} eps={ev.eps:.4g} "
                 f"hold={ev.hold_rate:.3f}[{ev.hold_rate_lo:.2f},{ev.hold_rate_hi:.2f}] "
                 f"supp={ev.support:.2f} mdl={ev.mdl_gain:+.3f}")
-        lines.append(f"{rule:<64s} {meta}")
+        lines.append(f"{rule:<{width}s} {meta}")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     footer = [
         "",

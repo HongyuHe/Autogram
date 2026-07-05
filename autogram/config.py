@@ -18,7 +18,7 @@ class DiscoveryConfig:
     """
 
     tolerance: float = 0.05             # dimensionless epsilon (fallback / global-band relative tolerance)
-    band_mode: str = "adaptive"         # DEFAULT "adaptive" (per-rule knee band, item 4); "global" = one fixed tolerance
+    band_mode: str = "global"           # DEFAULT "global" (one fixed tolerance; the shared-dial regime that yields the corroboration guarantee); "adaptive" = per-rule knee band (item 4)
     band_holdout_frac: float = 0.3      # split-conformal holdout for the adaptive band
     separation_tolerance: float = 1e-6  # minimum relative gap for != separations
     presence_tolerance: float = 1e-9    # relative non-zero cutoff for <|> pairings

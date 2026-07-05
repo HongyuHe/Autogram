@@ -1,106 +1,106 @@
-[forall cell] self >= 0                                          # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
-[forall link] demand >= 0                                        # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
-[forall link] demand_rev >= 0                                    # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
-[forall link] o0 >= 0                                            # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
-[forall link] o0_rev >= 0                                        # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
-[forall link] o1 >= 0                                            # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
-[forall link] o1_rev >= 0                                        # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
-[forall node] 0 ~= demand_self                                   # EXACT      eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+29.297
-[forall node] measurement_origination >= 0                       # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
-[forall node] measurement_termination >= 0                       # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
-[forall network] 0 ~= MIN(all_demand)                            # EXACT      eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+29.147
-[forall node] measurement_origination + SUM(fam_ingress_from) ~= measurement_termination + SUM(fam_egress_to) # LOOSE      eps=0.01883 hold=0.994[0.99,1.00] supp=1.00 mdl=+5.609
-[forall network] SUM(all_measurement_origination) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+5.117
-[forall network] AVG(all_measurement_origination) ~= AVG(all_measurement_termination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+5.117
-[forall network] MIN(all_measurement_origination) + SUM(all_measurement_termination) ~= SUM(all_measurement_origination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.687
-[forall network] MIN(all_measurement_origination) + SUM(all_measurement_origination) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.672
-[forall network] MIN(all_demand) + SUM(all_measurement_origination) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.667
-[forall network] MIN(all_demand) + SUM(all_measurement_termination) ~= SUM(all_measurement_origination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.667
-[forall network] AVG(all_measurement_origination) + MIN(all_demand) ~= AVG(all_measurement_termination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.667
-[forall network] AVG(all_measurement_origination) ~= AVG(all_measurement_termination) + MIN(all_demand) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.667
-[forall network] MIN(all_measurement_termination) + SUM(all_measurement_origination) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.663
-[forall network] MIN(all_measurement_termination) + SUM(all_measurement_termination) ~= SUM(all_measurement_origination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.660
-[forall network] AVG(all_demand) + SUM(all_measurement_termination) ~= SUM(all_measurement_origination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.646
-[forall network] AVG(all_demand) + SUM(all_measurement_origination) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.634
-[forall link] o1 != o1_rev                                       # SEPARATION eps=1e-06 hold=0.986[0.99,0.99] supp=1.00 mdl=+9.817
-[forall link] o0 != o0_rev                                       # SEPARATION eps=1e-06 hold=0.986[0.99,0.99] supp=1.00 mdl=+9.816
-[forall node] measurement_origination <|> measurement_termination # EXISTENCE  eps=1e-09 hold=0.979[0.98,0.98] supp=1.00 mdl=+29.297
-[forall link] o0 <|> o0_rev                                      # EXISTENCE  eps=1e-09 hold=0.974[0.97,0.98] supp=1.00 mdl=+29.297
-[forall link] o0 <|> o1                                          # EXISTENCE  eps=1e-09 hold=0.974[0.97,0.98] supp=1.00 mdl=+29.297
-[forall link] o0_rev <|> o1_rev                                  # EXISTENCE  eps=1e-09 hold=0.974[0.97,0.98] supp=1.00 mdl=+29.297
-[forall link] o1 <|> o1_rev                                      # EXISTENCE  eps=1e-09 hold=0.974[0.97,0.98] supp=1.00 mdl=+29.297
-[forall link] o0 + o1 ~= o0_rev + o1_rev                         # LOOSE      eps=0.05 hold=0.973[0.97,0.97] supp=1.00 mdl=+5.055
-[forall link] o0 + o0_rev ~= o1 + o1_rev                         # LOOSE      eps=0.05 hold=0.972[0.97,0.97] supp=1.00 mdl=+4.995
-[forall network] AVG(all_measurement_origination) ~= AVG(all_measurement_termination) + MIN(all_measurement_origination) # LOOSE      eps=0.05 hold=0.981[0.97,0.99] supp=1.00 mdl=+3.722
-[forall network] AVG(all_measurement_origination) + MIN(all_measurement_origination) ~= AVG(all_measurement_termination) # LOOSE      eps=0.05 hold=0.978[0.97,0.99] supp=1.00 mdl=+3.722
-[forall link] demand <|> demand_rev                              # EXISTENCE  eps=1e-09 hold=0.967[0.97,0.97] supp=1.00 mdl=+29.297
-[forall network] AVG(all_demand) + SUM(all_measurement_origination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.973[0.96,0.98] supp=1.00 mdl=+3.656
-[forall link] o0 ~= o1_rev                                       # LOOSE      eps=0.05 hold=0.962[0.96,0.96] supp=1.00 mdl=+5.717
-[forall link] o0_rev ~= o1                                       # LOOSE      eps=0.05 hold=0.962[0.96,0.96] supp=1.00 mdl=+5.717
-[forall network] AVG(all_measurement_origination) ~= AVG(all_measurement_termination) + MIN(all_measurement_termination) # LOOSE      eps=0.05 hold=0.969[0.96,0.98] supp=1.00 mdl=+4.257
-[forall network] AVG(all_measurement_origination) + SUM(all_measurement_origination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.969[0.96,0.98] supp=1.00 mdl=+3.551
-[forall network] AVG(all_measurement_origination) + SUM(all_measurement_termination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.969[0.96,0.98] supp=1.00 mdl=+3.540
-[forall network] AVG(all_measurement_termination) + SUM(all_measurement_termination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.969[0.96,0.98] supp=1.00 mdl=+3.539
-[forall network] AVG(all_measurement_termination) + SUM(all_measurement_origination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.968[0.96,0.98] supp=1.00 mdl=+3.554
-[forall network] MIN(all_measurement_origination) + SUM(all_measurement_origination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.967[0.95,0.98] supp=1.00 mdl=+3.612
-[forall network] SUM(all_demand) ~= SUM(all_measurement_origination) # LOOSE      eps=0.05 hold=0.965[0.95,0.97] supp=1.00 mdl=+4.032
-[forall network] MIN(all_measurement_termination) + SUM(all_measurement_origination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.965[0.95,0.97] supp=1.00 mdl=+3.603
-[forall network] MIN(all_demand) + SUM(all_demand) ~= SUM(all_measurement_origination) # LOOSE      eps=0.05 hold=0.965[0.95,0.97] supp=1.00 mdl=+3.582
-[forall network] MIN(all_demand) + SUM(all_measurement_origination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.965[0.95,0.97] supp=1.00 mdl=+3.582
-[forall network] MIN(all_measurement_termination) + SUM(all_demand) ~= SUM(all_measurement_origination) # LOOSE      eps=0.05 hold=0.963[0.95,0.97] supp=1.00 mdl=+3.561
-[forall network] MIN(all_measurement_origination) + SUM(all_demand) ~= SUM(all_measurement_origination) # LOOSE      eps=0.05 hold=0.961[0.95,0.97] supp=1.00 mdl=+3.555
-[forall network] AVG(all_measurement_origination) + MIN(all_measurement_termination) ~= AVG(all_measurement_termination) # LOOSE      eps=0.05 hold=0.958[0.94,0.97] supp=1.00 mdl=+4.251
-[forall link] demand <|> o0                                      # EXISTENCE  eps=1e-09 hold=0.942[0.94,0.94] supp=1.00 mdl=+29.297
-[forall link] demand <|> o1_rev                                  # EXISTENCE  eps=1e-09 hold=0.942[0.94,0.94] supp=1.00 mdl=+29.297
-[forall link] demand_rev <|> o0_rev                              # EXISTENCE  eps=1e-09 hold=0.942[0.94,0.94] supp=1.00 mdl=+29.297
-[forall link] demand_rev <|> o1                                  # EXISTENCE  eps=1e-09 hold=0.942[0.94,0.94] supp=1.00 mdl=+29.297
-[forall network] AVG(all_demand) + SUM(all_measurement_termination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.953[0.94,0.96] supp=1.00 mdl=+3.659
-[forall network] AVG(all_demand) + SUM(all_demand) ~= SUM(all_measurement_origination) # LOOSE      eps=0.05 hold=0.953[0.94,0.96] supp=1.00 mdl=+3.519
-[forall network] MIN(all_measurement_origination) + SUM(all_measurement_termination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.946[0.93,0.96] supp=1.00 mdl=+3.612
-[forall network] MIN(all_measurement_termination) + SUM(all_measurement_termination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.946[0.93,0.96] supp=1.00 mdl=+3.604
-[forall link] demand != demand_rev                               # SEPARATION eps=1e-06 hold=0.932[0.93,0.93] supp=1.00 mdl=+9.709
-[forall network] SUM(all_demand) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.944[0.93,0.96] supp=1.00 mdl=+4.034
-[forall network] MIN(all_demand) + SUM(all_demand) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.944[0.93,0.96] supp=1.00 mdl=+3.584
-[forall network] MIN(all_demand) + SUM(all_measurement_termination) ~= SUM(all_demand) # LOOSE      eps=0.05 hold=0.944[0.93,0.96] supp=1.00 mdl=+3.584
-[forall network] MIN(all_measurement_termination) + SUM(all_demand) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.941[0.92,0.95] supp=1.00 mdl=+3.561
-[forall network] MIN(all_measurement_origination) + SUM(all_demand) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.939[0.92,0.95] supp=1.00 mdl=+3.559
-[forall link] demand <|> o0_rev                                  # EXISTENCE  eps=1e-09 hold=0.918[0.92,0.92] supp=1.00 mdl=+29.297
-[forall link] demand <|> o1                                      # EXISTENCE  eps=1e-09 hold=0.918[0.92,0.92] supp=1.00 mdl=+29.297
-[forall link] demand_rev <|> o0                                  # EXISTENCE  eps=1e-09 hold=0.918[0.92,0.92] supp=1.00 mdl=+29.297
-[forall link] demand_rev <|> o1_rev                              # EXISTENCE  eps=1e-09 hold=0.918[0.92,0.92] supp=1.00 mdl=+29.297
-[forall network] AVG(all_demand) + SUM(all_demand) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.932[0.91,0.95] supp=1.00 mdl=+3.520
-[forall network] AVG(all_measurement_termination) + SUM(all_measurement_origination) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.849[0.83,0.87] supp=1.00 mdl=+3.073
-[forall network] AVG(all_measurement_origination) + SUM(all_measurement_origination) ~= SUM(all_measurement_termination) # LOOSE      eps=0.05 hold=0.834[0.81,0.86] supp=1.00 mdl=+3.073
-[forall node] measurement_origination + SUM(demand_col) ~= measurement_termination + SUM(demand_row) # LOOSE      eps=0.05 hold=0.792[0.79,0.80] supp=1.00 mdl=+3.357
-[forall node] 0 ~= MIN(demand_row)                               # LOOSE      eps=1e-09 hold=0.758[0.75,0.76] supp=1.00 mdl=+29.147
-[forall node] MIN(demand_row) ~= demand_self                     # LOOSE      eps=1e-09 hold=0.758[0.75,0.76] supp=1.00 mdl=+29.147
-[forall node] -1*MIN(demand_row) ~= demand_self                  # LOOSE      eps=1e-09 hold=0.758[0.75,0.76] supp=1.00 mdl=+28.997
-[forall node] 0.5*MIN(demand_row) ~= demand_self                 # LOOSE      eps=1e-09 hold=0.758[0.75,0.76] supp=1.00 mdl=+28.997
-[forall node] 0.5*demand_self ~= MIN(demand_row)                 # LOOSE      eps=1e-09 hold=0.758[0.75,0.76] supp=1.00 mdl=+28.997
-[forall node] SUM(demand_col) + SUM(demand_row) ~= measurement_origination + measurement_termination # LOOSE      eps=0.05 hold=0.735[0.73,0.74] supp=1.00 mdl=+3.276
-[forall network] AVG(all_demand) + AVG(all_measurement_origination) ~= AVG(all_measurement_termination) # LOOSE      eps=0.05 hold=0.711[0.68,0.74] supp=1.00 mdl=+3.025
-[forall node] SUM(demand_col) ~= measurement_termination + MIN(demand_col) # LOOSE      eps=0.05 hold=0.658[0.65,0.66] supp=1.00 mdl=+3.423
-[forall node] demand_self + SUM(demand_col) ~= measurement_termination + MIN(demand_col) # LOOSE      eps=0.05 hold=0.658[0.65,0.66] supp=1.00 mdl=+3.123
-[forall node] SUM(demand_row) ~= measurement_origination + MIN(demand_col) # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.406
-[forall node] SUM(demand_row) ~= measurement_origination + MIN(demand_row) # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.406
-[forall node] demand_self + SUM(demand_row) ~= measurement_origination + MIN(demand_col) # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.106
-[forall node] demand_self + SUM(demand_row) ~= measurement_origination + MIN(demand_row) # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.106
-[forall node] SUM(demand_col) ~= measurement_termination         # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.872
-[forall node] demand_self + SUM(demand_col) ~= measurement_termination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.572
-[forall node] SUM(demand_col) ~= demand_self + measurement_termination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.572
-[forall node] MIN(demand_col) + SUM(demand_col) ~= measurement_termination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.421
-[forall node] MIN(demand_col) + SUM(demand_col) ~= demand_self + measurement_termination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.121
-[forall node] MIN(demand_row) + SUM(demand_row) ~= measurement_origination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.405
-[forall node] MIN(demand_row) + SUM(demand_row) ~= demand_self + measurement_origination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.105
-[forall node] SUM(demand_row) ~= measurement_origination         # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.856
-[forall node] demand_self + SUM(demand_row) ~= measurement_origination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.556
-[forall node] SUM(demand_row) ~= demand_self + measurement_origination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.556
-[forall node] SUM(demand_col) ~= measurement_termination + MIN(demand_row) # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.421
-[forall node] demand_self + SUM(demand_col) ~= measurement_termination + MIN(demand_row) # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.121
-[forall node] MIN(demand_col) + SUM(demand_row) ~= measurement_origination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.405
-[forall node] MIN(demand_col) + SUM(demand_row) ~= demand_self + measurement_origination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.105
-[forall node] MIN(demand_row) + SUM(demand_col) ~= measurement_termination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.421
-[forall node] MIN(demand_row) + SUM(demand_col) ~= demand_self + measurement_termination # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.121
+[forall cell col] {col} >= 0                                                                                               # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
+[forall link X, Y] high_{X}_{Y} >= 0                                                                                       # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
+[forall link X, Y] high_{Y}_{X} >= 0                                                                                       # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
+[forall link X, Y] low_{X}_egress_to_{Y} >= 0                                                                              # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
+[forall link X, Y] low_{Y}_egress_to_{X} >= 0                                                                              # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
+[forall link X, Y] low_{X}_ingress_from_{Y} >= 0                                                                           # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
+[forall link X, Y] low_{Y}_ingress_from_{X} >= 0                                                                           # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
+[forall node X] 0 ~= high_{X}_{X}                                                                                          # EXACT      eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+29.297
+[forall node X] low_{X}_origination >= 0                                                                                   # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
+[forall node X] low_{X}_termination >= 0                                                                                   # ONE-SIDED  eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+14.349
+[forall network] 0 ~= min_{j≠k} high_{j}_{k}                                                                               # EXACT      eps=1e-09 hold=1.000[1.00,1.00] supp=1.00 mdl=+29.147
+[forall node X] low_{X}_origination + Σ_{j} low_{X}_ingress_from_{j} ~= low_{X}_termination + Σ_{j} low_{X}_egress_to_{j}  # LOOSE      eps=0.01883 hold=0.994[0.99,1.00] supp=1.00 mdl=+5.609
+[forall network] Σ_{j} low_{j}_origination ~= Σ_{j} low_{j}_termination                                                    # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+5.117
+[forall network] mean_{j} low_{j}_origination ~= mean_{j} low_{j}_termination                                              # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+5.117
+[forall network] min_{j} low_{j}_origination + Σ_{j} low_{j}_termination ~= Σ_{j} low_{j}_origination                      # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.687
+[forall network] min_{j} low_{j}_origination + Σ_{j} low_{j}_origination ~= Σ_{j} low_{j}_termination                      # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.672
+[forall network] min_{j≠k} high_{j}_{k} + Σ_{j} low_{j}_origination ~= Σ_{j} low_{j}_termination                           # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.667
+[forall network] min_{j≠k} high_{j}_{k} + Σ_{j} low_{j}_termination ~= Σ_{j} low_{j}_origination                           # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.667
+[forall network] mean_{j} low_{j}_origination + min_{j≠k} high_{j}_{k} ~= mean_{j} low_{j}_termination                     # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.667
+[forall network] mean_{j} low_{j}_origination ~= mean_{j} low_{j}_termination + min_{j≠k} high_{j}_{k}                     # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.667
+[forall network] min_{j} low_{j}_termination + Σ_{j} low_{j}_origination ~= Σ_{j} low_{j}_termination                      # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.663
+[forall network] min_{j} low_{j}_termination + Σ_{j} low_{j}_termination ~= Σ_{j} low_{j}_origination                      # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.660
+[forall network] mean_{j≠k} high_{j}_{k} + Σ_{j} low_{j}_termination ~= Σ_{j} low_{j}_origination                          # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.646
+[forall network] mean_{j≠k} high_{j}_{k} + Σ_{j} low_{j}_origination ~= Σ_{j} low_{j}_termination                          # LOOSE      eps=0.05 hold=0.996[0.99,1.00] supp=1.00 mdl=+4.634
+[forall link X, Y] low_{X}_ingress_from_{Y} != low_{Y}_ingress_from_{X}                                                    # SEPARATION eps=1e-06 hold=0.986[0.99,0.99] supp=1.00 mdl=+9.817
+[forall link X, Y] low_{X}_egress_to_{Y} != low_{Y}_egress_to_{X}                                                          # SEPARATION eps=1e-06 hold=0.986[0.99,0.99] supp=1.00 mdl=+9.816
+[forall node X] low_{X}_origination <|> low_{X}_termination                                                                # EXISTENCE  eps=1e-09 hold=0.979[0.98,0.98] supp=1.00 mdl=+29.297
+[forall link X, Y] low_{X}_egress_to_{Y} <|> low_{Y}_egress_to_{X}                                                         # EXISTENCE  eps=1e-09 hold=0.974[0.97,0.98] supp=1.00 mdl=+29.297
+[forall link X, Y] low_{X}_egress_to_{Y} <|> low_{X}_ingress_from_{Y}                                                      # EXISTENCE  eps=1e-09 hold=0.974[0.97,0.98] supp=1.00 mdl=+29.297
+[forall link X, Y] low_{Y}_egress_to_{X} <|> low_{Y}_ingress_from_{X}                                                      # EXISTENCE  eps=1e-09 hold=0.974[0.97,0.98] supp=1.00 mdl=+29.297
+[forall link X, Y] low_{X}_ingress_from_{Y} <|> low_{Y}_ingress_from_{X}                                                   # EXISTENCE  eps=1e-09 hold=0.974[0.97,0.98] supp=1.00 mdl=+29.297
+[forall link X, Y] low_{X}_egress_to_{Y} + low_{X}_ingress_from_{Y} ~= low_{Y}_egress_to_{X} + low_{Y}_ingress_from_{X}    # LOOSE      eps=0.05 hold=0.973[0.97,0.97] supp=1.00 mdl=+5.055
+[forall link X, Y] low_{X}_egress_to_{Y} + low_{Y}_egress_to_{X} ~= low_{X}_ingress_from_{Y} + low_{Y}_ingress_from_{X}    # LOOSE      eps=0.05 hold=0.972[0.97,0.97] supp=1.00 mdl=+4.995
+[forall network] mean_{j} low_{j}_origination ~= mean_{j} low_{j}_termination + min_{j} low_{j}_origination                # LOOSE      eps=0.05 hold=0.981[0.97,0.99] supp=1.00 mdl=+3.722
+[forall network] mean_{j} low_{j}_origination + min_{j} low_{j}_origination ~= mean_{j} low_{j}_termination                # LOOSE      eps=0.05 hold=0.978[0.97,0.99] supp=1.00 mdl=+3.722
+[forall link X, Y] high_{X}_{Y} <|> high_{Y}_{X}                                                                           # EXISTENCE  eps=1e-09 hold=0.967[0.97,0.97] supp=1.00 mdl=+29.297
+[forall network] mean_{j≠k} high_{j}_{k} + Σ_{j} low_{j}_origination ~= Σ_{j≠k} high_{j}_{k}                               # LOOSE      eps=0.05 hold=0.973[0.96,0.98] supp=1.00 mdl=+3.656
+[forall link X, Y] low_{X}_egress_to_{Y} ~= low_{Y}_ingress_from_{X}                                                       # LOOSE      eps=0.05 hold=0.962[0.96,0.96] supp=1.00 mdl=+5.717
+[forall link X, Y] low_{Y}_egress_to_{X} ~= low_{X}_ingress_from_{Y}                                                       # LOOSE      eps=0.05 hold=0.962[0.96,0.96] supp=1.00 mdl=+5.717
+[forall network] mean_{j} low_{j}_origination ~= mean_{j} low_{j}_termination + min_{j} low_{j}_termination                # LOOSE      eps=0.05 hold=0.969[0.96,0.98] supp=1.00 mdl=+4.257
+[forall network] mean_{j} low_{j}_origination + Σ_{j} low_{j}_origination ~= Σ_{j≠k} high_{j}_{k}                          # LOOSE      eps=0.05 hold=0.969[0.96,0.98] supp=1.00 mdl=+3.551
+[forall network] mean_{j} low_{j}_origination + Σ_{j} low_{j}_termination ~= Σ_{j≠k} high_{j}_{k}                          # LOOSE      eps=0.05 hold=0.969[0.96,0.98] supp=1.00 mdl=+3.540
+[forall network] mean_{j} low_{j}_termination + Σ_{j} low_{j}_termination ~= Σ_{j≠k} high_{j}_{k}                          # LOOSE      eps=0.05 hold=0.969[0.96,0.98] supp=1.00 mdl=+3.539
+[forall network] mean_{j} low_{j}_termination + Σ_{j} low_{j}_origination ~= Σ_{j≠k} high_{j}_{k}                          # LOOSE      eps=0.05 hold=0.968[0.96,0.98] supp=1.00 mdl=+3.554
+[forall network] min_{j} low_{j}_origination + Σ_{j} low_{j}_origination ~= Σ_{j≠k} high_{j}_{k}                           # LOOSE      eps=0.05 hold=0.967[0.95,0.98] supp=1.00 mdl=+3.612
+[forall network] Σ_{j≠k} high_{j}_{k} ~= Σ_{j} low_{j}_origination                                                         # LOOSE      eps=0.05 hold=0.965[0.95,0.97] supp=1.00 mdl=+4.032
+[forall network] min_{j} low_{j}_termination + Σ_{j} low_{j}_origination ~= Σ_{j≠k} high_{j}_{k}                           # LOOSE      eps=0.05 hold=0.965[0.95,0.97] supp=1.00 mdl=+3.603
+[forall network] min_{j≠k} high_{j}_{k} + Σ_{j≠k} high_{j}_{k} ~= Σ_{j} low_{j}_origination                                # LOOSE      eps=0.05 hold=0.965[0.95,0.97] supp=1.00 mdl=+3.582
+[forall network] min_{j≠k} high_{j}_{k} + Σ_{j} low_{j}_origination ~= Σ_{j≠k} high_{j}_{k}                                # LOOSE      eps=0.05 hold=0.965[0.95,0.97] supp=1.00 mdl=+3.582
+[forall network] min_{j} low_{j}_termination + Σ_{j≠k} high_{j}_{k} ~= Σ_{j} low_{j}_origination                           # LOOSE      eps=0.05 hold=0.963[0.95,0.97] supp=1.00 mdl=+3.561
+[forall network] min_{j} low_{j}_origination + Σ_{j≠k} high_{j}_{k} ~= Σ_{j} low_{j}_origination                           # LOOSE      eps=0.05 hold=0.961[0.95,0.97] supp=1.00 mdl=+3.555
+[forall network] mean_{j} low_{j}_origination + min_{j} low_{j}_termination ~= mean_{j} low_{j}_termination                # LOOSE      eps=0.05 hold=0.958[0.94,0.97] supp=1.00 mdl=+4.251
+[forall link X, Y] high_{X}_{Y} <|> low_{X}_egress_to_{Y}                                                                  # EXISTENCE  eps=1e-09 hold=0.942[0.94,0.94] supp=1.00 mdl=+29.297
+[forall link X, Y] high_{X}_{Y} <|> low_{Y}_ingress_from_{X}                                                               # EXISTENCE  eps=1e-09 hold=0.942[0.94,0.94] supp=1.00 mdl=+29.297
+[forall link X, Y] high_{Y}_{X} <|> low_{Y}_egress_to_{X}                                                                  # EXISTENCE  eps=1e-09 hold=0.942[0.94,0.94] supp=1.00 mdl=+29.297
+[forall link X, Y] high_{Y}_{X} <|> low_{X}_ingress_from_{Y}                                                               # EXISTENCE  eps=1e-09 hold=0.942[0.94,0.94] supp=1.00 mdl=+29.297
+[forall network] mean_{j≠k} high_{j}_{k} + Σ_{j} low_{j}_termination ~= Σ_{j≠k} high_{j}_{k}                               # LOOSE      eps=0.05 hold=0.953[0.94,0.96] supp=1.00 mdl=+3.659
+[forall network] mean_{j≠k} high_{j}_{k} + Σ_{j≠k} high_{j}_{k} ~= Σ_{j} low_{j}_origination                               # LOOSE      eps=0.05 hold=0.953[0.94,0.96] supp=1.00 mdl=+3.519
+[forall network] min_{j} low_{j}_origination + Σ_{j} low_{j}_termination ~= Σ_{j≠k} high_{j}_{k}                           # LOOSE      eps=0.05 hold=0.946[0.93,0.96] supp=1.00 mdl=+3.612
+[forall network] min_{j} low_{j}_termination + Σ_{j} low_{j}_termination ~= Σ_{j≠k} high_{j}_{k}                           # LOOSE      eps=0.05 hold=0.946[0.93,0.96] supp=1.00 mdl=+3.604
+[forall link X, Y] high_{X}_{Y} != high_{Y}_{X}                                                                            # SEPARATION eps=1e-06 hold=0.932[0.93,0.93] supp=1.00 mdl=+9.709
+[forall network] Σ_{j≠k} high_{j}_{k} ~= Σ_{j} low_{j}_termination                                                         # LOOSE      eps=0.05 hold=0.944[0.93,0.96] supp=1.00 mdl=+4.034
+[forall network] min_{j≠k} high_{j}_{k} + Σ_{j≠k} high_{j}_{k} ~= Σ_{j} low_{j}_termination                                # LOOSE      eps=0.05 hold=0.944[0.93,0.96] supp=1.00 mdl=+3.584
+[forall network] min_{j≠k} high_{j}_{k} + Σ_{j} low_{j}_termination ~= Σ_{j≠k} high_{j}_{k}                                # LOOSE      eps=0.05 hold=0.944[0.93,0.96] supp=1.00 mdl=+3.584
+[forall network] min_{j} low_{j}_termination + Σ_{j≠k} high_{j}_{k} ~= Σ_{j} low_{j}_termination                           # LOOSE      eps=0.05 hold=0.941[0.92,0.95] supp=1.00 mdl=+3.561
+[forall network] min_{j} low_{j}_origination + Σ_{j≠k} high_{j}_{k} ~= Σ_{j} low_{j}_termination                           # LOOSE      eps=0.05 hold=0.939[0.92,0.95] supp=1.00 mdl=+3.559
+[forall link X, Y] high_{X}_{Y} <|> low_{Y}_egress_to_{X}                                                                  # EXISTENCE  eps=1e-09 hold=0.918[0.92,0.92] supp=1.00 mdl=+29.297
+[forall link X, Y] high_{X}_{Y} <|> low_{X}_ingress_from_{Y}                                                               # EXISTENCE  eps=1e-09 hold=0.918[0.92,0.92] supp=1.00 mdl=+29.297
+[forall link X, Y] high_{Y}_{X} <|> low_{X}_egress_to_{Y}                                                                  # EXISTENCE  eps=1e-09 hold=0.918[0.92,0.92] supp=1.00 mdl=+29.297
+[forall link X, Y] high_{Y}_{X} <|> low_{Y}_ingress_from_{X}                                                               # EXISTENCE  eps=1e-09 hold=0.918[0.92,0.92] supp=1.00 mdl=+29.297
+[forall network] mean_{j≠k} high_{j}_{k} + Σ_{j≠k} high_{j}_{k} ~= Σ_{j} low_{j}_termination                               # LOOSE      eps=0.05 hold=0.932[0.91,0.95] supp=1.00 mdl=+3.520
+[forall network] mean_{j} low_{j}_termination + Σ_{j} low_{j}_origination ~= Σ_{j} low_{j}_termination                     # LOOSE      eps=0.05 hold=0.849[0.83,0.87] supp=1.00 mdl=+3.073
+[forall network] mean_{j} low_{j}_origination + Σ_{j} low_{j}_origination ~= Σ_{j} low_{j}_termination                     # LOOSE      eps=0.05 hold=0.834[0.81,0.86] supp=1.00 mdl=+3.073
+[forall node X] low_{X}_origination + Σ_{j≠X} high_{j}_{X} ~= low_{X}_termination + Σ_{j≠X} high_{X}_{j}                   # LOOSE      eps=0.05 hold=0.792[0.79,0.80] supp=1.00 mdl=+3.357
+[forall node X] 0 ~= min_{j≠X} high_{X}_{j}                                                                                # LOOSE      eps=1e-09 hold=0.758[0.75,0.76] supp=1.00 mdl=+29.147
+[forall node X] min_{j≠X} high_{X}_{j} ~= high_{X}_{X}                                                                     # LOOSE      eps=1e-09 hold=0.758[0.75,0.76] supp=1.00 mdl=+29.147
+[forall node X] -1*min_{j≠X} high_{X}_{j} ~= high_{X}_{X}                                                                  # LOOSE      eps=1e-09 hold=0.758[0.75,0.76] supp=1.00 mdl=+28.997
+[forall node X] 0.5*min_{j≠X} high_{X}_{j} ~= high_{X}_{X}                                                                 # LOOSE      eps=1e-09 hold=0.758[0.75,0.76] supp=1.00 mdl=+28.997
+[forall node X] 0.5*high_{X}_{X} ~= min_{j≠X} high_{X}_{j}                                                                 # LOOSE      eps=1e-09 hold=0.758[0.75,0.76] supp=1.00 mdl=+28.997
+[forall node X] Σ_{j≠X} high_{j}_{X} + Σ_{j≠X} high_{X}_{j} ~= low_{X}_origination + low_{X}_termination                   # LOOSE      eps=0.05 hold=0.735[0.73,0.74] supp=1.00 mdl=+3.276
+[forall network] mean_{j≠k} high_{j}_{k} + mean_{j} low_{j}_origination ~= mean_{j} low_{j}_termination                    # LOOSE      eps=0.05 hold=0.711[0.68,0.74] supp=1.00 mdl=+3.025
+[forall node X] Σ_{j≠X} high_{j}_{X} ~= low_{X}_termination + min_{j≠X} high_{j}_{X}                                       # LOOSE      eps=0.05 hold=0.658[0.65,0.66] supp=1.00 mdl=+3.423
+[forall node X] high_{X}_{X} + Σ_{j≠X} high_{j}_{X} ~= low_{X}_termination + min_{j≠X} high_{j}_{X}                        # LOOSE      eps=0.05 hold=0.658[0.65,0.66] supp=1.00 mdl=+3.123
+[forall node X] Σ_{j≠X} high_{X}_{j} ~= low_{X}_origination + min_{j≠X} high_{j}_{X}                                       # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.406
+[forall node X] Σ_{j≠X} high_{X}_{j} ~= low_{X}_origination + min_{j≠X} high_{X}_{j}                                       # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.406
+[forall node X] high_{X}_{X} + Σ_{j≠X} high_{X}_{j} ~= low_{X}_origination + min_{j≠X} high_{j}_{X}                        # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.106
+[forall node X] high_{X}_{X} + Σ_{j≠X} high_{X}_{j} ~= low_{X}_origination + min_{j≠X} high_{X}_{j}                        # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.106
+[forall node X] Σ_{j≠X} high_{j}_{X} ~= low_{X}_termination                                                                # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.872
+[forall node X] high_{X}_{X} + Σ_{j≠X} high_{j}_{X} ~= low_{X}_termination                                                 # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.572
+[forall node X] Σ_{j≠X} high_{j}_{X} ~= high_{X}_{X} + low_{X}_termination                                                 # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.572
+[forall node X] min_{j≠X} high_{j}_{X} + Σ_{j≠X} high_{j}_{X} ~= low_{X}_termination                                       # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.421
+[forall node X] min_{j≠X} high_{j}_{X} + Σ_{j≠X} high_{j}_{X} ~= high_{X}_{X} + low_{X}_termination                        # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.121
+[forall node X] min_{j≠X} high_{X}_{j} + Σ_{j≠X} high_{X}_{j} ~= low_{X}_origination                                       # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.405
+[forall node X] min_{j≠X} high_{X}_{j} + Σ_{j≠X} high_{X}_{j} ~= high_{X}_{X} + low_{X}_origination                        # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.105
+[forall node X] Σ_{j≠X} high_{X}_{j} ~= low_{X}_origination                                                                # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.856
+[forall node X] high_{X}_{X} + Σ_{j≠X} high_{X}_{j} ~= low_{X}_origination                                                 # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.556
+[forall node X] Σ_{j≠X} high_{X}_{j} ~= high_{X}_{X} + low_{X}_origination                                                 # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.556
+[forall node X] Σ_{j≠X} high_{j}_{X} ~= low_{X}_termination + min_{j≠X} high_{X}_{j}                                       # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.421
+[forall node X] high_{X}_{X} + Σ_{j≠X} high_{j}_{X} ~= low_{X}_termination + min_{j≠X} high_{X}_{j}                        # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.121
+[forall node X] min_{j≠X} high_{j}_{X} + Σ_{j≠X} high_{X}_{j} ~= low_{X}_origination                                       # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.405
+[forall node X] min_{j≠X} high_{j}_{X} + Σ_{j≠X} high_{X}_{j} ~= high_{X}_{X} + low_{X}_origination                        # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.105
+[forall node X] min_{j≠X} high_{X}_{j} + Σ_{j≠X} high_{j}_{X} ~= low_{X}_termination                                       # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.421
+[forall node X] min_{j≠X} high_{X}_{j} + Σ_{j≠X} high_{j}_{X} ~= high_{X}_{X} + low_{X}_termination                        # LOOSE      eps=0.05 hold=0.657[0.65,0.66] supp=1.00 mdl=+3.121
 
 # Autogram discovered invariants (observed data only; no catalogue, no oracle)
 # dataset    : geant_sample_1000

@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import shutil
+import sys
 from typing import Optional
 
 from .config import DiscoveryConfig, SearchConfig
@@ -27,6 +28,9 @@ def _git_short() -> str:
 
 
 def _portfolio_payload(res) -> dict:
+    from .discovery.export import _adapter_of
+    from .dsl.render import render_rule
+    adapter = _adapter_of(res)
     return {
         "dataset": res.dataset.name,
         "rounds": res.rounds_run,
@@ -36,6 +40,7 @@ def _portfolio_payload(res) -> dict:
         "portfolio": [
             {
                 "rule": ev.rule.unparse(),
+                "rule_explicit": render_rule(ev.rule, adapter),
                 "strictness": ev.strictness,
                 "hold_rate": ev.hold_rate,
                 "hold_rate_ci": [ev.hold_rate_lo, ev.hold_rate_hi],
@@ -191,8 +196,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="0 = run to completion (default)")
     pcal.add_argument("--validation-frac", dest="validation_frac", type=float, default=0.3)
     pcal.add_argument("--band-mode", dest="band_mode", choices=["adaptive", "global"],
-                      default="adaptive",
-                      help="per-candidate self-calibrated band (default) or one fixed global tolerance")
+                      default="global",
+                      help="one fixed global tolerance (default) or a per-candidate self-calibrated band")
     pcal.add_argument("--max-capability-tiers", dest="max_capability_tiers", type=int, default=3,
                       help="grammar re-induction tiers (widen aggregations/degree) when recall stalls")
     pcal.add_argument("--name", default="", help="dataset name for the saved rules file (defaults to the input filename)")
@@ -206,6 +211,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list] = None) -> int:
+    # Explicit rules use math glyphs (Σ, ≠); force UTF-8 stdout so printing them never crashes on
+    # a legacy Windows code page.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
