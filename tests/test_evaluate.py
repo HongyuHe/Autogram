@@ -29,9 +29,10 @@ def test_per_rule_threshold_raises_bar_for_low_support(dataset):
     g = DataOnlyEvaluator(dataset, DiscoveryConfig(seed=0, hold_rate_threshold=0.9,
                                                    threshold_policy="global")).evaluate(rule)
     assert g.threshold == 0.9 and g.accepted
-    # precision-aware (default) raises the per-rule bar for this fragile (low-support) grounding,
-    # so the same near-miss hold-rate no longer clears it -- a per-law precision gate in action.
-    p = DataOnlyEvaluator(dataset, DiscoveryConfig(seed=0, hold_rate_threshold=0.9)).evaluate(rule)
+    # precision-aware (per-rule policy) raises the per-rule bar for this fragile (low-support)
+    # grounding, so the same near-miss hold-rate no longer clears it -- a per-law precision gate.
+    p = DataOnlyEvaluator(dataset, DiscoveryConfig(seed=0, hold_rate_threshold=0.9,
+                                                   threshold_policy="per_rule")).evaluate(rule)
     assert p.threshold > g.threshold
     assert not p.accepted
 

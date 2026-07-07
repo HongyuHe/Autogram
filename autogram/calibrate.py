@@ -35,7 +35,7 @@ class CalibrationConfig:
     harness: str = "copilot"
     backend: str = "subagent"
     null_floor: float = 0.5              # threshold never drops below the false-discovery floor
-    band_mode: str = "global"            # DEFAULT: one fixed tolerance (shared-dial regime); "adaptive" = per-candidate knee band
+    band_mode: str = "adaptive"          # DEFAULT: per-candidate knee band (the ladder starts adaptive, then falls back to a fixed global band); "global" = one fixed tolerance
     max_capability_tiers: int = 3        # grammar re-induction tiers when recall stalls
     regime: Optional[RegimeSpec] = None  # wired, editable synthetic-proxy suite (item 7)
     save_rules: bool = True              # persist the learned portfolio to <rules_dir>/<name>_<ts>.dl
@@ -87,14 +87,14 @@ def _knob_schedule(base: DiscoveryConfig, null_floor: float = 0.5) -> List[Disco
     """The Tuner's generic-knob relaxation ladder (tight -> loose).
 
     Every step touches only dataset-agnostic knobs (band mode, tolerance, hold-rate threshold) --
-    never the user's specific invariants.  The base band mode (``base.band_mode``, **global** by
+    never the user's specific invariants.  The base band mode (``base.band_mode``, **adaptive** by
     default) is exercised first; later rungs lower the threshold and then widen to a looser fixed
     **global** band, which helps systematic-offset laws (e.g. I5/I6) whose whole population sits at
     one scale.
     """
     wide = max(2.0 * base.tolerance, 0.1)   # genuinely looser than the base band, so the fallback
-                                            # rungs are real relaxations and not no-ops when the base
-                                            # is already a fixed global band (the new default)
+                                            # rungs are real relaxations and not no-ops even when the
+                                            # base is already a fixed global band
     low = max(null_floor, min(base.hold_rate_threshold, 0.60))
     ladder = [
         base,                                                            # base band (global by default), tuned knobs

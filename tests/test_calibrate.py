@@ -21,9 +21,9 @@ def _mini_spec(agg=("SUM",), max_degree=1, role_exclusions=()):
                        max_degree=max_degree, role_exclusions=role_exclusions)
 
 
-def test_default_band_mode_is_global():
-    assert DiscoveryConfig().band_mode == "global"
-    assert CalibrationConfig().band_mode == "global"
+def test_default_band_mode_is_adaptive():
+    assert DiscoveryConfig().band_mode == "adaptive"
+    assert CalibrationConfig().band_mode == "adaptive"
     assert CalibrationConfig().max_capability_tiers == 3
 
 

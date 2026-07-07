@@ -18,7 +18,7 @@ class DiscoveryConfig:
     """
 
     tolerance: float = 0.05             # dimensionless epsilon (fallback / global-band relative tolerance)
-    band_mode: str = "global"           # DEFAULT "global" (one fixed tolerance; the shared-dial regime that yields the corroboration guarantee); "adaptive" = per-rule knee band (item 4)
+    band_mode: str = "adaptive"         # DEFAULT "adaptive" (per-candidate knee band, capped at `tolerance` so it can only tighten). "global" = one fixed shared tolerance. Adaptive fits each rule's band to its own residual spread, so the monotone-completeness transfer becomes a bound on hold-rate alone (cleanliness is absorbed by the band, not required as a precondition).
     band_holdout_frac: float = 0.3      # split-conformal holdout for the adaptive band
     separation_tolerance: float = 1e-6  # minimum relative gap for != separations
     presence_tolerance: float = 1e-9    # relative non-zero cutoff for <|> pairings
@@ -27,9 +27,12 @@ class DiscoveryConfig:
     subsample: int = 0                  # 0 => use every grounded point
     seed: int = 0
 
-    # Per-rule acceptance threshold (per-law precision gate). DEFAULT "per_rule" raises the
-    # bar for structurally fragile candidates; "global" reproduces the flat hold_rate_threshold.
-    threshold_policy: str = "per_rule"
+    # Acceptance-threshold policy for the hold-rate bar theta. DEFAULT "global" applies one flat
+    # hold_rate_threshold to every rule, so theta is shared across candidates; this makes the
+    # monotone-completeness transfer unconditional on complexity (the (C3) side-condition becomes
+    # trivial). "per_rule" instead raises the bar for structurally fragile candidates (a per-law
+    # precision gate) at the cost of reintroducing that complexity side-condition in the guarantee.
+    threshold_policy: str = "global"
     thr_base_complexity: int = 6        # no complexity penalty at/below this AST size
     thr_complexity_penalty: float = 0.01   # added per unit of complexity above the baseline
     thr_separation_penalty: float = 0.05   # scaled by fitted eps / tolerance cap (adaptive band only)
