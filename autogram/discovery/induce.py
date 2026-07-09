@@ -175,8 +175,42 @@ def induce_adapter(columns: Sequence[str], inducer: Optional[SchemaInducer] = No
     return compile_spec(induce_spec(columns, inducer, sample_rows))
 
 
+_SCHEMA_PROMPT_COLUMN_BUDGET = 1000
+
+
+def _sample_columns(columns, budget: int = _SCHEMA_PROMPT_COLUMN_BUDGET) -> list:
+    """Pick a diverse subset of at most ``budget`` column names for the induction prompt.
+
+    Wide production schemas often hold far more columns of one measurement kind than another (for
+    example, thousands of per-link telemetry counters but comparatively few demand columns). Taking
+    the first ``budget`` names in source order can then drop an entire kind, which starves the
+    grammar of the very relations that span kinds. We bucket columns by their name prefix (the token
+    before the first underscore) and round-robin across buckets, so every kind is represented within
+    the budget no matter how the source data happens to order its columns.
+    """
+    columns = list(columns)
+    if len(columns) <= budget:
+        return columns
+    buckets: dict[str, list[str]] = {}
+    for col in columns:
+        parts = col.split("_", 1)
+        prefix = parts[0] if len(parts) > 1 else ""
+        buckets.setdefault(prefix, []).append(col)
+    ordered = [buckets[prefix] for prefix in sorted(buckets)]
+    sampled: list[str] = []
+    depth = 0
+    while len(sampled) < budget and any(depth < len(bucket) for bucket in ordered):
+        for bucket in ordered:
+            if depth < len(bucket):
+                sampled.append(bucket[depth])
+                if len(sampled) >= budget:
+                    break
+        depth += 1
+    return sampled
+
+
 def _schema_prompt(columns, sample_rows) -> str:
-    head = "\n".join(list(columns)[:500])
+    head = "\n".join(_sample_columns(columns))
     return (
         "Return ONLY valid JSON for an Autogram GrammarSpec. This is NOT a SQL/database schema. "
         "Use ONLY the exact column names between EXACT_COLUMNS_BEGIN and EXACT_COLUMNS_END; "
