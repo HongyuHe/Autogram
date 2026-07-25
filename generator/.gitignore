@@ -1,0 +1,6 @@
+# Generated synthetic datasets (reproducible from config + seed; not source).
+output/
+
+# Python caches
+__pycache__/
+*.pyc

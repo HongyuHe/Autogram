@@ -1,0 +1,14 @@
+event_id,consumer_id,type,shard_scope,span_start,span_end,duration_minutes,severity_pct,recovering,mechanism,detection_sla_minutes,expected_alert
+consumer_000_ev002,consumer_000,true_loss_partial,shard_000_1,2026-01-01 00:26:30,2026-01-01 02:44:30,138.0,36.759,False,shard_subset_loss,60,True
+consumer_000_ev001,consumer_000,true_loss_persistent,all,2026-01-01 04:35:50,2026-01-01 05:51:50,76.0,1.037,False,persistent_skim,60,True
+consumer_002_ev001,consumer_002,true_loss_partial,"shard_002_0,shard_002_1",2026-01-01 03:12:40,2026-01-01 04:58:40,106.0,20.314,False,shard_subset_loss,60,True
+consumer_003_ev002,consumer_003,benign_burst,all,2026-01-01 00:12:00,2026-01-01 00:48:00,36.0,0.0,True,traffic_burst,60,False
+consumer_003_ev003,consumer_003,artifact,all,2026-01-01 00:58:40,2026-01-01 00:59:30,0.83,0.0,True,scrape_misalignment,60,False
+consumer_003_ev001,consumer_003,true_loss_persistent,all,2026-01-01 02:17:20,2026-01-01 03:52:20,95.0,2.605,False,persistent_skim,60,True
+consumer_004_ev002,consumer_004,benign_burst,all,2026-01-01 00:04:20,2026-01-01 00:42:20,38.0,0.0,True,traffic_burst,60,False
+consumer_004_ev004,consumer_004,artifact,all,2026-01-01 00:47:00,2026-01-01 00:47:50,0.83,0.0,True,scrape_misalignment,60,False
+consumer_004_ev001,consumer_004,true_loss_creeping,all,2026-01-01 01:55:30,2026-01-01 04:18:30,143.0,5.56,False,creeping_skim,60,True
+consumer_004_ev003,consumer_004,benign_burst,all,2026-01-01 05:26:30,2026-01-01 05:44:30,18.0,0.0,True,traffic_burst,60,False
+consumer_005_ev002,consumer_005,benign_burst,all,2026-01-01 01:07:50,2026-01-01 01:33:50,26.0,0.0,True,traffic_burst,60,False
+consumer_005_ev001,consumer_005,true_loss_partial,shard_005_0,2026-01-01 02:36:20,2026-01-01 03:56:20,80.0,25.137,False,shard_subset_loss,60,True
+consumer_005_ev003,consumer_005,benign_burst,all,2026-01-01 05:45:00,2026-01-01 05:57:00,12.0,0.0,True,traffic_burst,60,False

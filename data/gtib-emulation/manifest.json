@@ -1,0 +1,146 @@
+{
+  "generator": "gtib_emulator",
+  "version": "0.1.0",
+  "seed": 20260101,
+  "scale": {
+    "n_consumers": 6,
+    "archetypes": {
+      "steady": 4,
+      "bursty_ml": 2
+    },
+    "total_shards": 17,
+    "n_raw_steps": 2160,
+    "n_minutes": 360
+  },
+  "event_counts": {
+    "benign_burst": 5,
+    "true_loss_partial": 3,
+    "true_loss_persistent": 2,
+    "artifact": 2,
+    "true_loss_creeping": 1
+  },
+  "summary_stats": {
+    "normal_ratio_1h_median": 0.99575,
+    "normal_ratio_1h_p05": 0.94857,
+    "normal_ratio_1h_p95": 1.00935,
+    "max_completeness_ratio_1m": 4.85119
+  },
+  "evaluation": {
+    "evaluated_minutes": 1770,
+    "static_rule": {
+      "tp": 412,
+      "fp": 280,
+      "fn": 198,
+      "tn": 880,
+      "false_positives_on_benign_minutes": 30,
+      "precision": 0.5954,
+      "recall": 0.6754
+    },
+    "trajectory_rule": {
+      "tp": 388,
+      "fp": 61,
+      "fn": 222,
+      "tn": 1099,
+      "false_positives_on_benign_minutes": 31,
+      "precision": 0.8641,
+      "recall": 0.6361
+    },
+    "note": "static_rule.false_positives_on_benign_minutes > 0 with trajectory_rule fewer is the 'reproduce-the-bug' signal."
+  },
+  "config": {
+    "seed": 20260101,
+    "time": {
+      "duration_hours": 6.0,
+      "raw_scrape_seconds": 10,
+      "rate_window_seconds": 60,
+      "smoothing_window_seconds": 3600,
+      "start_timestamp": "2026-01-01T00:00:00Z"
+    },
+    "scale": {
+      "n_consumers": 6,
+      "shards_min": 1,
+      "shards_max": 4,
+      "base_rate_log_mu": 13.8,
+      "base_rate_log_sigma": 1.0,
+      "fraction_bursty": 0.4
+    },
+    "workload": {
+      "diurnal_amplitude": 0.3,
+      "diurnal_period_hours": 24.0,
+      "noise_log_sigma": 0.08,
+      "on_prob": 0.05,
+      "off_prob": 0.3,
+      "burst_amplitude": 2.5,
+      "allreduce_period_seconds": 300.0,
+      "allreduce_amplitude": 2.0,
+      "allreduce_jitter_seconds": 20.0
+    },
+    "pipeline": {
+      "service_margin": 2.0,
+      "catch_up_max_ratio": 20.0,
+      "drain_gain": 0.5,
+      "baseline_ema_halflife_seconds": 1800.0,
+      "healthy_ratio_mean": 0.998,
+      "healthy_ratio_std": 0.0015
+    },
+    "measurement": {
+      "counter_noise_rel": 0.0005,
+      "alignment_artifact_strength": 0.1,
+      "missing_sample_prob": 0.002,
+      "counter_reset_prob_per_hour": 0.05,
+      "shard_churn_prob_per_hour": 0.0,
+      "emit_channel_metrics": false
+    },
+    "alerting": {
+      "alert_threshold": 0.99,
+      "alert_duration_minutes": 10,
+      "good_data_threshold": 0.98
+    },
+    "anomaly": {
+      "persistent": {
+        "count_per_consumer": 0.5,
+        "min_severity": 0.01,
+        "max_severity": 0.05,
+        "min_duration_minutes": 70,
+        "max_duration_minutes": 140
+      },
+      "cliff": {
+        "count_per_consumer": 0.25,
+        "min_severity": 0.3,
+        "max_severity": 0.9,
+        "min_duration_minutes": 60,
+        "max_duration_minutes": 120
+      },
+      "partial": {
+        "count_per_consumer": 0.25,
+        "min_severity": 0.2,
+        "max_severity": 0.6,
+        "min_duration_minutes": 70,
+        "max_duration_minutes": 140
+      },
+      "creeping": {
+        "count_per_consumer": 0.25,
+        "min_severity": 0.02,
+        "max_severity": 0.08,
+        "min_duration_minutes": 90,
+        "max_duration_minutes": 160
+      },
+      "benign_burst": {
+        "count_per_consumer": 1.0,
+        "min_severity": 6.0,
+        "max_severity": 14.0,
+        "min_duration_minutes": 10,
+        "max_duration_minutes": 40
+      },
+      "detection_sla_minutes": 60
+    },
+    "output": {
+      "directory": "output",
+      "fmt": "csv",
+      "include_hidden_state": true,
+      "write_raw": true,
+      "write_derived": true,
+      "write_plot": false
+    }
+  }
+}

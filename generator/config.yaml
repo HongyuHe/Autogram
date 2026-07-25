@@ -1,0 +1,112 @@
+# gTIB Consumer Byte Completeness emulator -- example configuration.
+#
+# This file mirrors the built-in defaults (see gtib_emulator/config.py). Copy it,
+# edit the knobs you care about, and pass it with `--config config.yaml`. Only
+# the keys you set are overridden; everything else falls back to the defaults.
+# Unknown keys fail loudly so typos are caught.
+#
+# Provenance of each default:
+#   [STATED]  taken directly from the email thread
+#   [ASSUMED] our modelling choice / default, tunable
+#   [PAPER]   default informed by published data-center/ML traffic measurements
+#             (Benson et al., IMC 2010; VL2, SIGCOMM 2009; DCTCP, SIGCOMM 2010)
+
+seed: 20260101                 # deterministic runs
+
+time:
+  duration_hours: 6.0          # [ASSUMED] start small; raise for more 1h windows
+  raw_scrape_seconds: 10       # [STATED] raw metric scraped at 10s
+  rate_window_seconds: 60      # [STATED] rates precomputed at 1m
+  smoothing_window_seconds: 3600  # [STATED] 1-hour smoothing window
+  start_timestamp: "2026-01-01T00:00:00Z"
+
+# ---- scale (Q-H: configurable, start small) ----
+scale:
+  n_consumers: 6               # [ASSUMED] start small
+  shards_min: 1                # [ASSUMED] Presenter tasks per consumer (SUM is over these)
+  shards_max: 4                # [ASSUMED]
+  base_rate_log_mu: 13.8       # [PAPER] log-normal tenant rates; median ~1 MB/s
+  base_rate_log_sigma: 1.0     # [PAPER] heavy tail (whales >> median)
+  fraction_bursty: 0.4         # [ASSUMED] share of ML-style bursty tenants
+
+# ---- workload / ML-burst statistics (Q-F: paper-backed defaults) ----
+workload:
+  diurnal_amplitude: 0.30      # [ASSUMED]
+  diurnal_period_hours: 24.0   # [ASSUMED]
+  noise_log_sigma: 0.08        # [ASSUMED]
+  # Intrinsic burstiness is kept MILD (normal variation); the large,
+  # threshold-crossing ML spikes are injected as labelled benign_burst events.
+  on_prob: 0.05                # [ASSUMED] P(enter ON burst) per 10s step
+  off_prob: 0.30               # [ASSUMED] P(leave ON burst) -> short bursts
+  burst_amplitude: 2.5         # [ASSUMED] mild ON multiplier
+  allreduce_period_seconds: 300.0  # [ASSUMED] ML sync cadence
+  allreduce_amplitude: 2.0     # [ASSUMED] extra multiplier at each sync tick
+  allreduce_jitter_seconds: 20.0   # [ASSUMED] stragglers de-sync the spike
+
+# ---- pipeline / fluid queue (Q-C healthy ratio, Q-E catch-up) ----
+pipeline:
+  service_margin: 2.0          # [ASSUMED value / STATED direction] Presenter faster
+  catch_up_max_ratio: 20.0     # [STATED] post-burst ratio can shoot to ~20
+  drain_gain: 0.5              # [ASSUMED] how gradually backlog drains (small = multi-minute dips)
+  baseline_ema_halflife_seconds: 1800.0  # [ASSUMED] fallback baseline smoothing
+  healthy_ratio_mean: 0.998    # [ASSUMED] typical healthy ratio, comfortably above the 0.99 alert threshold
+  healthy_ratio_std: 0.0015    # [ASSUMED] tight; real spread is open question Q-C
+
+# ---- measurement layer ----
+measurement:
+  counter_noise_rel: 0.0005    # [ASSUMED] scrape noise
+  alignment_artifact_strength: 0.10  # [ASSUMED] input/output scrape misalignment
+  missing_sample_prob: 0.002   # [ASSUMED] scrape gaps
+  counter_reset_prob_per_hour: 0.05  # [ASSUMED] task-restart counter resets
+  shard_churn_prob_per_hour: 0.0     # [ASSUMED] 0 = off; >0 lets shards leave mid-run
+  emit_channel_metrics: false  # [STATED preference] Q-J: keep gRPC/Channelz metrics hidden
+
+# ---- alerting rule under study (Q-D thresholds) ----
+alerting:
+  alert_threshold: 0.99        # [STATED] rule doc: ALERT IF ratio < 0.99
+  alert_duration_minutes: 10   # [ASSUMED interp, Q-D] confirmation on the 1h-smoothed ratio
+  good_data_threshold: 0.98    # [STATED] Tao: 0.98 good-data threshold
+
+# ---- anomaly injection (the labelled ground truth) ----
+# count_per_consumer is a Poisson mean; severity is the fractional byte deficit.
+anomaly:
+  detection_sla_minutes: 60    # [STATED] minutes vs ~1 hour
+  persistent:                  # [STATED] persistent 1-5% under-accounting
+    count_per_consumer: 0.5
+    min_severity: 0.01
+    max_severity: 0.05
+    min_duration_minutes: 70
+    max_duration_minutes: 140
+  cliff:                       # [STATED] sudden cliffs (a task dies)
+    count_per_consumer: 0.25
+    min_severity: 0.30
+    max_severity: 0.90
+    min_duration_minutes: 60
+    max_duration_minutes: 120
+  partial:                     # [STATED] shard/regional-scoped partial loss
+    count_per_consumer: 0.25
+    min_severity: 0.20
+    max_severity: 0.60
+    min_duration_minutes: 70
+    max_duration_minutes: 140
+  creeping:                    # [ASSUMED] soft ramp that grazes the threshold
+    count_per_consumer: 0.25
+    min_severity: 0.02
+    max_severity: 0.08
+    min_duration_minutes: 90
+    max_duration_minutes: 160
+  benign_burst:                # [STATED] bursty workloads -> transient dip+overshoot
+    count_per_consumer: 1.0    # bursty tenants get 2x this rate
+    min_severity: 6.0          # for benign_burst, severity fields are the burst AMPLITUDE range
+    max_severity: 14.0
+    min_duration_minutes: 10
+    max_duration_minutes: 40
+
+# ---- output ----
+output:
+  directory: "output"
+  fmt: "csv"                   # "csv" or "parquet" (parquet needs pyarrow)
+  include_hidden_state: true   # backlog_bytes / cum_lost_bytes ground-truth columns
+  write_raw: true              # per-shard 10s counters
+  write_derived: true          # per-consumer 1m derived signals + labels
+  write_plot: false            # optional quick-look PNG (needs matplotlib)
