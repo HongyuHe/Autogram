@@ -64,6 +64,12 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
     * ``measurement_i_source + sum_j flow_j_i == measurement_i_destination + sum_j flow_i_j`` (agg+ref balance)
     * every column ``>= 0``                     (non-negativity)
 
+    Two explicit one-sided proxy families are also available and, when enabled *on their own*,
+    replace all relational structure with sign-constrained independent columns (see below):
+
+    * ``families=("nonneg",)`` -> every column ``>= 0``
+    * ``families=("nonpos",)`` -> every column ``<= 0``
+
     ``noise`` is applied to the measured (``measurement_*``) columns only; the demand matrix stays
     clean.  The engine never sees ``noise``; the self-calibrated band must track it.
 
@@ -167,8 +173,24 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
                 matrix[:, k] = matrix[:, k] * (1.0 + noise * rng.standard_normal(T))
         matrix = np.maximum(matrix, 0.0)
 
+    # explicit one-sided proxies (item: nonneg/nonpos).  When the run enables *only* a one-sided
+    # family, sign-constrain every column and apply an independent per-cell dropout to exact zeros.
+    # Zero is both >= 0 and <= 0, so the sign law is preserved, while the independent dropout masks
+    # give each column its own presence pattern -- so no pair, sum, zero, balance, or presence
+    # relation is accidentally planted (only the one-sided sign relation holds).
+    one_sided = enabled & {"nonneg", "nonpos"}
+    if one_sided and not (enabled - {"nonneg", "nonpos"}):
+        keep = rng.random(matrix.shape) >= 0.25
+        matrix = np.abs(matrix) * keep
+        if "nonpos" in enabled:
+            matrix = -matrix
+
     all_planted = _planted(vocab, ents, N)
     planted = {k: v for k, v in all_planted.items() if k in enabled}
+    if "nonneg" in enabled:
+        planted["nonneg"] = frozenset(cols)
+    if "nonpos" in enabled:
+        planted["nonpos"] = frozenset(cols)
     ts = np.arange(T)
     return Synthetic(columns=cols, matrix=matrix, timestamps=ts, vocab=vocab,
                      entities=ents, planted=planted)

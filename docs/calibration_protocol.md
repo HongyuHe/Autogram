@@ -25,27 +25,17 @@ The Tuner never edits engine code and never hard-codes the user's invariants. It
 ## The loop
 
 1. `autogram precheck` — verify the runtime can induce schemas (harness/subagent/key).
-2. Split the known invariants into a **calibration** subset (guides tuning) and a **validation**
-   subset (reports honest recall; never tuned against).
-3. **Tune generic knobs on the wired proxy suite** (`RegimeSpec`): the approximate-offset proxy
-   and the null control are drawn from the RegimeSpec; the tuning grid is adaptive and expands if
-   no operating point fits, but the threshold never drops below the data null floor.
-4. **(Re-)induce a grammar and discover** on the user's data. The per-candidate **adaptive band**
-   is the default — each candidate law is judged at a tolerance fit from its own residuals.
-5. **Walk the relaxation ladder** (generic knobs only): exercise the adaptive band, lower the
-   threshold toward the null floor, then fall back to a fixed global band (which helps
-   systematic-offset laws whose whole population sits at one scale). Score calibration-split recall
-   after each rung and stop early at full recall.
-6. **Re-induce with widened capabilities on stall.** If relaxing the numeric knobs stops improving
-   recall, re-propose the grammar with a higher capability floor (all aggregations, then
-   products/ratios via `max_degree=2`) — a missed law can be a vocabulary gap, not a threshold gap.
-7. **Report and persist.** Report recovery via the Discovery reporter (per-invariant recovered/missed,
-   aggregate recall on the held-out validation split, the number of grammar re-inductions, and a
-   false-discovery figure), and **save the learned invariants by default** to
-   `rules/<name>_<timestamp>.dl` plus a `learned_invariants` list in the JSON report.
+2. Split the known invariants into a **calibration** subset (guides tuning) and a **validation** subset (reports honest recall; never tuned against).
+3. **Derive the positive proxy suite from the calibration subset only.** With no custom `RegimeSpec`, calibration reads only the *relation forms* of the calibration-split invariants — never the held-out validation split, and never domain words in the variable names — and plants one generic proxy per form on fresh synthetic entities.
+4. **Map each form to a generic shape:** exact pair (`==` to a variable), approximate pair (`~=` to a variable), sum (`==`/`~=` to a `{sum: [...]}`), zero (`==`/`~=` to `0`), presence pairing (`<|>`), non-negative (`>= 0`), and non-positive (`<= 0`); a supported shape the known-invariant file cannot express — notably a mixed reference-plus-sum conservation balance — is reachable only by supplying a custom `RegimeSpec`.
+5. **Prepare each proxy once, then jointly tune.** Every selected positive proxy and an always-on null control are generated and schema-induced exactly once and then reused across one joint (tolerance, hold-rate threshold) grid, which expands toward the null floor on a stall and fails loudly with per-proxy evidence when nothing qualifies.
+6. **Enforce the hard eligibility rule.** A setting qualifies only when every selected positive proxy meets its recovery target, every produced portfolio stays compact and free of scaled-slack inequality variants, and the null control produces zero accepted equalities; among qualifying settings the strictest wins (smallest tolerance, then highest threshold).
+7. **(Re-)induce a grammar and discover on the user's data under one shared global band by default.** `--band-mode adaptive` is the opt-in mode that fits a separate, capped tolerance to each candidate from its own residuals; the standalone `DiscoveryConfig` default stays adaptive, while `autogram calibrate` defaults to the shared global band.
+8. **Walk the relaxation ladder** (generic knobs only): later rungs lower the threshold toward the null floor and widen the tolerance, every rung is re-checked on the *same* prepared null dataset so a rung that accepts even one false equality is disqualified and can never win, and calibration-split recall is scored after each rung with an early stop at full recall.
+9. **Re-induce with widened capabilities on stall.** If relaxing the numeric knobs stops improving recall, re-propose the grammar with a higher capability floor (all aggregations, then products/ratios via `max_degree=2`) — a missed law can be a vocabulary gap, not a threshold gap.
+10. **Report and persist.** Report recovery via the Discovery reporter (per-invariant recovered/missed, aggregate recall on the held-out validation split, the number of grammar re-inductions, and a false-discovery figure), echo the selected proxy shapes with per-proxy recovery evidence (recovery fraction, accepted count, compactness, and any scaled-slack rules), the grid expansions, and the selected null-equality count, and **save the learned invariants by default** to `rules/<name>_<timestamp>.dl` plus a `learned_invariants` list in the JSON report.
 
-Defaults on: the per-candidate adaptive band (`--band-mode global` opts out when you have a strong
-band prior), the wired `RegimeSpec` proxy suite, and grammar re-induction (`--max-capability-tiers`).
+Defaults on: one shared global band (`--band-mode adaptive` opts in to a per-candidate, capped self-calibrated band), the proxy suite derived from the calibration-split shapes plus the always-on null control, and grammar re-induction (`--max-capability-tiers`).
 
 ## What the Tuner may and may not change
 
@@ -55,12 +45,15 @@ set, role-exclusion blocklist, and the declarative `RegimeSpec` (shape + regime 
 **May not:** the user's specific invariants (no per-invariant special-casing), the held-out
 validation split, or the always-on null proxy (the false-discovery control).
 
+**Extending the suite.** A caller may pass a `CalibrationConfig.regime`, and the Tuner may add, adjust, or deactivate any of the supported generic proxy entries as a declarative edit.
+Adding a genuinely *new* shape is a code change, not a knob: it requires extending the trusted generator, the recovery scorer, the known-invariant shape mapping (when the shape should be auto-derivable), and the tests.
+
 ## Guarantees & limits (state these in every report)
 
 - **Recall subject to a false-discovery ceiling** — recall is only meaningful alongside a low
   null-acceptance figure. Never maximize recall alone.
-- **Proxies are abstractions, not copies** — a proxy shares a *shape and regime* with a real
-  invariant, planted on fresh synthetic entities; it never references the user's real variables.
+- **Proxies are abstractions, not copies** — a proxy shares a *shape and regime* with a real invariant, planted on fresh synthetic entities, and never references the user's real variables.
+  Proxy recovery constrains only the tuned knobs and never restricts which rules the real grammar may enumerate; conversely, a proxy suite that does not represent a real law's noise/support regime can still lead to settings that miss it.
 - **Known-recall is a lower bound under representativeness**, not a guarantee of discovering
   *unknown* invariants: an invariant may be missed if it is weaker than the tuned threshold
   (F1), lives at a different tolerance scale (F2), is not expressible in the grammar (F3), or if

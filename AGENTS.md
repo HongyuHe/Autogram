@@ -10,8 +10,8 @@ You are the **Tuner**. Your job: adapt Autogram's generic knobs to the user's da
 
 ## Loop
 1. **Preflight:** `autogram precheck --harness <h>`. Fix any issue before continuing.
-2. **Calibrate:** `autogram calibrate --input data.pkl --known known_invariants.yaml --out report.json`. This tunes generic knobs on the wired `RegimeSpec` proxy suite, (re-)induces a grammar, walks a relaxation ladder with a per-candidate **adaptive band** by default, re-induces with widened capabilities if recall stalls, and reports recall of the known invariants (on a held-out validation split) with a false-discovery figure.
-3. **Read the report.** If `recall_validation` is low, adjust **generic knobs only**: pass `--band-mode global` when you have a strong prior that everything holds at one band, raise `--max-capability-tiers` to allow more grammar widening, or extend the `RegimeSpec` proxy suite. **Never** hard-code the user's specific invariants.
+2. **Calibrate:** `autogram calibrate --input data.pkl --known known_invariants.yaml --out report.json`. This tunes generic knobs on a proxy suite derived from your calibration-split invariant shapes (or a custom `RegimeSpec`), (re-)induces a grammar, walks a relaxation ladder under **one shared global band by default**, re-induces with widened capabilities if recall stalls, and reports recall of the known invariants (on a held-out validation split) with a false-discovery figure.
+3. **Read the report.** If `recall_validation` is low, adjust **generic knobs only**: pass `--band-mode adaptive` to fit a separate, capped tolerance to each candidate, raise `--max-capability-tiers` to allow more grammar widening, or add/adjust/deactivate entries in the `RegimeSpec` proxy suite. **Never** hard-code the user's specific invariants.
 4. Stop when validation recall is satisfactory or the iteration budget is spent.
 
 ## Rules (do not break these)

@@ -76,6 +76,58 @@ def _signature(inv: KnownInvariant):
     return None
 
 
+def shapes_for_invariant(inv: KnownInvariant) -> List[str]:
+    """Map one known-invariant relation form to the generic proxy shape(s) that cover it.
+
+    The mapping inspects only the *structure* of the relation (operator and right-hand-side
+    form) -- never domain-specific words in the variable names -- so it is dataset-agnostic:
+
+    * ``==`` with a column rhs                      -> ``["two_end"]``       (exact pairwise equality)
+    * ``~=`` with a column rhs                      -> ``["offset_pair"]``   (approximate pairwise equality)
+    * ``~=`` / ``==`` with a ``{sum: [...]}`` rhs   -> ``["row_sum", "col_sum"]`` (reference == family sum;
+      the file format does not encode which matrix axis the family spans, so both are covered)
+    * ``~=`` / ``==`` with ``0``                    -> ``["self_zero"]``     (equality to zero)
+    * ``<|>`` with a column rhs                     -> ``["presence_pair"]`` (presence pairing)
+    * ``>= 0``                                      -> ``["nonneg"]``
+    * ``<= 0``                                      -> ``["nonpos"]``
+
+    ``agg_ref_balance`` is intentionally never produced: the known-invariant file format cannot
+    express a mixed reference-plus-sum balance, so that shape is reachable only via a custom
+    ``RegimeSpec``.  Any unsupported form maps to ``[]``.
+    """
+    op, rhs = inv.op, inv.rhs
+    is_zero = isinstance(rhs, (int, float)) and float(rhs) == 0.0
+    if op in ("~=", "==") and is_zero:
+        return ["self_zero"]
+    if op in ("~=", "==") and isinstance(rhs, dict) and "sum" in rhs:
+        return ["row_sum", "col_sum"]
+    if op == "==" and isinstance(rhs, str):
+        return ["two_end"]
+    if op == "~=" and isinstance(rhs, str):
+        return ["offset_pair"]
+    if op == "<|>" and isinstance(rhs, str):
+        return ["presence_pair"]
+    if op == ">=" and is_zero:
+        return ["nonneg"]
+    if op == "<=" and is_zero:
+        return ["nonpos"]
+    return []
+
+
+def abstract_shapes(known: List[KnownInvariant]) -> List[str]:
+    """Union (first-seen order, deduped) of the proxy shapes covering ``known``.
+
+    Returns an empty list when no invariant maps to a supported shape; the calibrator turns that
+    into a loud error rather than silently proxying every shape.
+    """
+    out: List[str] = []
+    for inv in known:
+        for shape in shapes_for_invariant(inv):
+            if shape not in out:
+                out.append(shape)
+    return out
+
+
 def _one_sided_columns(result: DiscoveryResult, op: str) -> set:
     """Columns C for which the portfolio contains ``[forall b] <ref over C> op 0``."""
     ds = result.dataset

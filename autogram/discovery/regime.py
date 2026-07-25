@@ -19,6 +19,7 @@ from . import synth as S
 KNOWN_SHAPES = (
     "row_sum", "col_sum", "two_end", "self_zero",
     "offset_pair", "agg_ref_balance", "presence_pair",
+    "nonneg", "nonpos",
 )
 
 
@@ -64,14 +65,15 @@ def default_regime() -> RegimeSpec:
 
 
 def abstract_from_shapes(shapes, seed: int = 0) -> RegimeSpec:
-    """Auto-coverage: build a proxy per shape present among the calibration invariants.
+    """Auto-coverage: build a proxy per supported shape present among the calibration invariants.
 
     ``shapes`` are the grammar shapes abstracted from the user's calibration-split invariants;
-    unknown shapes are ignored (they signal a grammar-expressiveness gap, not a proxy gap).
-    Falls back to the full default suite when nothing maps.
+    unknown shapes are ignored (they signal a grammar-expressiveness gap, not a proxy gap).  Unlike
+    earlier revisions this does **not** fall back to the full default suite when nothing maps: it
+    returns an empty ``RegimeSpec`` so the caller (calibration) can fail loudly and tell the user to
+    supply a custom regime, rather than silently fabricating proxies for shapes they never declared.
     """
-    entries = [ProxyEntry(s) for s in shapes if s in KNOWN_SHAPES]
-    return RegimeSpec(entries=entries or [ProxyEntry(s) for s in KNOWN_SHAPES])
+    return RegimeSpec(entries=[ProxyEntry(s) for s in shapes if s in KNOWN_SHAPES])
 
 
 def generate(entry: ProxyEntry, seed: int = 0):

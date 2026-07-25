@@ -5,8 +5,48 @@ from __future__ import annotations
 import json
 
 from autogram.discovery import regime as R
-from autogram.discovery.known import KnownInvariant, _signature, load_known
+from autogram.discovery.known import (
+    KnownInvariant, _signature, abstract_shapes, load_known, shapes_for_invariant,
+)
 from autogram.calibrate import CalibrationConfig, _split_known, precheck
+
+
+def test_shapes_for_invariant_maps_each_relation_form():
+    # Every KnownInvariant relation form maps to the expected generic proxy shape set, using
+    # only the op/rhs structure (no domain-specific words in the variable names).
+    assert shapes_for_invariant(KnownInvariant("a", "==", "x", "y")) == ["two_end"]
+    assert shapes_for_invariant(KnownInvariant("a", "~=", "x", "y")) == ["offset_pair"]
+    assert shapes_for_invariant(KnownInvariant("a", "~=", "x", {"sum": ["y", "z"]})) == ["row_sum", "col_sum"]
+    assert shapes_for_invariant(KnownInvariant("a", "==", "x", {"sum": ["y"]})) == ["row_sum", "col_sum"]
+    assert shapes_for_invariant(KnownInvariant("a", "==", "x", 0)) == ["self_zero"]
+    assert shapes_for_invariant(KnownInvariant("a", "~=", "x", 0)) == ["self_zero"]
+    assert shapes_for_invariant(KnownInvariant("a", "<|>", "x", "y")) == ["presence_pair"]
+    assert shapes_for_invariant(KnownInvariant("a", ">=", "x", 0)) == ["nonneg"]
+    assert shapes_for_invariant(KnownInvariant("a", "<=", "x", 0)) == ["nonpos"]
+    # a reference-vs-sum never abstracts to agg_ref_balance (the file format cannot express it)
+    assert "agg_ref_balance" not in shapes_for_invariant(
+        KnownInvariant("a", "==", "x", {"sum": ["y", "z"]}))
+
+
+def test_abstract_shapes_unions_first_seen_order_and_dedupes():
+    known = [
+        KnownInvariant("a", "~=", "x", "y"),
+        KnownInvariant("b", "~=", "p", "q"),          # duplicate offset_pair
+        KnownInvariant("c", "==", "m", "n"),
+        KnownInvariant("d", ">=", "z", 0),
+    ]
+    assert abstract_shapes(known) == ["offset_pair", "two_end", "nonneg"]
+
+
+def test_abstract_from_shapes_empty_when_no_shape_maps():
+    # The automatic path must NOT silently fall back to the full suite when nothing maps.
+    rs = R.abstract_from_shapes(["not_a_shape", "also_bad"])
+    assert rs.entries == []
+    assert rs.active_entries() == []
+
+
+def test_known_shapes_include_explicit_one_sided_proxies():
+    assert "nonneg" in R.KNOWN_SHAPES and "nonpos" in R.KNOWN_SHAPES
 
 
 def test_regime_default_and_edits():

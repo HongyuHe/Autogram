@@ -20,11 +20,13 @@ from typing import List, Optional
 from .config import DiscoveryConfig, SearchConfig
 from .discovery.export import write_rules_dl
 from .discovery.induce import induce_spec, make_inducer
-from .discovery.known import KnownInvariant, load_known, recover_known
+from .discovery.known import KnownInvariant, abstract_shapes, load_known, recover_known
 from .discovery.loop import build_dataframe_grammar, run_prepared
-from .discovery.regime import RegimeSpec, default_regime
+from .discovery.regime import RegimeSpec, abstract_from_shapes
 from .discovery.subagent import HARNESSES
-from .discovery.validate import null_accepted, tune_threshold_tolerance
+from .discovery.validate import (
+    CalibrationGridError, null_equalities_at, prepare_proxy_suite, tune_joint,
+)
 
 
 @dataclass
@@ -35,7 +37,7 @@ class CalibrationConfig:
     harness: str = "copilot"
     backend: str = "subagent"
     null_floor: float = 0.5              # threshold never drops below the false-discovery floor
-    band_mode: str = "adaptive"          # DEFAULT: per-candidate knee band (the ladder starts adaptive, then falls back to a fixed global band); "global" = one fixed tolerance
+    band_mode: str = "global"            # DEFAULT for calibration: one fixed global tolerance; "adaptive" = per-candidate self-calibrated band. (The engine's own DiscoveryConfig default stays "adaptive".)
     max_capability_tiers: int = 3        # grammar re-induction tiers when recall stalls
     regime: Optional[RegimeSpec] = None  # wired, editable synthetic-proxy suite (item 7)
     save_rules: bool = True              # persist the learned portfolio to <rules_dir>/<name>_<ts>.dl
@@ -83,14 +85,38 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int):
     return calib, valid
 
 
+def _derive_regime(cfg: "CalibrationConfig", calib: List[KnownInvariant]) -> RegimeSpec:
+    """The proxy suite calibration will tune on.
+
+    A caller-supplied ``cfg.regime`` is authoritative and returned unchanged (its active entries are
+    used as-is).  Otherwise the positive proxy suite is derived *only* from the relation shapes
+    present in the calibration-split known invariants -- never the held-out validation split, never
+    a hard-coded full suite.  If no supported shape can be derived, calibration fails loudly rather
+    than silently proxying every shape (the null control is always added separately downstream).
+    """
+    if cfg.regime is not None:
+        if not cfg.regime.active_entries():
+            raise ValueError(
+                "custom CalibrationConfig.regime has no active proxy entries; activate at least "
+                "one shape or omit the regime to derive it from the calibration invariants")
+        return cfg.regime
+    regime = abstract_from_shapes(abstract_shapes(calib))
+    if not regime.active_entries():
+        raise ValueError(
+            "no supported proxy shape can be derived from the calibration invariants "
+            "(only ==, ~=, reference==sum, ==0, <|>, >=0 and <=0 forms are abstractable); "
+            "supply a custom CalibrationConfig.regime to calibrate this dataset")
+    return regime
+
+
 def _knob_schedule(base: DiscoveryConfig, null_floor: float = 0.5) -> List[DiscoveryConfig]:
     """The Tuner's generic-knob relaxation ladder (tight -> loose).
 
     Every step touches only dataset-agnostic knobs (band mode, tolerance, hold-rate threshold) --
-    never the user's specific invariants.  The base band mode (``base.band_mode``, **adaptive** by
-    default) is exercised first; later rungs lower the threshold and then widen to a looser fixed
-    **global** band, which helps systematic-offset laws (e.g. I5/I6) whose whole population sits at
-    one scale.
+    never the user's specific invariants.  The base band mode (``base.band_mode`` -- ``global`` for
+    calibration by default, though the ladder honours whatever mode ``base`` carries) is exercised
+    first; later rungs lower the threshold and then widen to a looser fixed **global** band, which
+    helps systematic-offset laws (e.g. I5/I6) whose whole population sits at one scale.
     """
     wide = max(2.0 * base.tolerance, 0.1)   # genuinely looser than the base band, so the fallback
                                             # rungs are real relaxations and not no-ops even when the
@@ -211,46 +237,66 @@ def _spec_summary(spec, tier: int, caps: dict) -> dict:
 
 def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
               name: str = "calibrate") -> dict:
-    """Full calibration loop: tune knobs on proxies, (re-)propose a grammar, iterate, report recall.
+    """Full calibration loop: jointly tune knobs on the proxy suite, discover on the dataset, report recall.
 
     Objective: recall on a *held-out* validation split, subject to a false-discovery ceiling
-    (null acceptance) -- never recall alone.  Enabled by default: one fixed global band,
-    the wired RegimeSpec proxy suite, and grammar re-induction with widened capabilities on stall.
-    The learned portfolio is persisted to ``<rules_dir>/<name>_<timestamp>.dl`` and echoed into the
-    returned report as ``learned_invariants``.
+    (null acceptance) -- never recall alone.  The proxy suite is a caller-supplied ``RegimeSpec`` or
+    one derived from the calibration-split shapes; every selected positive proxy and the always-on
+    null control are prepared once and reused to jointly pick one shared (tolerance, hold-rate
+    threshold).  The relaxation ladder then runs on the real data (one fixed global band by default),
+    re-inducing the grammar with widened capabilities on stall, and every rung must clear the same
+    zero-null-equality gate before it can win.  The learned portfolio is persisted to
+    ``<rules_dir>/<name>_<timestamp>.dl`` and echoed into the report as ``learned_invariants``.
     """
     cfg = cfg or CalibrationConfig()
     known = load_known(known_path)
     calib, valid = _split_known(known, cfg.validation_frac, cfg.seed)
+    inducer = make_inducer("subagent", harness=cfg.harness)
 
-    # 1) RegimeSpec -- the wired, editable synthetic-proxy suite (enabled by default). The tuner
-    #    adjusts the offset proxy to a clean, isolated regime for threshold/tolerance tuning.
-    regime = cfg.regime or default_regime()
-    regime.adjust("offset_pair", n_entities=3, n_snapshots=120, noise=0.0)
+    # 1) proxy suite -- a caller-supplied regime is authoritative; otherwise it is derived from the
+    #    calibration-split shapes only.  The null control is always included by prepare_proxy_suite.
+    regime = _derive_regime(cfg, calib)
 
-    # 2) tune base generic knobs on the offset proxy drawn from the RegimeSpec (means, not ends)
-    tuned_pair = tune_threshold_tolerance(cfg.seed, null_floor=cfg.null_floor, regime=regime)
+    # 2) prepare every selected positive proxy + the null control ONCE (schema induction per proxy);
+    #    the prepared grammars are reused for every joint-tuning grid cell and every ladder rung.
+    suite = prepare_proxy_suite(regime, seed=cfg.seed, inducer=inducer)
+
+    # 3) jointly tune ONE shared (tolerance, hold-rate threshold) across the whole selected suite +
+    #    null, under the calibration band mode.  A setting is eligible only when every positive proxy
+    #    hits its recovery target with a compact, scaled-slack-free portfolio and the null accepts no
+    #    equality; the grid expands on stall and fails loudly (with per-proxy evidence) otherwise.
+    joint = tune_joint(suite, seed=cfg.seed, band_mode=cfg.band_mode, null_floor=cfg.null_floor)
     base = DiscoveryConfig(seed=cfg.seed,
-                           tolerance=max(0.05, float(tuned_pair["tolerance"])),
-                           hold_rate_threshold=float(tuned_pair["threshold"]),
+                           tolerance=float(joint["tolerance"]),
+                           hold_rate_threshold=float(joint["hold_rate_threshold"]),
                            band_mode=cfg.band_mode)
     scfg = SearchConfig(seed=cfg.seed)
-    inducer = make_inducer("subagent", harness=cfg.harness)
 
     schedule = _knob_schedule(base, null_floor=cfg.null_floor)
     knob_budget = cfg.max_iterations if cfg.max_iterations and cfg.max_iterations > 0 else len(schedule)
     tiers = _capability_tiers()[:max(1, cfg.max_capability_tiers)]
 
-    # 3) outer grammar-capability loop + inner knob ladder
+    # 4) outer grammar-capability loop + inner knob ladder
     history: List[dict] = []
     grammar_specs: List[dict] = []
-    best = None            # (recall, dcfg, res, tier, caps)
+    best = None            # (recall, dcfg, res, tier, caps, null_eq)
     reinductions = 0
     prev_tier_best = -1.0
     global_iter = 0
     accumulated = None     # running union of induced specs -> re-induction can only grow it (item 2)
+    # Memoize the null gate by (band_mode, tolerance, threshold): the same relaxation-ladder rungs
+    # recur in every grammar tier, and the null grammar is prepared once, so each unique config only
+    # needs scoring once across all tiers.
+    null_cache: dict = {}
+
+    def _null_gate(dcfg: DiscoveryConfig) -> int:
+        key = (dcfg.band_mode, dcfg.tolerance, dcfg.hold_rate_threshold)
+        if key not in null_cache:
+            null_cache[key] = null_equalities_at(suite.null, dcfg, cfg.seed)
+        return null_cache[key]
+
     for ti, caps in enumerate(tiers):
-        spec = induce_spec(list(df.columns), inducer)     # (re-)propose the grammar
+        spec = induce_spec(list(df.columns), inducer)     # (re-)propose the grammar (columns only)
         if ti > 0:
             reinductions += 1
             # Fold the fresh (non-deterministic) proposal back into the accumulated grammar so a
@@ -269,6 +315,11 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             global_iter += 1
             res = run_prepared(ds, G, discovery_cfg=dcfg, search_cfg=scfg)
             rec = recover_known(res, calib)["recall"]
+            # Same zero-null-equality gate as tuning, at THIS rung's (tolerance, threshold), reusing
+            # the once-prepared null grammar (memoized across tiers): a proxy-safe base is not enough
+            # if a relaxed rung is unsafe, so an unsafe rung can never become the winner.
+            null_eq = _null_gate(dcfg)
+            null_safe = null_eq == 0
             history.append({
                 "iteration": global_iter,
                 "grammar_tier": ti,
@@ -277,22 +328,28 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
                 "band_mode": dcfg.band_mode,
                 "calibration_recall": round(rec, 4),
                 "rules_learned": len(res.portfolio),
+                "null_equalities": null_eq,
+                "null_safe": null_safe,
             })
             tier_best = max(tier_best, rec)
-            if best is None or rec > best[0]:
-                best = (rec, dcfg, res, ti, caps)
-            if rec >= 1.0:
+            if null_safe and (best is None or rec > best[0]):
+                best = (rec, dcfg, res, ti, caps, null_eq)
+            if null_safe and rec >= 1.0:
                 break
-        if best[0] >= 1.0:
+        if best is not None and best[0] >= 1.0:
             break                                          # solved -- no need to widen further
         if tier_best <= prev_tier_best + 1e-9:
             break                                          # stall: widening the grammar didn't help
         prev_tier_best = tier_best
 
-    recall, best_dcfg, best_res, best_tier, best_caps = best
+    if best is None:
+        raise CalibrationGridError(
+            "no null-safe ladder rung was found on the real data at any tuned or relaxed setting; "
+            "raise the null-floor headroom or supply a custom regime")
+
+    recall, best_dcfg, best_res, best_tier, best_caps, best_null = best
     report_all = recover_known(best_res, known)
     report_val = recover_known(best_res, valid) if valid else report_all
-    null_eq = null_accepted(seed=cfg.seed, inducer=inducer, regime=regime)
 
     # Persist the learned invariants by default: a human-readable .dl file + the rules in the report.
     rules_file = None
@@ -321,7 +378,7 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             "hold_rate_threshold": round(best_dcfg.hold_rate_threshold, 4),
             "grammar_tier": best_tier,
             "capabilities": (best_caps or "as-induced"),
-            "grid_expansions": tuned_pair.get("expansions", 0),
+            "grid_expansions": joint["expansions"],
         },
         "iterations": len(history),
         "grammar_reinductions": reinductions,
@@ -329,10 +386,16 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
         "grammar_specs": grammar_specs,
         "regime_proxies": [{"shape": e.shape, "noise": e.noise, "active": e.active}
                            for e in regime.entries],
+        "proxies": {
+            "shapes": joint["proxy_shapes"],
+            "per_proxy": joint["per_proxy"],
+            "selected_null_equalities": joint["selected_null_equalities"],
+            "grid_expansions": joint["expansions"],
+        },
         "recall_all": report_all["recall"],
         "recall_validation": report_val["recall"],
         "recovered_all": f"{report_all['recovered']}/{report_all['total']}",
-        "false_discovery": {"null_equalities_accepted": null_eq},
+        "false_discovery": {"null_equalities_accepted": best_null},
         "n_rules_learned": len(best_res.portfolio),
         "rules_file": rules_file,
         "learned_invariants": learned_invariants,
