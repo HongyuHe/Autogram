@@ -5,6 +5,7 @@ Datasets used by this project.
 | Dataset | Location | Description |
 |---------|----------|-------------|
 | crosscheck-samples | [`crosscheck-samples/`](crosscheck-samples/) | Abilene (2004) & GÉANT (2005) network traffic-matrix samples, 1000 snapshots each. |
+| gtib-emulation | [`gtib-emulation/`](gtib-emulation/) | Synthetic multi-tenant "byte-completeness" SLO telemetry from the gTIB emulator: per-shard counters, per-minute rates/ratios/alerts, and a labelled event catalogue. |
 
 ---
 
@@ -437,3 +438,193 @@ crosscheck-samples/geant_sample_1000.pkl   | rows 1000 | nodes 22 | links 36 | i
 A fuller exploration — column-parsing helpers, distributions, and the invariant validation
 (Section 16) — lives in [`../crosscheck_exploration.ipynb`](../crosscheck_exploration.ipynb)
 at the repository root.
+
+---
+
+## gtib-emulation
+
+Synthetic, fully-labelled telemetry produced by the **gTIB byte-completeness emulator** in [`../generator/`](../generator/).
+The four files here are one default run (`seed 20260101`, 6 hours of a small system); regenerate or rescale them with `uv run python -m gtib_emulator generate` (see [`../generator/README.md`](../generator/README.md)).
+
+The emulator's own **authoritative documentation** (what is modelled, every configuration knob, the honesty caveats) lives in [`../generator/README.md`](../generator/README.md), and its executable invariant contract is [`../generator/gtib_emulator/invariants.py`](../generator/gtib_emulator/invariants.py).
+This section is a **data dictionary and invariant catalogue** for the emitted files, plus a structural comparison to `crosscheck-samples`.
+
+### What the data represents
+
+The dataset models a multi-tenant streaming-telemetry accounting system with a "byte-completeness" service-level objective.
+For each tenant (a *consumer*), bytes are counted at two stages of a pipeline and compared:
+
+```
+consumer traffic --> [Collector] --> (buffer ~ a queue) --> [Presenter] --> metrics
+                          |                                        |
+                collector_input_counted                presenter_output_counted
+```
+
+The monitored signal is the **completeness ratio** `Output_Rate / Input_Rate`, summed over a consumer's shards.
+The production alert `ratio < 0.99 for 1 hour` misfires on bursty machine-learning tenants, whose rapid traffic swings cause transient dips that are queueing artifacts rather than real byte loss.
+The emulator generates the labelled ground truth needed to build and evaluate a better detector, and it embeds a set of physical invariants a learned rule may rely on.
+
+### Files and grains
+
+Unlike `crosscheck-samples` (one wide pickle whose columns carry the entity identity), gtib is emitted as **long/tidy CSVs with plain scalar cells**: the entity identity lives in row values (`consumer_id`, `shard_id`, `minute_index`), and the measured quantities are a fixed set of columns.
+
+| File | Grain (one row =) | Rows × cols | Contents |
+|------|-------------------|-------------|----------|
+| [`gtib-emulation/timeseries_raw.csv`](gtib-emulation/timeseries_raw.csv) | one shard at one 10 s scrape | 36720 × 7 | the two observed cumulative counters + `missing_flag`/`reset_flag` |
+| [`gtib-emulation/timeseries_derived.csv`](gtib-emulation/timeseries_derived.csv) | one consumer at one 1 min step | 2160 × 16 | per-minute rates, ratios, the alert outputs, hidden ground truth, and labels |
+| [`gtib-emulation/events.csv`](gtib-emulation/events.csv) | one injected event | 13 × 12 | the ground-truth catalogue of what was injected, where, and whether it should alert |
+| [`gtib-emulation/manifest.json`](gtib-emulation/manifest.json) | the whole run | — | seed, effective config, scale, event counts, summary stats, and the static-vs-oracle evaluation |
+
+Time axis: 10 s raw scrapes aggregate to 1 min rates, which smooth over a 60 min window.
+Default scale: 6 consumers (4 steady, 2 bursty), 17 shards total, 360 minutes, 2160 raw steps.
+
+### What the columns mean
+
+**`timeseries_raw.csv`** (the observed, noisy inputs a detector actually sees):
+
+| Column | dtype | Meaning |
+|--------|-------|---------|
+| `timestamp`, `consumer_id`, `shard_id` | str | identity; `shard_id` is `shard_<ccc>_<s>` |
+| `collector_input_counted` | float64 | cumulative bytes counted at the Collector (monotone, resets on task restart, NaN on a missed scrape) |
+| `presenter_output_counted` | float64 | cumulative bytes counted at the Presenter (same behaviour; already carries the metering offset and scrape noise) |
+| `missing_flag` | bool | this scrape was dropped (counter is NaN) |
+| `reset_flag` | bool | the counter restarted at this step (a task death) |
+
+**`timeseries_derived.csv`** (the per-minute alerting math plus hidden ground truth and labels):
+
+| Column | dtype | Layer | Meaning |
+|--------|-------|-------|---------|
+| `timestamp`, `consumer_id`, `minute_index` | str/int | identity | minute boundary and tenant |
+| `input_rate_bytes_per_min`, `output_rate_bytes_per_min` | float64 | observed | per-minute byte increments summed over the consumer's shards |
+| `completeness_ratio` | float64 | derived | `output_rate / input_rate` over one minute |
+| `completeness_ratio_1h` | float64 | derived | 60-minute rolling ratio-of-sums |
+| `static_alert` | bool | derived | the production rule's output |
+| `traj_alert` | bool | derived | an illustrative trajectory-aware rule (the contrast) |
+| `backlog_bytes`, `cum_lost_bytes` | float64 | **hidden ground truth** | queue occupancy and cumulative real loss, summed over shards (never observable in production) |
+| `is_true_loss`, `is_benign_burst`, `is_artifact` | bool | label | per-minute masks from the event catalogue |
+| `label` | str | label | `normal` / `true_loss` / `benign_burst` / `artifact` (priority `true_loss` ≻ `benign_burst` ≻ `artifact` ≻ `normal`) |
+| `oracle_alert` | bool | label | the correct answer: equals `is_true_loss` |
+
+Default `label` distribution: `normal` 1380, `true_loss` 644, `benign_burst` 133, `artifact` 3.
+
+### Reading a value out of a cell
+
+Cells are plain scalars, so no unwrapping is needed (contrast the dict cells of `crosscheck-samples`).
+Two conventions matter when reconstructing the derived quantities from the raw counters:
+
+- a **rate** is the increment of a *cumulative* counter across a boundary, so `rate(t) = counter(t) − counter(t − window)`;
+- a **missing scrape** (`NaN`) is forward-filled before differencing, and a minute containing a reset, a negative step, or no valid shard is dropped from that minute's sum.
+
+```python
+import pandas as pd
+raw = pd.read_csv("gtib-emulation/timeseries_raw.csv", parse_dates=["timestamp"])
+der = pd.read_csv("gtib-emulation/timeseries_derived.csv", parse_dates=["timestamp"])
+
+# completeness ratio is exactly output_rate / input_rate:
+der["check"] = der["output_rate_bytes_per_min"] / der["input_rate_bytes_per_min"]
+```
+
+### Structural relationships (invariants)
+
+The invariants follow from how the data is generated.
+Shorthand: raw per shard `s` at step `t` — `I[s,t] = collector_input_counted`, `O[s,t] = presenter_output_counted`; derived per consumer at minute `m` — `IR`, `OR`, `CR`, `CR1h`, `SA`, `TA`, `B = backlog_bytes`, `L = cum_lost_bytes`; hidden physical per shard/step (not emitted) — `cum_input`, `cum_output_physical`, `cum_true_loss`, `Q` (backlog).
+
+#### A. Model-guaranteed invariants (the executable contract in `invariants.py`)
+
+| # | Invariant | Formal statement | Strictness | Shape | Observable in the CSVs? |
+|---|-----------|------------------|-----------|-------|--------------------------|
+| A1 | Byte conservation (flagship) | `cum_input = cum_output_physical + Q + cum_true_loss` ∀ shard, step | exact (`rel < 1e-6`) | 4-term additive balance with a latent buffer term, over cumulative time series | **No** — the physical counters are withheld; `B` and `L` are its per-minute shard-summed projections |
+| A2 | Non-negative backlog | `Q ≥ 0` | exact | one-sided bound | Yes, as `B ≥ 0` |
+| A3 | Monotone true loss | `cum_true_loss` non-decreasing over time | exact | temporal monotonicity | Yes, as `L` non-decreasing per consumer |
+| A4 | Monotone counters between resets | `I`, `O` non-decreasing over time except where `reset_flag` | exact | guarded (conditional) temporal monotonicity | Yes, on `timeseries_raw` |
+| A5 | Non-negative rates | `IR ≥ 0`, `OR ≥ 0` | exact | one-sided bound | Yes |
+| A6 | Healthy band (steady, normal) | for steady consumers on `normal` minutes, median `CR` sits near `healthy_ratio_mean ≈ 0.998`, and `CR < 0.99` on < ~10% of them | soft (statistical) | band membership + frequency bound | Yes |
+| A7 | Benign events lose no bytes | over any `benign_burst`/`artifact` span, `ΔL ≈ 0` | soft | label-guarded near-equality | Yes |
+| A8 | True-loss events accumulate a deficit | over any `true_loss_*` span, `ΔL > 0` | soft | label-guarded positivity | Yes |
+
+#### B. Exact identities among the emitted columns (verified numerically to floating-point precision)
+
+| # | Identity | Formal statement | Shape |
+|---|----------|------------------|-------|
+| B1 | Completeness-ratio definition | `CR = OR / IR` where `IR > 0` (else `NaN`) | ratio (division) identity |
+| B2 | Smoothed ratio = windowed ratio-of-sums | `CR1h = (Σ_{last 60 min} OR) / (Σ_{last 60 min} IR)` | rolling-window sum + division |
+| B3 | Rate = sum over shards of counter increments | `IR = Σ_{valid shards} Δ_minute(ffill(I))`, and likewise `OR` from `O` | cross-grain n-ary SUM of time-differences, with reset/missing guards |
+| B4 | Static-alert definition | `SA = 1` iff `CR1h < 0.99` for ≥ 10 consecutive minutes | sustained-threshold run-length predicate |
+| B5 | Trajectory-alert definition | `TA = (CR1h < 0.98) ∧ (Σ_{last 45 min}(IR − OR) > 0) ∧ (CR1h[m] − CR1h[m−45] ≤ 0)` | conjunction of a bound, a windowed-deficit sign, and a lagged slope |
+| B6 | Oracle and label identities | `oracle_alert = is_true_loss`; `label` is the priority pick over the masks; each mask is the OR of event spans covering the minute | categorical / boolean-from-spans |
+| B7 | Hidden-GT minute aggregation | `B[c,m] = Σ_s Q[s, last step of m]`, `L[c,m] = Σ_s cum_true_loss[s, last step of m]` | n-ary SUM at a boundary |
+
+A further modeled relation is **metering proportionality**: each observed output increment is approximately `eta` times the physical increment, with a per-consumer constant `eta ∈ [0.98, 1.0]` (default `≈ 0.998`).
+It is the gtib analogue of the ~2% origination/termination deficit in `crosscheck-samples`, but here it is an explicit multiplicative constant rather than an additive gap.
+
+**Deliberate anti-invariant.** `CR` is **not** bounded above by 1: after a burst, the queue drains faster than it filled, so the output rate temporarily exceeds the input rate and the ratio overshoots (this run reaches `4.85`).
+A detector that assumes `ratio ≤ 1` is wrong on gtib.
+
+### Comparison to `crosscheck-samples`
+
+The two datasets share a **data-generation philosophy** (a physical system plus a measurement layer, with clean hidden values and noisy observed ones) but differ in almost every structural respect.
+
+| Aspect | crosscheck-samples | gtib-emulation |
+|--------|--------------------|----------------|
+| Layout | wide: row = snapshot, columns = variables | long/tidy: row = (consumer, minute) or (consumer, shard, step) |
+| Cell type | 5-key dict | plain scalar |
+| Where identity lives | in column names (`low_X_egress_to_Y`, `high_S_D`) | in row values (`consumer_id`, `shard_id`, `minute_index`) |
+| Time semantics | rows are independent, exchangeable snapshots | intrinsically a time series (rates, rolling windows, cumulative counters, sustained alerts) |
+| Dominant invariant shapes | per-snapshot algebraic (equality, family sum, conservation, zero, presence, non-negativity) | temporal and dynamic (rates, windowed ratios, monotonicity, run-length predicates, guarded relations) |
+| Scale (default) | 237 / 681 vars × 1000 snapshots | 16 derived + 7 raw columns × 2160 / 36720 rows |
+
+**Shared invariant shapes** (the same forms `crosscheck-samples` exercises):
+
+- **one-sided bounds** — A2, A5 (and raw counters ≥ 0) mirror non-negativity (`crosscheck` I1);
+- **reference = n-ary family sum / additive balance** — B3, B7, and the additive form of A1 mirror origination/termination as demand row/column sums and node flow conservation (`crosscheck` I5–I7).
+
+**New invariant shapes** (beyond the `crosscheck-samples` families), with the reason each is new:
+
+| gtib invariant | Why it is a new shape |
+|----------------|-----------------------|
+| B1 ratio identity `CR = OR/IR` | `crosscheck` has no column defined as the quotient of two others; its ratios are diagnostic statistics, never a per-row division identity |
+| B2 windowed ratio-of-sums | combines a rolling time window with division; `crosscheck` rows are independent, so it has no time-window operator |
+| B3 rate = Σ shard increments | a cross-grain temporal aggregation: cumulative counters differenced to increments, then summed to a coarser grain, with forward-fill and reset guards |
+| A3, A4 monotonicity | ordering over time, in A4's case suspended at `reset_flag`; `crosscheck` has no time axis and no guarded relations |
+| B4 sustained-threshold alert | a run-length predicate over consecutive rows producing a boolean; no `crosscheck` family expresses persistence or duration |
+| B5 trajectory alert | a multi-term conjunction of a bound, a windowed sum of a difference, and a lagged slope |
+| A7, A8 label-guarded accumulation | relations conditioned on a categorical `label` column |
+| metering proportionality (`eta`) | a multiplicative relation with a learned per-consumer constant, not an approximate equality |
+| A1 latent-term balance | a conservation law containing a hidden buffer state, and stated over cumulative series rather than a single snapshot |
+
+In short, gtib is dominated by time and rate relations, ratios, windowed aggregations, sustained and multi-term temporal predicates, guarded relations, and multiplicative proportionality — the shapes the `crosscheck-samples` catalogue does not cover.
+
+### Caveats
+
+- **gtib is synthetic and unvalidated against production.** Anchored facts (intervals, thresholds, catch-up magnitude, multi-tenancy, the target loss patterns) are reproduced faithfully; the distributions, scale, and burst shapes are documented assumptions exposed as knobs. See the emulator's Open Questions.
+- **The flagship invariant A1 is not directly testable on the CSVs.** The physical input/output counters are withheld by design; only their noisy observed counterparts and the summed `B`/`L` projections are emitted.
+- **`gtib-emulation/` mirrors the emulator's default `generator/output/`.** Both are one run at `seed 20260101`; rerun the generator to change scale or seed.
+- **This is a base run.** No detector output beyond the two reference rules is present; the labels and `oracle_alert` are the ground truth to score against.
+
+### Reproducing this section
+
+```python
+import pandas as pd
+raw = pd.read_csv("gtib-emulation/timeseries_raw.csv")
+der = pd.read_csv("gtib-emulation/timeseries_derived.csv")
+ev  = pd.read_csv("gtib-emulation/events.csv")
+print("raw", raw.shape, "| derived", der.shape, "| events", ev.shape)
+print("labels:", der["label"].value_counts().to_dict())
+
+# B1: completeness_ratio == output_rate / input_rate (where input_rate > 0)
+m = der["input_rate_bytes_per_min"] > 0
+err = (der.loc[m, "completeness_ratio"]
+       - der.loc[m, "output_rate_bytes_per_min"] / der.loc[m, "input_rate_bytes_per_min"]).abs().max()
+print("B1 max abs error:", err)
+```
+
+Expected output:
+
+```
+raw (36720, 7) | derived (2160, 16) | events (13, 12)
+labels: {'normal': 1380, 'true_loss': 644, 'benign_burst': 133, 'artifact': 3}
+B1 max abs error: 4.4e-16
+```
+
+To re-run the emulator's own hard/soft invariant checks: `cd ../generator && uv run python -m gtib_emulator validate --config config.yaml`.
+
