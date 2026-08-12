@@ -1,7 +1,7 @@
 # GTIB implementation — status and handoff
 
-**Last updated:** end of review round 28.
-**Branch:** `main`, working tree only. Nothing is committed; `HEAD` is still the base commit `d575db0`.
+**Last updated:** end of review round 36.
+**Branch:** `dev`, pushed to `origin/dev`. The base of this work is commit `3221b4b`; everything since is committed, so `git --no-pager diff 3221b4b..HEAD` shows the whole change and `git --no-pager log 3221b4b..HEAD` explains each step.
 
 This document exists so that another engineer can pick this work up cold. It covers what was built, how it was verified, how the implementation–review loop works, and exactly what is left to do.
 
@@ -39,12 +39,14 @@ This work is being driven by an iterative adversarial review process. It matters
 5. If `NOT DONE`, remediate and go to step 1.
 6. **Stop condition: two consecutive `DONE` verdicts.**
 
-**Current streak: 0 of 2.** Round 28 returned `NOT DONE`.
+**Current streak: 0 of 2.** Rounds 28 through 36 all returned `NOT DONE`. Rounds 29-36 found seven, seven, five, two, three, six, four and five Important defects respectively -- every one of them in the *previous* round's remediation. Expect the next round to find something too.
 
 **Rules that make the loop work, learned the hard way:**
 
 - **Always spawn a fresh reviewer.** Reusing a reviewer lets it anchor on its own earlier conclusions.
-- **Tell the reviewer how to see the diff.** All work is uncommitted and `HEAD == base`, so `git diff BASE..HEAD` shows nothing. The reviewer must use `git --no-pager diff d575db0`, and must be given the explicit list of untracked files (below), because those appear in no diff at all.
+- **Tell the reviewer how to see the diff.** `git --no-pager diff 3221b4b..HEAD`, plus `git --no-pager log 3221b4b..HEAD` for the reasoning behind each commit.
+- **Tell the reviewer what is already running.** Give it the list of long jobs in flight, or it will start a three-hour suite of its own.
+- **Tell the reviewer to clear `__pycache__`** before targeted runs. A stale `.pyc` masked a real fix during round 33 and cost an hour of misdiagnosis.
 - **Give the reviewer the environment caveats** (venv paths, which jobs are already running, and which are too slow to re-run), or it will report environmental failures as defects, or start a three-hour job you are already running.
 - **Give the reviewer the "settled decisions" list** so it does not re-litigate resolved questions, but explicitly invite it to overturn them with new concrete evidence.
 - **Push back when a finding is wrong.** Not every finding has been accepted; one was rejected with measurements (see §6).
@@ -66,71 +68,57 @@ This happened. It left `covered = np.ones(...)` in `autogram/loader/gtib.py` ins
 
 ## 3. Where the code lives
 
-### 3.1 Untracked files (invisible to `git diff` — read them directly)
-
-```
-.gitattributes
-autogram/loader/gtib.py
-configs/gtib.yaml
-configs/gtib_known.yaml
-configs/gtib_raw.yaml
-configs/gtib_raw_known.yaml
-docs/autogram_guarantees.md
-scripts/                       (whole directory)
-tests/test_boolean_logic.py
-tests/test_conditions.py
-tests/test_crosscheck_golden.py
-tests/test_distribution_band.py
-tests/test_gtib_end_to_end.py
-tests/test_gtib_ingest.py
-tests/test_gtib_proxies.py
-tests/test_ratio_proportional.py
-tests/test_relational.py
-tests/test_temporal.py
-```
-
-### 3.2 Modified tracked files
-
-60 files, roughly +56k / −44k lines. See `git --no-pager diff --stat d575db0`. The files you will touch most:
+Everything is committed, so `git --no-pager diff --stat 3221b4b..HEAD` is the authoritative map. The
+files you will touch most:
 
 | File | Role |
 | --- | --- |
-| `autogram/discovery/evaluate.py` | The evaluator. Acceptance predicate, definitions, conjunctions, `SUSTAINED`, threshold fitting, condition-support floors. |
-| `autogram/dsl/evaluate.py` | Grounding. `Grounded`, `ground()`, cross-grain related aggregates, `_partition_values`. |
-| `autogram/calibrate.py` | Calibration driver, `_split_known`, capability tiers, null-control gating. |
-| `autogram/discovery/known.py` | Known-invariant signatures, canonicalisation, `recover_known`. |
-| `autogram/discovery/archive.py` | Pareto archive, redundancy suppression, lag-shadow suppression. |
-| `autogram/discovery/propose.py` | Enumeration, conditioning, conjunction tiers. |
-| `autogram/loader/gtib.py` | GTIB ingestion, profiling, shard materialisation. |
+| `autogram/dsl/evaluate.py` | Grounding. `Grounded`, `ground()`, overflow tracking (`eval_term_overflow`, `_blowup`, `_union_overflow`, `_shift_overflow`, `_window_overflow`), `robust_median`, cross-grain aggregation, `typed_group_key`. |
+| `autogram/discovery/evaluate.py` | The evaluator. Acceptance predicate, definitions, conjunctions, `SUSTAINED`, threshold fitting, condition-support floors, the finite-arithmetic guards, `_typed_label` / `_display_keys`. |
+| `autogram/discovery/known.py` | Known-invariant signatures, canonicalisation (`_drop_negligible`, `_stable_row_sum`, `_candidate_is_exact`), `recover_known`. |
+| `autogram/calibrate.py` | Calibration driver, `_ColumnScaleView`, `_split_known`, capability tiers, null-control gating. |
+| `autogram/discovery/propose.py` | Enumeration, conditioning, conjunction tiers, the conditioned pre-count. |
+| `autogram/discovery/validate.py` | Proxy suites and null controls, including the null magnitude envelope. |
+| `autogram/loader/gtib.py` | GTIB ingestion, profiling, shard materialisation, `_is_regime_column`. |
 | `docs/autogram_guarantees.md` | The published guarantees. Must stay true to the code. |
+| `tests/test_overflow.py` | The finite-arithmetic regression suite added by this work. |
 
 ---
 
 ## 4. Verification status
 
-### 4.1 Last clean measurement (end of round 26 work, before the round-27 changes)
+**Read this before trusting any number below.** The engine fingerprint recorded in a report is
+computed from the source files *when the report is written*, not from the modules the run loaded, so
+a report can match the fingerprint yet have been produced by different code. Freeze the tree before
+launching a verification run, and do not edit `autogram/**` while one is in flight. (Editing `docs/`
+or `tests/` is safe -- the fingerprint only covers `autogram/`.)
 
-- Full test suite: **415 passed, 0 failed**.
-- `artifacts/gtib_report.json`: 21/21 known invariants recovered, `recall_all` 1.0, `recall_validation` 1.0, false discovery `{equalities: 0, temporal: 0, definitions: 0}`.
-- `artifacts/gtib_raw_report.json`: 2/2 recovered, same recall and false-discovery figures.
-- Both reports' `provenance.engine_source_sha256` matched the live `autogram.calibrate._engine_source_fingerprint()`.
+### 4.1 Last full green measurement
 
-### 4.2 Current state — confirmed
+Commit `55c4676` (round 30's predecessor) produced both reports cleanly:
 
-The round-27 fixes are in the tree and the full verification completed cleanly:
-
-- Full test suite: **419 passed, 0 failed** (2:52:25).
-- `artifacts/gtib_report.json`: **21/21** recovered, `recall_all` 1.0, `recall_validation` 1.0, false discovery `{equalities: 0, temporal: 0, definitions: 0}`, no missed knowns.
+- `artifacts/gtib_report.json`: **21/21** recovered, `recall_all` 1.0, `recall_validation` 1.0,
+  false discovery `{equalities: 0, temporal: 0, definitions: 0}`, no missed knowns.
 - `artifacts/gtib_raw_report.json`: **2/2** recovered, same figures.
-- Both reports' `provenance.engine_source_sha256` is `204888b9695ff02a0a9e1391c6e5d04611a791d069d2c3c87bb368b53a3f93af`, matching the live `autogram.calibrate._engine_source_fingerprint()`. The reports are current, not stale.
+- Both fingerprints matched the live engine.
 
-Treat the earlier `417 passed / 2 failed` run as superseded — both failures were the restore-bug corruption described in §2.1, not design defects. The corrupted line was restored and the fix independently red-green verified with a byte-identical-restore assertion.
+### 4.2 Since then
 
-**The four items in §7 are open against this otherwise-green tree.** A green suite does not mean the work is done: every one of the round-28 findings describes a defect that the current tests do not catch, which is precisely why the review loop continues.
+The raw report has been regenerated and has passed on every subsequent commit. The **derived**
+report and the **full suite** have not completed on a commit that was still `HEAD` when they
+finished -- each round's remediation landed first. Closing that gap is the single most valuable
+next step: freeze the tree, run §5.2 and §5.3, and record the result here.
+
+Targeted coverage is strong in the meantime: **291 tests** pass on `f936fb3` across
+`test_overflow.py`, `test_known_canon.py`, `test_gtib_ingest.py`, `test_boolean_logic.py`,
+`test_distribution_band.py`, `test_ratio_proportional.py`, `test_evaluate.py`, `test_relational.py`,
+`test_calibrate.py`, `test_temporal.py`, `test_aggregations.py`, `test_band.py`,
+`test_conditions.py`, `test_archive_propose.py`, and `test_crosscheck_golden.py` -- the last being
+the byte-for-byte CrossCheck non-regression the plan requires at line 675.
 
 ### 4.3 Hygiene
 
-`git --no-pager diff --check d575db0` exits 0.
+`git --no-pager diff --check 3221b4b` exits 0.
 
 ---
 
@@ -215,120 +203,42 @@ Each was investigated in depth and is load-bearing. If you think one is wrong, b
 
 ---
 
-## 7. Remaining TODO items
+## 7. Remaining work
 
-These are the four Important findings from **review round 28**. None has been fixed. They are ordered by my judgement of severity. Each was reproduced by the reviewer; I confirmed each against the code but did **not** independently re-derive the reviewer's numbers, so treat those figures as reported-not-verified and reproduce them first.
+The four round-28 findings that this document used to list are **all fixed**, together with the
+thirty-nine further Important defects rounds 29-36 found in that remediation. Read
+`git --no-pager log 3221b4b..HEAD` for the full account; each commit message states the defect, why
+it mattered, and what the fix is.
 
----
+What is left:
 
-### TODO-1 — Arithmetic overflow is silently treated as missing data (soundness)
+1. **Close the verification gap (§4.2).** Freeze the tree, run the full suite and both calibration
+   reports to completion on one commit, confirm the acceptance criteria in §5.4, and record the
+   result in §4. This is the highest-value next step: the targeted suite is green and the raw report
+   passes, but no *derived* report or full-suite run has finished on a commit that was still `HEAD`
+   when it completed.
+2. **Continue the review loop to two consecutive `DONE` verdicts** (§2). The next round is round 37.
+3. **Do not assume convergence.** The findings have become more exotic as the obvious ones were
+   fixed -- the last few rounds turned up pre-epoch timestamp wrap-around, `True` colliding with `1`
+   inside composite group keys, and pandas `groupby` merging those two before the engine ever saw
+   them -- but they have not stopped, and each was a genuine soundness or honesty defect.
 
-**Severity:** Important. This is the most serious of the four, because it can let a **false discovery** through, which is the one thing the engine is not allowed to do.
+### What the review loop has hardened, thematically
 
-**Sites:** `autogram/dsl/evaluate.py` lines ~121–127 (the `A.Div` branch) and ~395–402 (the finite mask in `ground()`).
+Useful orientation for whoever picks this up, because it is where the next defect is most likely to
+be found too:
 
-**What is wrong.** `A.Div` guards division by exact zero (`np.where(den == 0.0, np.nan, num / den)`), but a division by a *finite but tiny* denominator overflows to `±inf`. `ground()` then applies
-
-```python
-mask = np.isfinite(rho) & np.isfinite(scale)
-```
-
-which drops every overflowed row from the population. Those rows vanish silently: they are not counted as violations, and the reported `support` is derived from `n_bindings / n_candidates × condition_support`, not from the number of rows that survived the finite mask.
-
-**Why it matters.** The reviewer reports a false ratio law accepted on 20 of 100 rows while the other 80 overflowed and were discarded, with a reported support of `1.0`. That is a false discovery presented with full confidence. It also makes the Wilson bound meaningless, because `n` no longer reflects the population the rule claims to describe.
-
-**Suggested fix.**
-- Distinguish "the term is undefined here" (genuinely missing → drop) from "the arithmetic overflowed" (the rule's own expression blew up → this is a **violation**, or a reason to reject the rule outright). Overflow is a property of the candidate, not of the data.
-- Consider rejecting a candidate whose evaluation overflows on more than a negligible fraction of rows, with a fail-loud reason string, rather than quietly shrinking its population.
-- Whatever the policy, make the *reported* support reflect the rows actually graded. Compare with `Grounded.graded_points` / `graded_condition_support`, which were added for the conditioned case and already measure the graded population before subsampling — the same idea needs to apply here.
-
-**Tests to add.**
-- A ratio with a denominator that underflows towards zero on most rows: assert the rule is not accepted, and that the reported support reflects the graded rows.
-- Extreme-value tests around `float64` limits for `Mul`, `Div` and `Add` chains.
-- Red-green each one.
-
----
-
-### TODO-2 — "Negligible" sum members are decided by the median, so a bimodal term can be discarded (soundness)
-
-**Severity:** Important. Also a false-discovery path, this time in the recall figure rather than in acceptance.
-
-**Sites:** `autogram/discovery/known.py` lines ~472–502 (`_col_scale`, `_drop_negligible`) and ~605–650 (the `recover_known` matching path).
-
-**What is wrong.** `_col_scale` returns the **median absolute value** of a column. `_drop_negligible` removes a summed member whose scale is negligible against the anchor. A column that is `0` on 51% of rows and `1000` on the other 49% has a median of `0`, so it is judged negligible and dropped from the signature.
-
-**Why it matters.** The reviewer reports recall `1.0` for a law that is violated on 49% of rows. The known-invariant recall figure is the headline claim of this whole exercise; a canonicalisation that discards a materially non-zero term makes it dishonest. Note the docstring already claims the transform "strictly widens matching: anything that matched exactly still matches after canonicalizing" — that claim is only true if the dropped member really is negligible everywhere.
-
-**Suggested fix.**
-- Replace the median test with a **pointwise** one: a member may be dropped only if it is negligible on (essentially) every gradeable row — for example `max(|value|)` over gradeable rows, or a high quantile, measured against the anchor's scale.
-- Keep the existing "never canonicalise an entire group away" guard.
-- Re-check `_canonicalize`'s idempotence and the widening claim in the docstring after the change, and update the docstring if the property changes.
-
-**Tests to add.**
-- The bimodal counterexample: a member zero on ~half the rows and large on the rest must **not** be dropped, and the law must not be credited as recovered.
-- A genuinely all-zero member must still be dropped (this is what makes `total == SUM(a)` and `total == SUM(a, z)` one relation — see TODO-3 and §7's note on `_split_known`).
-- Red-green both.
-
----
-
-### TODO-3 — `_ColumnScaleView` decodes cells differently from the runtime frame (held-out integrity)
-
-**Severity:** Important.
-
-**Sites:** `autogram/calibrate.py` lines ~280–298 (`_ColumnScaleView`) and ~724–729 (the `_split_known` call site).
-
-**What is wrong.** `_ColumnScaleView` was introduced in round 27 so that `_split_known` could canonicalise signatures exactly as `recover_known` does. It reads columns with `pd.to_numeric(...)`. The runtime `Frame` does not: for CrossCheck-style data it decodes dict-valued cells. So the two disagree about a column's scale, and therefore about which sum members are negligible.
-
-**Why it matters.** The whole point of the round-27 change was that the calibration and validation halves must not contain two spellings of one relation. If the view decodes differently from the runtime frame, aliases can still straddle the split — the reviewer reproduced this at seed 0. When that happens, tuning on the calibration half is tuning on a "held-out" invariant, and the calibration/validation gap stops being an overfitting alarm.
-
-**Suggested fix.**
-- Canonicalise using the **compiled runtime frame** rather than a bespoke view. The obstacle is ordering: `_split_known` currently runs before `build_dataframe_grammar`. Options, roughly in order of preference:
-  1. Build the frame (or just the column-decoding part of it) earlier, and pass the real thing in.
-  2. Reuse the exact decoding helper the `Frame` uses inside `_ColumnScaleView`, so the two cannot drift.
-  3. If neither is practical, make `_ColumnScaleView` fail loudly on a cell shape it cannot decode, rather than silently coercing it to `NaN`.
-- Whichever you pick, add an assertion or a test that the view and the runtime frame agree on column scales for a CrossCheck fixture.
-
-**Tests to add.**
-- A CrossCheck-style dict-cell fixture where the naive `pd.to_numeric` view and the runtime frame disagree; assert the split keeps the aliases together.
-- Red-green it.
-
----
-
-### TODO-4 — The identifier guard for condition inference is too weak (robustness / blow-up)
-
-**Severity:** Important.
-
-**Site:** `autogram/loader/gtib.py` lines ~169–179 (inside `infer_tabular_profile`).
-
-**What is wrong.** Round 27 added two guards: reject a domain above `_MAX_CONDITION_DOMAIN` (64), and reject a near-unique column (`distinct > len(frame) // 2`). A column with 50 distinct values over 100 rows passes both: 50 ≤ 64, and 50 is not `> 50`. It is still an identifier repeated twice, not a regime label.
-
-**Why it matters.** The reviewer reports 251,175 conditions generated before rule expansion. That is a combinatorial blow-up in the conditioned search space, which at best wastes hours and at worst trips the fail-loud ceiling and makes an ordinary CSV unusable — the same class of failure the round-27 fix was meant to eliminate.
-
-**Suggested fix.**
-- Require **meaningful per-value support**: each condition value should cover at least some minimum number or fraction of rows (a handful of rows per value is not a regime). This subsumes both existing guards and is the property actually wanted.
-- Additionally, **pre-count the complete conditioned search space** before enumeration and fail loudly with a clear message if it exceeds the ceiling, rather than discovering it deep inside expansion.
-- Keep the existing `_MAX_CONDITION_DOMAIN` mirror of `schema/compiler._MAX_CONDITION_DOMAIN`, so inference can never propose something the compiler will reject.
-
-**Tests to add.**
-- 50 distinct values over 100 rows must not be inferred as a condition.
-- A genuine low-cardinality regime label (e.g. two or three values over many rows) must still be inferred.
-- A pre-count test asserting the fail-loud path triggers before expansion.
-- Extend `tests/test_gtib_ingest.py::test_high_cardinality_identifier_is_not_inferred_as_a_condition`, which already covers the near-unique and above-ceiling cases.
-- Red-green each.
-
----
-
-### TODO-5 — Re-verify and close the loop
-
-After fixing TODO-1 … TODO-4:
-
-1. Run the **full suite** (§5.2) and confirm 0 failures. Do not rely on targeted runs (§2.1).
-2. **Regenerate both calibration reports** (§5.3) — any source change invalidates the fingerprint — and confirm the acceptance criteria in §5.4: 21/21 and 2/2 recovered, `recall_all` and `recall_validation` both 1.0, all three false-discovery counters 0, fingerprints matching the live engine.
-3. Confirm `git --no-pager diff --check d575db0` exits 0 and delete scratch `*.out` / `*.err` / `*.pid` files.
-4. Spawn **review round 29** (§2), fresh context, with the round-28 findings listed as "fixed, please audit specifically".
-5. Continue until **two consecutive `DONE` verdicts**.
-
-**Do not commit** unless explicitly asked. All work to date is deliberately uncommitted on `main`.
+- **Finite arithmetic became an acceptance conjunct (S2).** Overflow used to be treated as missing
+  data; it is now tracked through term evaluation, cross-grain aggregation, post-fit proportional
+  arithmetic, the band centre subtraction, and definitions, and a tolerated overflow is still
+  excluded from the scored population and the reported support.
+- **Known-invariant canonicalisation** became pointwise, collective, domain-preserving,
+  deterministically summed, and exactness-aware -- each property added because its absence credited
+  a law the data does not satisfy.
+- **Group identity** is recursively type-qualified everywhere a label is a key, is compared, or is
+  used to bucket. `True == 1` and they hash alike; every place that forgot it merged two groups, and
+  a merged group cannot fail the per-group gate.
+- **Reported support** counts only the rows a rule was actually graded on, everywhere.
 
 ---
 
@@ -346,6 +256,14 @@ Rounds 1–10 are covered in earlier session checkpoints (the full GTIB feature 
 | 25 | The phase ladder's null-coverage argument rested on nesting that did not hold. |
 | 26 | The round-25 ladder fix set `grammar.proportional_enabled`, **a field `Grammar` does not have** — an inert attribute that looked like a fix and did nothing. Phase 0 still carried 30 proportional and 1,969 cross-grain candidates. |
 | 27 | Materialised and streaming cross-grain paths still disagreed on non-adjacent minutes and all-invalid minutes. |
-| 28 | The four items in §7. |
+| 28 | Four findings: overflow silently treated as missing data; median-decided negligibility; the split's view decoding differently from the runtime frame; a condition-inference guard too weak to reject an identifier. |
+| 29 | Seven. The most consequential: the post-fit arithmetic of a proportional law had no finite-arithmetic guard at all, and 600 individually-negligible summed members contributed 6% of a total between them. |
+| 30 | Seven. A blown-up counter difference was absorbed by a cross-grain validity mask and contributed zero to a total that still looked complete; the post-fit guard read the coreset rather than the population. |
+| 31 | Five. Per-group coefficients keyed by `str(label)` collided; a SUSTAINED window's taint was counted as one row rather than the whole window. |
+| 32 | Two. A *tolerated* overflow was still scored as evidence, and reporting re-introduced the group-key collision that fitting had just removed. |
+| 33 | Three. Exact relations were canonicalised with a tolerance they do not have, crediting a law false on every row. |
+| 34 | Six. Reductions can return **NaN** from finite members (pairwise summation cancels ±inf), which a guard looking only for infinities lets through as missing data; `True` and `1` merged in every dict keyed by group label. |
+| 35 | Four. The exactness override was inert; int64 timestamp arithmetic wrapped near `Timestamp.max`; typed identity was shallow and missed subsampling and temporal grouping. |
+| 36 | Five. Grouped holdout splits and the related-grain join still merged `True` with `1` -- pandas `groupby` does it before the engine sees the key -- and saturation itself overflowed for pre-epoch timestamps. |
 
-The pattern worth internalising: **most rounds found a defect in the previous round's fix.** Verify fixes empirically against the data rather than reasoning about them, and red-green every regression test.
+The pattern worth internalising: **most rounds found a defect in the previous round's fix.** Verify fixes empirically against the data rather than reasoning about them, and red-green every regression test — thirteen tests in this series were caught passing whether or not their own fix was present, and were strengthened or removed.
