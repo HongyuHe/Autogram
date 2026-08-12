@@ -45,7 +45,7 @@ This work is being driven by an iterative adversarial review process. It matters
 
 - **Always spawn a fresh reviewer.** Reusing a reviewer lets it anchor on its own earlier conclusions.
 - **Tell the reviewer how to see the diff.** All work is uncommitted and `HEAD == base`, so `git diff BASE..HEAD` shows nothing. The reviewer must use `git --no-pager diff d575db0`, and must be given the explicit list of untracked files (below), because those appear in no diff at all.
-- **Give the reviewer the environment caveats** (venv paths, the 4-core cap, the 900 s subagent timeout), or it will report environmental failures as defects.
+- **Give the reviewer the environment caveats** (venv paths, which jobs are already running, and which are too slow to re-run), or it will report environmental failures as defects, or start a three-hour job you are already running.
 - **Give the reviewer the "settled decisions" list** so it does not re-litigate resolved questions, but explicitly invite it to overturn them with new concrete evidence.
 - **Push back when a finding is wrong.** Not every finding has been accepted; one was rejected with measurements (see §6).
 - **Red-green verify every regression test.** Write the test, confirm it passes, then revert the fix and confirm the test *fails*. A test that passes both ways guards nothing.
@@ -138,41 +138,40 @@ Treat the earlier `417 passed / 2 failed` run as superseded — both failures we
 
 ### 5.1 Environment
 
-- Use the venv: `.venv\Scripts\python.exe` and `.venv\Scripts\autogram.exe`. **There is no `python -m autogram` entry point.** The system Python lacks pandas.
-- **Cap all jobs at 4 CPU cores.** The machine is shared. Set `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, and pin affinity:
-
-```powershell
-$env:OMP_NUM_THREADS='4'; $env:OPENBLAS_NUM_THREADS='4'
-$env:MKL_NUM_THREADS='4'; $env:NUMEXPR_NUM_THREADS='4'
-$p = Start-Process -FilePath .venv\Scripts\python.exe `
-     -ArgumentList @('-m','pytest','-q','-p','no:cacheprovider','tests') `
-     -NoNewWindow -PassThru -RedirectStandardOutput fs.out -RedirectStandardError fs.err
-$p.ProcessorAffinity = 15     # cores 0-3; children inherit this
-$p.Id | Out-File fs.pid -Encoding ascii
-```
-
-- **Always** set `AUTOGRAM_SUBAGENT_TIMEOUT=900` and `AUTOGRAM_SUBAGENT_CACHE=1` for anything that triggers subagent schema induction. The default 300 s timeout causes spurious failures.
-- `Start-Process` returns a launcher PID; the real worker is a grandchild. Use `Get-CimInstance Win32_Process -Filter "ParentProcessId=$pid"` to find it. A launcher exiting does **not** mean the job finished.
-- stdout is buffered until the process ends, so an output file of size 0 is normal for a long run.
-- PowerShell here does not support `&&`, `||`, `?.`. Use `;` and `if ($?) { }`.
+- Use the venv: `.venv/bin/python` and `.venv/bin/autogram`. **There is no `python -m autogram` entry point.** The system Python lacks pandas. Provision with `UV_SKIP_WHEEL_FILENAME_CHECK=1 uv sync` (the lock file carries one wheel whose filename version disagrees with its metadata).
+- **Use the whole machine.** There is no core cap and no thread cap; do not set `OMP_NUM_THREADS` or its siblings, and do not pin affinity. Run the full suite and both calibration reports concurrently -- they are independent, and the wall clock is dominated by a single long test either way.
+- Set `AUTOGRAM_SUBAGENT_CACHE=1` for anything that triggers subagent schema induction, so an identical prompt is answered once per process. The subagent timeout needs no override.
+- Give each concurrent job a **distinct** `AUTOGRAM_SUBAGENT_LOG`, or their JSONL appends interleave.
+- stdout is buffered until the process ends, so an output file of size 0 is normal for a long run. Redirect to a file and poll it rather than waiting on the terminal.
 
 ### 5.2 Full test suite
 
-~2.5–3 hours. `tests/test_gtib_end_to_end.py::test_gtib_phase_ladder_climbs_held_out_recall_with_zero_null_acceptances` alone is ~1.5 hours by design.
+~2.5–3 hours. `tests/test_gtib_end_to_end.py::test_gtib_phase_ladder_climbs_held_out_recall_with_zero_null_acceptances` alone is ~1.5 hours by design, and the suite is serial, so that test sets the floor.
+
+```bash
+export AUTOGRAM_SUBAGENT_HARNESS=copilot AUTOGRAM_SUBAGENT_CACHE=1
+export AUTOGRAM_SUBAGENT_LOG=artifacts/subagent_tests.jsonl
+nohup .venv/bin/python -m pytest -q -p no:cacheprovider tests --durations=25 \
+      -W ignore::RuntimeWarning > artifacts/full_suite.out 2>&1 &
+```
 
 ### 5.3 Calibration reports
 
-~1.5–2.5 hours each. They can run concurrently with the suite on the same 4-core mask.
+The derived report is ~100 minutes; the raw one is ~10. Launch both alongside the suite -- they are independent.
 
-```powershell
-$env:AUTOGRAM_SUBAGENT_HARNESS='copilot'; $env:AUTOGRAM_SUBAGENT_CACHE='1'
-$env:AUTOGRAM_SUBAGENT_TIMEOUT='900'
-$env:AUTOGRAM_SUBAGENT_LOG='artifacts\subagent_gtib.jsonl'
-.venv\Scripts\autogram.exe calibrate --config configs\gtib.yaml     --out artifacts\gtib_report.json
-.venv\Scripts\autogram.exe calibrate --config configs\gtib_raw.yaml --out artifacts\gtib_raw_report.json
+```bash
+export AUTOGRAM_SUBAGENT_HARNESS=copilot AUTOGRAM_SUBAGENT_CACHE=1
+
+AUTOGRAM_SUBAGENT_LOG=artifacts/subagent_gtib.jsonl \
+  nohup .venv/bin/autogram calibrate --config configs/gtib.yaml \
+        --out artifacts/gtib_report.json > artifacts/gtib_calib.out 2>&1 &
+
+AUTOGRAM_SUBAGENT_LOG=artifacts/subagent_gtib_raw.jsonl \
+  nohup .venv/bin/autogram calibrate --config configs/gtib_raw.yaml \
+        --out artifacts/gtib_raw_report.json > artifacts/gtib_raw_calib.out 2>&1 &
 ```
 
-Give each concurrent job a **distinct** `AUTOGRAM_SUBAGENT_LOG`, or their JSONL appends interleave.
+`artifacts/gtib_report.json` is ~10 MB. Query it with Python; do not print it.
 
 ### 5.4 Acceptance check
 
@@ -181,12 +180,19 @@ Any source change alters the engine fingerprint, so the reports must be regenera
 ```python
 import json, autogram.calibrate as C
 live = C._engine_source_fingerprint()
-for path in (r"artifacts\gtib_report.json", r"artifacts\gtib_raw_report.json"):
+for path, expected in (("artifacts/gtib_report.json", 21), ("artifacts/gtib_raw_report.json", 2)):
     r = json.load(open(path, encoding="utf-8"))
+    recovered = sum(1 for item in r["invariants"] if item["recovered"])
+    assert recovered == len(r["invariants"]) == expected
     assert r["recall_all"] == 1.0 and r["recall_validation"] == 1.0
     assert all(v == 0 for v in r["false_discovery"].values())
     assert r["provenance"]["engine_source_sha256"] == live      # else the report is STALE
 ```
+
+The fingerprint is computed from the source files **when the report is written**, not from the
+modules the run loaded. Editing source while a calibration is in flight therefore produces a report
+that *matches* the fingerprint yet was produced by different code. Freeze the tree before launching
+a verification run.
 
 ---
 
