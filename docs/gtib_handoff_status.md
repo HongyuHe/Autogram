@@ -93,28 +93,34 @@ a report can match the fingerprint yet have been produced by different code. Fre
 launching a verification run, and do not edit `autogram/**` while one is in flight. (Editing `docs/`
 or `tests/` is safe -- the fingerprint only covers `autogram/`.)
 
-### 4.1 Last full green measurement
+### 4.1 Current state — fully verified on commit `18623a4`
 
-Commit `55c4676` (round 30's predecessor) produced both reports cleanly:
+The tree was frozen at `18623a4` and all three verifications were run to completion against it:
 
+- **Full test suite: 497 passed, 0 failed** (4:51:08).
 - `artifacts/gtib_report.json`: **21/21** recovered, `recall_all` 1.0, `recall_validation` 1.0,
   false discovery `{equalities: 0, temporal: 0, definitions: 0}`, no missed knowns.
 - `artifacts/gtib_raw_report.json`: **2/2** recovered, same figures.
-- Both fingerprints matched the live engine.
+- Both reports' `provenance.engine_source_sha256` matches the live
+  `autogram.calibrate._engine_source_fingerprint()`, so neither is stale.
 
-### 4.2 Since then
+This is the first commit in the round-29..37 series on which the derived report and the full suite
+both finished while it was still `HEAD`; earlier rounds' remediation always landed first.
 
-The raw report has been regenerated and has passed on every subsequent commit. The **derived**
-report and the **full suite** have not completed on a commit that was still `HEAD` when they
-finished -- each round's remediation landed first. Closing that gap is the single most valuable
-next step: freeze the tree, run §5.2 and §5.3, and record the result here.
+### 4.2 Runtime, for planning
 
-Targeted coverage is strong in the meantime: **291 tests** pass on `f936fb3` across
-`test_overflow.py`, `test_known_canon.py`, `test_gtib_ingest.py`, `test_boolean_logic.py`,
-`test_distribution_band.py`, `test_ratio_proportional.py`, `test_evaluate.py`, `test_relational.py`,
-`test_calibrate.py`, `test_temporal.py`, `test_aggregations.py`, `test_band.py`,
-`test_conditions.py`, `test_archive_propose.py`, and `test_crosscheck_golden.py` -- the last being
-the byte-for-byte CrossCheck non-regression the plan requires at line 675.
+The suite is serial and two tests dominate it:
+
+| Test | Time |
+| --- | --- |
+| `test_gtib_end_to_end.py::test_gtib_phase_ladder_climbs_held_out_recall_with_zero_null_acceptances` | 2:20:36 |
+| `test_gtib_end_to_end.py::test_checked_in_gtib_known_catalog_reaches_full_recall` | 38:40 |
+| `test_validate.py::test_run_all_reports_proxy_phase` | 23:46 |
+| `test_cli.py::test_cli_default_search_bound_matches_proxy_runtime_bound` | 22:18 |
+
+The derived calibration is ~100 minutes and the raw one ~10; both run happily alongside the suite.
+Budget about five hours of wall clock for a complete verification, and start it only once the tree
+is frozen.
 
 ### 4.3 Hygiene
 
@@ -242,12 +248,9 @@ identity-preserving (state non-shrinking growth, or report zero-delta tiers).
 
 What is left:
 
-1. **Close the verification gap (§4.2).** Freeze the tree, run the full suite and both calibration
-   reports to completion on one commit, confirm the acceptance criteria in §5.4, and record the
-   result in §4. This is the highest-value next step: the targeted suite is green and the raw report
-   passes, but no *derived* report or full-suite run has finished on a commit that was still `HEAD`
-   when it completed.
-2. **Continue the review loop to two consecutive `DONE` verdicts** (§2). The next round is round 37.
+1. **Fix TODO-A and TODO-B above**, then re-verify (§4 is green as of `18623a4`, so any change
+   invalidates it and both reports plus the suite must be re-run).
+2. **Continue the review loop to two consecutive `DONE` verdicts** (§2). The next round is round 38.
 3. **Do not assume convergence.** The findings have become more exotic as the obvious ones were
    fixed -- the last few rounds turned up pre-epoch timestamp wrap-around, `True` colliding with `1`
    inside composite group keys, and pandas `groupby` merging those two before the engine ever saw
