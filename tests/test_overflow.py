@@ -10,6 +10,8 @@ longer counts the rows the rule claims to describe.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
 
@@ -629,13 +631,31 @@ def test_tolerated_post_fit_overflow_still_shrinks_reported_support():
         tolerance=0.05, hold_rate_threshold=0.62, band_mode="global", seed=0,
         max_overflow_fraction=0.01,
     )
+    rule = A.Rule("record", A.Compare(A.Ref("y"), "~\u221d", A.Ref("x")))
 
-    result = DataOnlyEvaluator(dataset, cfg).evaluate(
-        A.Rule("record", A.Compare(A.Ref("y"), "~\u221d", A.Ref("x"))),
-    )
+    baseline = DataOnlyEvaluator(dataset, cfg).evaluate(rule)
 
-    assert result.support < 1.0
-    assert abs(result.support - 0.999) < 1e-9
+    assert baseline.support < 1.0
+    assert abs(baseline.support - 0.999) < 1e-9
+
+    # The row must also leave the SCORED population, not merely the support figure. Find a seed
+    # whose evaluation split contains the overflowing row, so the narrowing is what removes it.
+    from autogram.discovery.evaluate import _fit_proportional
+    from autogram.dsl.evaluate import ground
+
+    for seed in range(12):
+        seeded = replace(cfg, seed=seed)
+        g = ground(rule, dataset.observed, dataset.name_model, seed=seed)
+        fitted = _fit_proportional(g, dataset.observed, dataset.name_model, seeded)
+        assert fitted is not None
+        evaluation_mask = fitted[2]
+        if not bool(evaluation_mask[500]):
+            continue
+        scored = DataOnlyEvaluator(dataset, seeded).evaluate(rule)
+        assert scored.n_points == int(np.count_nonzero(evaluation_mask)) - 1
+        break
+    else:                                                   # pragma: no cover - fixture guard
+        raise AssertionError("no seed placed the overflowing row in the evaluation split")
 
 
 def test_reported_group_keys_survive_labels_that_stringify_alike():
@@ -662,3 +682,70 @@ def test_reported_group_keys_survive_labels_that_stringify_alike():
     assert len(reported) == 2, reported
     assert sorted(round(value, 6) for value in reported.values()) == [3.0, 10.0]
     assert len(result.parameters["group_hold_rates"]) == 2
+
+
+def _tainted_definition_dataset(name: str, n: int = 100, window: int = 10, blown: int = 2):
+    value = np.linspace(0.0, 10.0, n)
+    num = np.full(n, 2.0)
+    den = np.full(n, 1.0)
+    for index in range(blown):
+        num[20 + index] = 1e300
+        den[20 + index] = 1e-320
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=n, freq="1min"),
+        "consumer_id": ["c0"] * n,
+        "target": value > 5.0,
+        "num": num,
+        "den": den,
+    })
+    frame = profile_dataframe(
+        df, time_index="timestamp", group_keys=("consumer_id",),
+        temporal_windows=(window,), advanced=True,
+    )
+    dataset, _grammar = build_dataframe_grammar(frame, _base_spec(), name=name)
+    return dataset, window
+
+
+def test_tolerated_definition_overflow_is_not_scored_as_evidence():
+    """Round-33 review: a tolerated overflow must still leave the definition's population.
+
+    A SUSTAINED predicate turns a tainted window into a confident ``False``, which then scores as a
+    correct prediction -- so leaving the rows in inflates both the agreement and the support of a
+    definition the data cannot actually witness there.
+    """
+    dataset, window = _tainted_definition_dataset("tainted_definition")
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("target"),
+            A.Sustained(A.Bound(A.Div(A.Ref("num"), A.Ref("den")), ">", 1.0), window),
+        ),
+    )
+    cfg = DiscoveryConfig(hold_rate_threshold=0.62, band_mode="global", seed=0,
+                          max_overflow_fraction=0.5)
+
+    result = DataOnlyEvaluator(dataset, cfg).evaluate(rule)
+
+    # Tolerated (2 blown rows taint 11 windows, well under the 50% cap), but excluded from scoring.
+    assert "overflow" not in result.reason
+    assert 0 < result.n_points <= 100 - 11
+
+
+def test_display_keys_are_injective_for_labels_that_render_alike():
+    """Round-33 review: a per-label fallback re-collides with a label that was never ambiguous.
+
+    ``1``, ``"1"`` and ``"'1'"`` render as ``1``, ``'1'`` and ``'1'`` -- so disambiguating only the
+    colliding pair produces two identical keys anyway, and a third group's coefficient vanishes from
+    the persisted parameters.
+    """
+    from autogram.discovery.evaluate import _display_keys
+
+    for labels in (
+        [1, "1", "'1'"],
+        ["a", "b", "c"],
+        [1, 2, 3],
+        [(1, "a"), (1, "b")],
+        [True, 1, "1"],
+    ):
+        keys = _display_keys(labels)
+        assert len(set(keys.values())) == len(keys), (labels, keys)

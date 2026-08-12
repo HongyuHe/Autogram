@@ -55,6 +55,7 @@ def test_canonicalize_never_empties_a_group():
     canon = _canonicalize(all_zero, f, 1e-4)
     assert canon[1][1] == frozenset({"self", "dead"})   # guard: not reduced to empty
 
+
 def test_non_sum_signatures_pass_through_unchanged():
     f = _frame()
     for sig in [("pair", frozenset({"a", "b"})), ("zero", "a"), ("one_sided", "a", ">=")]:
@@ -289,124 +290,6 @@ def test_stable_row_sum_is_order_independent_and_exact():
     assert float(np.stack([columns[name] for name in ("a", "b", "c", "d")], axis=0).sum(axis=0)[1]) != 2.0
 
 
-def test_removal_may_not_widen_the_graded_population():
-    """Round-30 review: a member's own missingness restricts the sum's domain.
-
-    ``z`` is 0 on ten rows and missing on the other ninety, so ``total == SUM(real, z)`` is graded
-    on ten rows only. Dropping ``z`` produced ``total == SUM(real)``, which is graded on all one
-    hundred -- and fails on ninety of them. Canonicalisation may not hand the reduced relation rows
-    the original never had to satisfy.
-    """
-    names = ["total", "real", "z"]
-    n = 100
-    mat = np.zeros((n, len(names)))
-    mat[:, 1] = 500.0
-    mat[:, 0] = 500.0
-    mat[10:, 0] = 999.0          # `total == SUM(real)` is false on the last ninety rows
-    mat[:, 2] = np.nan
-    mat[:10, 2] = 0.0            # `z` is defined (and zero) only on the first ten rows
-    f = Frame(mat, names)
-
-    kept = _drop_negligible(frozenset({"real", "z"}), "total", f, zero_tol=1e-4)
-
-    assert kept == frozenset({"real", "z"})
-    assert _canonicalize(("ref_sum", ("total", frozenset({"real", "z"}))), f, 1e-4) != (
-        "ref_sum", ("total", frozenset({"real"}))
-    )
-
-
-def test_all_defined_zero_member_is_still_dropped():
-    # The domain-preserving requirement must not break the intended case: a member defined on every
-    # row where the anchor is defined, and zero throughout, is still removable.
-    names = ["total", "real", "z"]
-    n = 60
-    mat = np.zeros((n, len(names)))
-    mat[:, 1] = 500.0
-    mat[:, 0] = 500.0
-    mat[:, 2] = 0.0
-    mat[40:, 0] = np.nan         # the anchor itself is missing on the tail; `z` still qualifies
-    f = Frame(mat, names)
-
-    kept = _drop_negligible(frozenset({"real", "z"}), "total", f, zero_tol=1e-4)
-
-    assert kept == frozenset({"real"})
-
-
-def test_stable_row_sum_is_order_independent_and_exact():
-    """Round-30 review: the aggregate bound must not depend on hash-randomised iteration order.
-
-    Floating-point addition is not associative, so accumulating per-column magnitudes in
-    ``frozenset``/``dict`` order makes the result depend on string hash randomisation -- and with it
-    which members are canonicalized away, and therefore which side of the held-out boundary a
-    catalogue entry lands on. The summation must be both deterministically ordered and exact.
-
-    Tested at this seam rather than through ``_drop_negligible``: a whole-function test cannot force
-    an adversarial iteration order, so it passes whether or not the summation is ordered, which is
-    no test at all (round-32 review).
-    """
-    from autogram.discovery.known import _stable_row_sum
-
-    columns = {
-        "a": np.array([0.03630875, 1e16]),
-        "b": np.array([0.04805217, 1.0]),
-        "c": np.array([0.04447561, -1e16]),
-        "d": np.array([0.02008216, 1.0]),
-    }
-
-    reference = _stable_row_sum(columns)
-    for order in (("d", "c", "b", "a"), ("b", "a", "d", "c"), ("c", "a", "d", "b")):
-        shuffled = {name: columns[name] for name in order}
-        assert _stable_row_sum(shuffled).tobytes() == reference.tobytes()
-
-    # Exact, not merely reproducible: naive accumulation of the second row loses the two ones.
-    assert reference[1] == 2.0
-    assert float(np.stack([columns[name] for name in ("a", "b", "c", "d")], axis=0).sum(axis=0)[1]) != 2.0
-
-
-def test_drop_negligible_is_independent_of_column_iteration_order():
-    """Floating-point addition is not associative, so the aggregate bound must sum deterministically.
-
-    ``frozenset`` iteration order depends on string hashing, which is randomised per process, so an
-    unordered accumulation makes the *split itself* non-deterministic across runs -- the same
-    catalogue would land on different sides of the held-out boundary. Run in subprocesses under
-    different ``PYTHONHASHSEED`` values, which is the only way to exercise the property.
-    """
-    import subprocess
-    import sys
-
-    program = """
-import numpy as np
-from autogram.loader.loader import Frame
-from autogram.discovery.known import _drop_negligible
-
-names = ["total", "real", "a", "b", "c", "d"]
-n = 25
-mat = np.zeros((n, len(names)))
-mat[:, 1] = 900.0
-mat[:, 2] = 0.03630875
-mat[:, 3] = 0.04805217
-mat[:, 4] = 0.04447561
-mat[:, 5] = 0.02008216
-mat[:, 0] = 1489.1868408634612 / 1e-4 * 1e-4
-kept = _drop_negligible(frozenset(names[1:]), "total", Frame(mat, names), 1e-4)
-print(",".join(sorted(kept)))
-"""
-
-    results = set()
-    for seed in ("0", "1", "2", "3", "4"):
-        completed = subprocess.run(
-            [sys.executable, "-c", program],
-            capture_output=True,
-            text=True,
-            env={"PYTHONHASHSEED": seed, "PATH": "/usr/bin:/bin"},
-            cwd=".",
-        )
-        assert completed.returncode == 0, completed.stderr
-        results.add(completed.stdout.strip())
-
-    assert len(results) == 1, results
-
-
 def test_member_missing_only_where_a_retained_member_is_also_missing_is_dropped():
     """Round-31 review: domain preservation must compare masks, not each member to the anchor.
 
@@ -442,3 +325,43 @@ def test_stable_row_sum_reports_an_unrepresentable_total_as_infinite():
 
     assert np.isinf(total[0])
     assert total[1] == 8.0
+
+
+def test_exact_relation_may_only_drop_identically_zero_members():
+    """Round-33 review: an exact relation has no tolerance to spend.
+
+    A member that is merely small still breaks ``total == SUM(...)`` on every row it is non-zero, so
+    crediting a learned exact sum with recovering a known exact sum that omits it reports a law the
+    data does not satisfy anywhere.
+    """
+    names = ["total", "a", "z"]
+    n = 40
+    mat = np.zeros((n, len(names)))
+    mat[:, 1] = 1000.0
+    mat[:, 2] = 0.05                 # 5e-5 of the anchor: under zero_tol, but not zero
+    mat[:, 0] = 1000.05
+    f = Frame(mat, names)
+
+    known = ("equality", "exact", ("ref_sum", ("total", frozenset({"a", "z"}))))
+    learned = ("equality", "exact", ("ref_sum", ("total", frozenset({"a"}))))
+    assert _canonicalize(known, f, 1e-4) != _canonicalize(learned, f, 1e-4)
+
+    # An approximate relation may still absorb it -- that is what its tolerance is for.
+    known_approx = ("equality", "approximate", ("ref_sum", ("total", frozenset({"a", "z"}))))
+    learned_approx = ("equality", "approximate", ("ref_sum", ("total", frozenset({"a"}))))
+    assert _canonicalize(known_approx, f, 1e-4) == _canonicalize(learned_approx, f, 1e-4)
+
+
+def test_exact_relation_still_drops_a_structurally_zero_member():
+    names = ["total", "a", "z"]
+    n = 40
+    mat = np.zeros((n, len(names)))
+    mat[:, 1] = 1000.0
+    mat[:, 2] = 0.0
+    mat[:, 0] = 1000.0
+    f = Frame(mat, names)
+
+    known = ("equality", "exact", ("ref_sum", ("total", frozenset({"a", "z"}))))
+    learned = ("equality", "exact", ("ref_sum", ("total", frozenset({"a"}))))
+
+    assert _canonicalize(known, f, 1e-4) == _canonicalize(learned, f, 1e-4)

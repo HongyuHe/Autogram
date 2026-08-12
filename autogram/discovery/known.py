@@ -493,6 +493,22 @@ def _shared_gradeable(anchor: np.ndarray, members: dict) -> np.ndarray:
     return gradeable
 
 
+def _is_identically_zero(frame, col: str, anchor_col: str) -> bool:
+    """Is ``col`` exactly zero on every row where it and the anchor are both defined?
+
+    The only removal an EXACT relation licenses: a member that contributes exactly nothing changes
+    no sum anywhere, whatever the tolerance. A member that is merely small does change it.
+    """
+    values = _col_values(frame, col)
+    anchor = _col_values(frame, anchor_col)
+    if values is None or anchor is None or values.shape != anchor.shape:
+        return False
+    defined = np.isfinite(values) & np.isfinite(anchor)
+    if not np.any(defined):
+        return False
+    return not bool(np.any(values[defined] != 0.0))
+
+
 def _stable_row_sum(magnitudes: dict) -> np.ndarray:
     """Row-wise sum of per-column magnitudes, in an order that does not depend on hashing.
 
@@ -522,7 +538,8 @@ def _stable_row_sum(magnitudes: dict) -> np.ndarray:
     )
 
 
-def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset:
+def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float,
+                     exact: bool = False) -> frozenset:
     """Drop summed columns that provably do not change the sum on any gradeable row.
 
     Two groupings that differ only by such columns describe the *same* physical fact, which is what
@@ -550,6 +567,17 @@ def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset
     """
     if zero_tol <= 0.0:
         return frozenset(cols)                       # exact column-set matching requested
+    if exact:
+        # An EXACT relation has no tolerance to spend. A member that is merely small still breaks
+        # ``total == SUM(...)`` on every row it is non-zero, so crediting a learned exact sum with
+        # recovering a known exact sum that omits it would report a law the data does not satisfy.
+        # Only identically-zero members are removable here.
+        zero_tol = 0.0
+        kept = frozenset(
+            col for col in cols
+            if not _is_identically_zero(frame, col, anchor_col)
+        )
+        return kept if kept else frozenset(cols)
     anchor = _col_values(frame, anchor_col)
     if anchor is None or not np.any(np.isfinite(anchor) & (np.abs(anchor) > 0.0)):
         return frozenset(cols)                       # no usable anchor -> do not canonicalize
@@ -608,7 +636,7 @@ def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset
     return kept if kept else frozenset(cols)         # never canonicalize an entire group away
 
 
-def _canonicalize(sig, frame, zero_tol: float):
+def _canonicalize(sig, frame, zero_tol: float, exact: bool = False):
     """Map a relation signature to a data-canonical form (negligible sum members removed).
 
     Only the sum-shaped signatures carry groupings, so only they are canonicalized; pairwise,
@@ -623,17 +651,20 @@ def _canonicalize(sig, frame, zero_tol: float):
         return (
             sig[0],
             sig[1],
-            _canonicalize(sig[2], frame, zero_tol),
+            _canonicalize(sig[2], frame, zero_tol, exact=sig[1] == "exact"),
         )
     if sig[0] == "conditional" and len(sig) == 2:
         condition, base = sig[1]
         return (
             "conditional",
-            (condition, _canonicalize(base, frame, zero_tol)),
+            (condition, _canonicalize(base, frame, zero_tol, exact=exact)),
         )
     if sig[0] == "ref_sum":
         ref_col, cols = sig[1]
-        return ("ref_sum", (ref_col, _drop_negligible(cols, ref_col, frame, zero_tol)))
+        return (
+            "ref_sum",
+            (ref_col, _drop_negligible(cols, ref_col, frame, zero_tol, exact=exact)),
+        )
     if sig[0] == "agg_ref_balance":
         return (
             "sum_balance",

@@ -135,16 +135,21 @@ def _display_keys(labels) -> dict:
     round-trip the *identity* of a group. Stringifying is lossy: distinct labels ``1`` and ``"1"``
     collapse to one key and one group's fitted coefficient silently overwrites the other's, leaving
     an accepted per-group law that cannot be audited or reproduced. Plain ``str`` is kept while it
-    is unambiguous -- that is the readable common case -- and only the colliding labels fall back to
-    ``repr``, which distinguishes them.
+    is unambiguous -- that is the readable common case -- and the *whole set* falls back to ``repr``
+    otherwise. Falling back only for the labels that collide is not enough: ``1``, ``"1"`` and
+    ``"'1'"`` render as ``1``, ``'1'`` and ``'1'``, so a per-label fallback re-collides with a label
+    that was never ambiguous to begin with.
     """
     labels = list(labels)
-    plain = [str(label) for label in labels]
-    duplicated = {key for key in plain if plain.count(key) > 1}
-    return {
-        label: (repr(label) if text in duplicated else text)
-        for label, text in zip(labels, plain)
-    }
+    for render in (str, repr):
+        keys = [render(label) for label in labels]
+        if len(set(keys)) == len(labels):
+            return dict(zip(labels, keys))
+    # Neither rendering separates them (two objects can share a repr), so qualify by position. The
+    # keys stay stable for a fixed label order, and injectivity is what the audit trail needs.
+    keys = [f"{repr(label)}#{index}" for index, label in enumerate(labels)]
+    assert len(set(keys)) == len(labels)
+    return dict(zip(labels, keys))
 
 
 def _group_hold_gate(
@@ -357,15 +362,17 @@ class DataOnlyEvaluator:
             # ... and to the same finite-arithmetic guard, for the same reason: a definition marks a
             # non-finite row invalid, so without this it would be scored on whatever its own
             # overflow left behind.
-            overflow_rejection = self._definition_overflow_rejection(rule)
+            overflow_rejection, tainted_rows = self._definition_overflow_rejection(rule)
             if overflow_rejection is not None:
                 return overflow_rejection
+        else:
+            tainted_rows = None
         if isinstance(rule.atom, A.BooleanDefinition):
-            return self._evaluate_boolean_definition(rule)
+            return self._evaluate_boolean_definition(rule, tainted_rows)
         if isinstance(rule.atom, A.CategoryDefinition):
             return self._evaluate_category_definition(rule)
         if isinstance(rule.atom, A.BandDefinition):
-            return self._evaluate_band_definition(rule)
+            return self._evaluate_band_definition(rule, tainted_rows)
         op = rule.atom.op
 
         g = ground(rule, frame, nm, subsample=cfg.subsample, seed=cfg.seed)
@@ -761,16 +768,21 @@ class DataOnlyEvaluator:
         )
 
     def _definition_overflow_rejection(self, rule: A.Rule):
-        """Apply the same finite-arithmetic guard to a definition, else ``None``.
+        """Finite-arithmetic guard for a definition -> ``(rejection, tainted_rows)``.
 
         Definitions do not go through :func:`ground`; they mark a non-finite row invalid and score
         the survivors, which is the identical silent-shrink hazard the comparison path had. Every
         term a definition evaluates -- its target and each bound inside its predicate -- is checked,
         so a blown-up predicate cannot quietly narrow the population a definition claims to define.
+
+        Overflow *within* ``max_overflow_fraction`` is tolerated but is still not evidence, so the
+        tainted rows are returned for exclusion. Leaving them in is worse than for a comparison: a
+        ``SUSTAINED`` predicate turns a tainted window into a confident ``False``, which then scores
+        as a correct prediction and inflates both the agreement and the support.
         """
         terms = _definition_terms(rule.atom)
         if not terms:
-            return None
+            return None, None
         frame = self.ds.observed
         nm = self.ds.name_model
         condition = (
@@ -786,6 +798,7 @@ class DataOnlyEvaluator:
         overflow_points = 0
         graded_points = 0
         attempted = 0
+        tainted = np.zeros(frame.n_rows, dtype=bool)
         for binding in enumerate_bindings(rule.binder, nm):
             binding_overflow = None
             grounded = True
@@ -812,12 +825,14 @@ class DataOnlyEvaluator:
             blown = int(np.count_nonzero(binding_overflow & selected))
             overflow_points += blown
             graded_points += n_selected - blown
-        return self._overflow_reject_if(
+            tainted |= binding_overflow & selected
+        rejection = self._overflow_reject_if(
             rule,
             overflow_points=overflow_points,
             graded_points=graded_points,
             fraction=(float(overflow_points) / float(attempted)) if attempted else 0.0,
         )
+        return rejection, (tainted if tainted.any() else None)
 
     def _condition_support_rejection(self, rule: A.Rule):
         """Reject a conditioned rule whose condition selects too few rows, else ``None``.
@@ -872,7 +887,7 @@ class DataOnlyEvaluator:
             )
         return None
 
-    def _evaluate_boolean_definition(self, rule: A.Rule) -> Evaluation:
+    def _evaluate_boolean_definition(self, rule: A.Rule, tainted_rows=None) -> Evaluation:
         atom = rule.atom
         learned = _learned_bounds(atom.predicate)
         if len(learned) > 2:
@@ -883,6 +898,7 @@ class DataOnlyEvaluator:
             learned,
             window_by_bound,
             self.ds,
+            tainted_rows=tainted_rows,
         )
         if target.size == 0:
             return self._reject(rule, "Boolean definition grounded no valid points")
@@ -1107,7 +1123,7 @@ class DataOnlyEvaluator:
             },
         )
 
-    def _evaluate_band_definition(self, rule: A.Rule) -> Evaluation:
+    def _evaluate_band_definition(self, rule: A.Rule, tainted_rows=None) -> Evaluation:
         values = []
         groups = []
         source_groups = _group_labels(
@@ -1137,6 +1153,8 @@ class DataOnlyEvaluator:
             mask = np.isfinite(vector)
             if condition_mask is not None:
                 mask &= condition_mask
+            if tainted_rows is not None:
+                mask &= ~np.asarray(tainted_rows, dtype=bool)
             values.append(np.asarray(vector, dtype=float)[mask])
             if source_groups is not None:
                 groups.append(source_groups[mask])
@@ -1436,7 +1454,7 @@ def _bound_effective_series(bound: A.Bound, window, binder, binding, dataset):
     return effective, valid
 
 
-def _definition_grounding(rule: A.Rule, learned, window_by_bound, dataset):
+def _definition_grounding(rule: A.Rule, learned, window_by_bound, dataset, tainted_rows=None):
     """Single aligned pass over the definition population.
 
     Returns the concatenated Boolean target, the threshold-independent validity mask, the optional
@@ -1453,6 +1471,12 @@ def _definition_grounding(rule: A.Rule, learned, window_by_bound, dataset):
         if rule.condition is not None
         else None
     )
+    # Rows the definition's own arithmetic blew up on are not evidence, even when the blow-up was
+    # within the tolerated fraction: a sustained predicate would turn each one into a confident
+    # ``False`` that then scores as a correct prediction.
+    if tainted_rows is not None:
+        keep = ~np.asarray(tainted_rows, dtype=bool)
+        condition = keep if condition is None else (condition & keep)
     source_groups = _group_labels(frame, dataset.name_model)
     targets: list[np.ndarray] = []
     valids: list[np.ndarray] = []
