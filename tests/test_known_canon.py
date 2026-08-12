@@ -365,3 +365,25 @@ def test_exact_relation_still_drops_a_structurally_zero_member():
     learned = ("equality", "exact", ("ref_sum", ("total", frozenset({"a"}))))
 
     assert _canonicalize(known, f, 1e-4) == _canonicalize(learned, f, 1e-4)
+
+
+def test_exact_zero_member_that_is_missing_elsewhere_is_not_dropped():
+    """Round-34 review: exactness must not bypass the domain-preserving fixpoint.
+
+    A member that is zero where defined but MISSING elsewhere restricts the sum's domain, so
+    removing it hands the reduced relation rows the original never had to satisfy -- an exact known
+    graded on ten rows credited to a learned sum that fails on the other ninety.
+    """
+    names = ["total", "real", "z"]
+    n = 100
+    mat = np.zeros((n, len(names)))
+    mat[:, 1] = 500.0
+    mat[:, 0] = 500.0
+    mat[10:, 0] = 999.0          # `total == SUM(real)` is false on the last ninety rows
+    mat[:, 2] = np.nan
+    mat[:10, 2] = 0.0            # `z` is defined (and exactly zero) only on the first ten rows
+    f = Frame(mat, names)
+
+    kept = _drop_negligible(frozenset({"real", "z"}), "total", f, zero_tol=1e-4, exact=True)
+
+    assert kept == frozenset({"real", "z"})

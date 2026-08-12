@@ -128,6 +128,17 @@ def _group_labels(frame, name_model, row_indices=None):
     return labels
 
 
+def _typed_label(label):
+    """Identity of a group label that Python's ``==``/hashing does not collapse.
+
+    ``True == 1`` and ``hash(True) == hash(1)``, so a plain dict keyed by group label silently
+    merges two genuinely different groups: one group's fitted coefficient replaces the other's, and
+    the accepted per-group law can no longer be audited. Qualifying by type keeps them apart while
+    leaving the label itself available for display.
+    """
+    return (type(label).__name__, label)
+
+
 def _display_keys(labels) -> dict:
     """Map raw group labels to collision-free display keys for reporting.
 
@@ -140,16 +151,23 @@ def _display_keys(labels) -> dict:
     ``"'1'"`` render as ``1``, ``'1'`` and ``'1'``, so a per-label fallback re-collides with a label
     that was never ambiguous to begin with.
     """
-    labels = list(labels)
+    typed = list(dict.fromkeys(_typed_label(label) for label in labels))
     for render in (str, repr):
-        keys = [render(label) for label in labels]
-        if len(set(keys)) == len(labels):
-            return dict(zip(labels, keys))
-    # Neither rendering separates them (two objects can share a repr), so qualify by position. The
-    # keys stay stable for a fixed label order, and injectivity is what the audit trail needs.
-    keys = [f"{repr(label)}#{index}" for index, label in enumerate(labels)]
-    assert len(set(keys)) == len(labels)
-    return dict(zip(labels, keys))
+        keys = [render(label) for _kind, label in typed]
+        if len(set(keys)) == len(typed):
+            return dict(zip(typed, keys))
+    # Neither rendering separates them (``True``/``1`` share both, and two objects can share a
+    # repr), so qualify by type and then by position. Injectivity is what the audit trail needs.
+    keys = [f"{kind}:{label!r}" for kind, label in typed]
+    if len(set(keys)) != len(typed):
+        keys = [f"{key}#{index}" for index, key in enumerate(keys)]
+    assert len(set(keys)) == len(typed)
+    return dict(zip(typed, keys))
+
+
+def _binding_key(binding: dict) -> tuple:
+    """Hashable identity of one binding, for per-binding bookkeeping."""
+    return tuple(sorted(binding.items()))
 
 
 def _group_hold_gate(
@@ -168,11 +186,12 @@ def _group_hold_gate(
     rates = {}
     lows = {}
     accepted = True
-    ordered_labels = list(dict.fromkeys(groups.tolist()))
-    display = _display_keys(ordered_labels)
-    for label in ordered_labels:
+    ordered_typed = list(dict.fromkeys(_typed_label(item) for item in groups.tolist()))
+    display = _display_keys([label for _kind, label in ordered_typed])
+    for typed in ordered_typed:
+        label = typed[1]
         mask = np.asarray([
-            item == label
+            _typed_label(item) == typed
             for item in groups
         ], dtype=bool)
         count = int(np.count_nonzero(mask))
@@ -181,7 +200,7 @@ def _group_hold_gate(
             count,
             z=z,
         )
-        key = display[label]
+        key = display[typed]
         rates[key] = group_rate
         lows[key] = group_lo
         gate_value = group_lo if use_wilson else group_rate
@@ -705,8 +724,9 @@ class DataOnlyEvaluator:
             return np.full(n_points, largest, dtype=float)
         mapped = np.full(n_points, largest, dtype=float)
         for index, label in enumerate(labels.tolist()):
-            if label in coefficients:
-                mapped[index] = coefficients[label]
+            typed = _typed_label(label)
+            if typed in coefficients:
+                mapped[index] = coefficients[typed]
         return mapped
 
     @staticmethod
@@ -798,7 +818,7 @@ class DataOnlyEvaluator:
         overflow_points = 0
         graded_points = 0
         attempted = 0
-        tainted = np.zeros(frame.n_rows, dtype=bool)
+        tainted: dict = {}
         for binding in enumerate_bindings(rule.binder, nm):
             binding_overflow = None
             grounded = True
@@ -825,14 +845,17 @@ class DataOnlyEvaluator:
             blown = int(np.count_nonzero(binding_overflow & selected))
             overflow_points += blown
             graded_points += n_selected - blown
-            tainted |= binding_overflow & selected
+            # Keyed PER BINDING: a blow-up in one binding says nothing about another, and applying
+            # one binding's mask to all of them both hides a different binding's genuine failures
+            # and excludes rows it never blew up on.
+            tainted[_binding_key(binding)] = binding_overflow & selected
         rejection = self._overflow_reject_if(
             rule,
             overflow_points=overflow_points,
             graded_points=graded_points,
             fraction=(float(overflow_points) / float(attempted)) if attempted else 0.0,
         )
-        return rejection, (tainted if tainted.any() else None)
+        return rejection, (tainted or None)
 
     def _condition_support_rejection(self, rule: A.Rule):
         """Reject a conditioned rule whose condition selects too few rows, else ``None``.
@@ -1153,8 +1176,12 @@ class DataOnlyEvaluator:
             mask = np.isfinite(vector)
             if condition_mask is not None:
                 mask &= condition_mask
-            if tainted_rows is not None:
-                mask &= ~np.asarray(tainted_rows, dtype=bool)
+            binding_taint = (
+                None if tainted_rows is None
+                else tainted_rows.get(_binding_key(binding))
+            )
+            if binding_taint is not None:
+                mask &= ~np.asarray(binding_taint, dtype=bool)
             values.append(np.asarray(vector, dtype=float)[mask])
             if source_groups is not None:
                 groups.append(source_groups[mask])
@@ -1205,12 +1232,43 @@ class DataOnlyEvaluator:
             if learned
             else float(rule.atom.center)
         )
+        # The centre introduces arithmetic the grounding pass never saw, exactly as a fitted
+        # proportional coefficient does: ``value - centre`` overflows for a centre and an
+        # observation at opposite ends of the float64 range. Checked over the WHOLE graded
+        # population, refused above the cap, and -- when tolerated -- the blown-up rows leave the
+        # scored population and the reported support with it.
+        with np.errstate(over="ignore", invalid="ignore"):
+            centred_all = population - center
+        centre_overflow = _blowup(
+            centred_all, population, np.full(population.shape, center),
+        )
+        if centre_overflow is not None:
+            blown = int(np.count_nonzero(centre_overflow))
+            attempted = max(1, n_bindings * self.ds.observed.n_rows)
+            rejection = self._overflow_reject_if(
+                rule,
+                overflow_points=blown,
+                graded_points=max(0, int(population.size) - blown),
+                fraction=float(blown) / float(attempted),
+            )
+            if rejection is not None:
+                return rejection
+            evaluation_mask = evaluation_mask & ~centre_overflow
+            if not np.any(evaluation_mask):
+                return self._reject(
+                    rule, "band centre overflowed on every evaluated row",
+                )
+            graded_support = (
+                float(int(population.size) - blown)
+                / float(max(1, n_bindings * self.ds.observed.n_rows))
+            ) * (float(n_bindings) / float(n_candidates) if n_candidates else 0.0)
         observed = population[evaluation_mask]
         scale = np.maximum(np.abs(observed), abs(center))
         positive = scale[scale > 0]
         floor = 1e-6 * (robust_median(positive) if positive.size else 1.0)
         scale = np.maximum(scale, floor)
-        relative = np.abs(observed - center) / scale
+        with np.errstate(over="ignore", invalid="ignore"):
+            relative = np.abs(observed - center) / scale
         holds = relative <= float(self.cfg.tolerance) + 1e-15
         k = int(np.count_nonzero(holds))
         lo, hi, phat = wilson(k, int(holds.size), z=z_for_alpha(self.cfg.ci_alpha))
@@ -1279,8 +1337,13 @@ def _fit_proportional(g, frame, nm, cfg):
     coefficients: dict[str, float] = {}
     coefficient_by_point = np.full(g.n_points, np.nan, dtype=float)
     evaluation_mask = np.zeros(g.n_points, dtype=bool)
-    for group_index, label in enumerate(dict.fromkeys(labels.tolist())):
-        mask = np.asarray([item == label for item in labels], dtype=bool)
+    for group_index, typed in enumerate(
+        dict.fromkeys(_typed_label(item) for item in labels.tolist())
+    ):
+        label = typed[1]
+        mask = np.asarray(
+            [_typed_label(item) == typed for item in labels], dtype=bool,
+        )
         left = g.left[mask]
         right = g.right[mask]
         finite = np.isfinite(left) & np.isfinite(right)
@@ -1324,7 +1387,7 @@ def _fit_proportional(g, frame, nm, cfg):
         # identically (``1`` and ``"1"``) would otherwise collide, one group's coefficient would
         # silently replace the other's, and the finite-arithmetic guard would then check the wrong
         # coefficient. Stringification happens only when the parameters are reported.
-        coefficients[label] = coefficient
+        coefficients[typed] = coefficient
         coefficient_by_point[mask] = coefficient
         evaluation_mask[eval_positions] = True
         evaluation_mask[zero_predictor_positions] = True
@@ -1339,12 +1402,14 @@ def _fit_proportional(g, frame, nm, cfg):
 
 
 def _reported_coefficients(coefficients: dict) -> dict:
-    """Serialisable view of the per-group coefficients (raw labels -> collision-free keys)."""
-    display = _display_keys(coefficients)
-    return {
-        ("global" if label == "__global__" else display[label]): value
-        for label, value in coefficients.items()
+    """Serialisable view of the per-group coefficients (typed labels -> collision-free keys)."""
+    display = _display_keys([label for _kind, label in coefficients])
+    reported = {
+        ("global" if typed[1] == "__global__" else display[typed]): value
+        for typed, value in coefficients.items()
     }
+    assert len(reported) == len(coefficients)
+    return reported
 
 
 def _predicate_terms(predicate: A.Predicate, window=None) -> list[tuple]:
@@ -1471,12 +1536,6 @@ def _definition_grounding(rule: A.Rule, learned, window_by_bound, dataset, taint
         if rule.condition is not None
         else None
     )
-    # Rows the definition's own arithmetic blew up on are not evidence, even when the blow-up was
-    # within the tolerated fraction: a sustained predicate would turn each one into a confident
-    # ``False`` that then scores as a correct prediction.
-    if tainted_rows is not None:
-        keep = ~np.asarray(tainted_rows, dtype=bool)
-        condition = keep if condition is None else (condition & keep)
     source_groups = _group_labels(frame, dataset.name_model)
     targets: list[np.ndarray] = []
     valids: list[np.ndarray] = []
@@ -1504,6 +1563,15 @@ def _definition_grounding(rule: A.Rule, learned, window_by_bound, dataset, taint
             continue
         if condition is not None:
             valid = valid & (condition if condition is not None else False)
+        # Rows this binding's own arithmetic blew up on are not evidence, even when the blow-up was
+        # within the tolerated fraction: a sustained predicate would turn each one into a confident
+        # ``False`` that then scores as a correct prediction.
+        binding_taint = (
+            None if tainted_rows is None
+            else tainted_rows.get(_binding_key(binding))
+        )
+        if binding_taint is not None:
+            valid = valid & ~np.asarray(binding_taint, dtype=bool)
         targets.append(np.asarray(target, dtype=float) != 0.0)
         valids.append(valid & np.isfinite(np.asarray(target, dtype=float)))
         if source_groups is not None:

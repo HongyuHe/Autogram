@@ -493,22 +493,6 @@ def _shared_gradeable(anchor: np.ndarray, members: dict) -> np.ndarray:
     return gradeable
 
 
-def _is_identically_zero(frame, col: str, anchor_col: str) -> bool:
-    """Is ``col`` exactly zero on every row where it and the anchor are both defined?
-
-    The only removal an EXACT relation licenses: a member that contributes exactly nothing changes
-    no sum anywhere, whatever the tolerance. A member that is merely small does change it.
-    """
-    values = _col_values(frame, col)
-    anchor = _col_values(frame, anchor_col)
-    if values is None or anchor is None or values.shape != anchor.shape:
-        return False
-    defined = np.isfinite(values) & np.isfinite(anchor)
-    if not np.any(defined):
-        return False
-    return not bool(np.any(values[defined] != 0.0))
-
-
 def _stable_row_sum(magnitudes: dict) -> np.ndarray:
     """Row-wise sum of per-column magnitudes, in an order that does not depend on hashing.
 
@@ -568,16 +552,14 @@ def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float,
     if zero_tol <= 0.0:
         return frozenset(cols)                       # exact column-set matching requested
     if exact:
-        # An EXACT relation has no tolerance to spend. A member that is merely small still breaks
-        # ``total == SUM(...)`` on every row it is non-zero, so crediting a learned exact sum with
-        # recovering a known exact sum that omits it would report a law the data does not satisfy.
-        # Only identically-zero members are removable here.
+        # An EXACT relation has no tolerance to spend: a member that is merely small still breaks
+        # ``total == SUM(...)`` on every row it is non-zero. Setting the budget to zero expresses
+        # exactly that, and -- crucially -- leaves the member on the SAME pipeline as an approximate
+        # one, so the domain-preserving fixpoint below still applies. Short-circuiting to "drop the
+        # identically-zero members" instead let a member that is zero where defined but MISSING
+        # elsewhere be removed, which widens the graded population and credits a learned sum that
+        # fails on the rows the known relation never had to satisfy.
         zero_tol = 0.0
-        kept = frozenset(
-            col for col in cols
-            if not _is_identically_zero(frame, col, anchor_col)
-        )
-        return kept if kept else frozenset(cols)
     anchor = _col_values(frame, anchor_col)
     if anchor is None or not np.any(np.isfinite(anchor) & (np.abs(anchor) > 0.0)):
         return frozenset(cols)                       # no usable anchor -> do not canonicalize
@@ -591,6 +573,8 @@ def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float,
     gradeable = _shared_gradeable(anchor, members)
     if not np.any(gradeable):
         return frozenset(cols)
+    # With ``zero_tol == 0`` (an exact relation) the budget is zero everywhere, so only members that
+    # are exactly zero on every gradeable row qualify -- which is the correct reading of "exact".
     budget = zero_tol * np.abs(anchor[gradeable])
     candidates = {}
     for col, values in members.items():
@@ -730,6 +714,27 @@ def _matching_signatures(sig):
     return candidates
 
 
+def _candidate_is_exact(candidate) -> bool:
+    """Does this known-signature candidate assert an EXACT relation?"""
+    return (
+        isinstance(candidate, tuple)
+        and len(candidate) == 3
+        and candidate[0] == "equality"
+        and candidate[1] == "exact"
+    )
+
+
+def _matches_any(sig, frame, zero_tol: float, canon_by_tolerance: dict) -> bool:
+    """Is any expansion of ``sig`` matched by a learned relation, at that expansion's tolerance?"""
+    for candidate in _matching_signatures(sig):
+        exact = _candidate_is_exact(candidate)
+        canon_candidate = _canonicalize(candidate, frame, zero_tol, exact=exact)
+        for learned in canon_by_tolerance[exact]:
+            if relation_signature_matches(canon_candidate, learned):
+                return True
+    return False
+
+
 def recover_known(result: DiscoveryResult, known: List[KnownInvariant],
                   zero_tol: float = 1e-4) -> dict:
     """Report per-invariant recovery + aggregate recall of the user's known invariants.
@@ -743,10 +748,15 @@ def recover_known(result: DiscoveryResult, known: List[KnownInvariant],
     """
     frame = result.dataset.observed
     rels = portfolio_relations(result)
-    canon_rels = [
-        _canonicalize(s, frame, zero_tol)
-        for s in rels
-    ]
+    # The learned side is canonicalised under the tolerance the KNOWN relation permits, not under
+    # its own. A learned *exact* sum is still recovered by an approximate known written over a
+    # slightly different column set -- the known one tolerates the difference, and it is the known
+    # one whose recovery is being reported. Canonicalising the learned side by its own exactness
+    # instead made an exact learned rule unmatchable by the approximate known it satisfies.
+    canon_by_tolerance = {
+        exact: [_canonicalize(s, frame, zero_tol, exact=exact) for s in rels]
+        for exact in (False, True)
+    }
     ge_cols = _one_sided_columns(result, ">=")
     le_cols = _one_sided_columns(result, "<=")
     report: List[dict] = []
@@ -771,22 +781,12 @@ def recover_known(result: DiscoveryResult, known: List[KnownInvariant],
                 and _lag_grounds_any_row(result, _column, _steps)
             )
             if not recovered:
-                recovered = any(
-                    relation_signature_matches(
-                        _canonicalize(candidate, frame, zero_tol),
-                        learned,
-                    )
-                    for candidate in _matching_signatures(sig)
-                    for learned in canon_rels
+                recovered = _matches_any(
+                    sig, frame, zero_tol, canon_by_tolerance,
                 )
         else:
-            recovered = any(
-                relation_signature_matches(
-                    _canonicalize(candidate, frame, zero_tol),
-                    learned,
-                )
-                for candidate in _matching_signatures(sig)
-                for learned in canon_rels
+            recovered = _matches_any(
+                sig, frame, zero_tol, canon_by_tolerance,
             )
         n_ok += int(recovered)
         report.append({"name": inv.name, "op": inv.op, "recovered": bool(recovered),

@@ -749,3 +749,111 @@ def test_display_keys_are_injective_for_labels_that_render_alike():
     ):
         keys = _display_keys(labels)
         assert len(set(keys.values())) == len(keys), (labels, keys)
+
+
+def test_reduction_that_cancels_to_nan_is_an_overflow_not_missing_data():
+    """Round-34 review: a reduction can return NaN from finite members.
+
+    Pairwise summation overflows a partial sum and then cancels, so the result is ``NaN`` rather
+    than an infinity -- and a guard that only looks for infinities lets those rows be dropped as
+    ordinary missing data, shrinking the population behind a full-confidence support figure.
+    """
+    import autogram.dsl.binders as B
+    import autogram.dsl.evaluate as E
+
+    # Sixteen members with alternating signs: numpy's unrolled accumulators reach +inf and -inf
+    # separately and their combination is NaN, even though every member is finite and the exact
+    # mathematical sum is zero.
+    n = 40
+    columns = [f"m{index}" for index in range(16)]
+    values = {
+        name: np.full(n, 1.5e308 if index % 2 == 0 else -1.5e308)
+        for index, name in enumerate(columns)
+    }
+    for name in columns:                       # the first ten rows sum cleanly to zero
+        values[name][:10] = np.sign(values[name][:10])
+    df = pd.DataFrame({**values, "target": np.zeros(n)})
+    dataset = _dataset(df, "nan_reduction")
+    with np.errstate(over="ignore", invalid="ignore"):
+        last = np.stack([values[c] for c in columns], axis=1)[-1].sum()
+    assert np.isnan(last), last
+
+    original = B.resolve_family
+    B.resolve_family = lambda role, binder, binding, nm: tuple(columns)
+    try:
+        _value, overflow = E.eval_term_overflow(
+            A.Agg("SUM", "fam"), "record", {}, dataset.observed, dataset.name_model,
+        )
+    finally:
+        B.resolve_family = original
+
+    assert overflow is not None
+    assert int(np.count_nonzero(overflow)) == 30      # every row whose partial sums cancelled
+
+
+def test_rolling_reduction_that_cancels_to_nan_is_an_overflow():
+    n = 60
+    window = 16
+    series = np.resize(np.array([1.5e308, -1.5e308]), n)
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=n, freq="1min"),
+        "consumer_id": ["c0"] * n,
+        "m": series,
+        "target": np.zeros(n),
+    })
+    frame = profile_dataframe(
+        df, time_index="timestamp", group_keys=("consumer_id",), temporal_windows=(window,),
+    )
+    dataset, _grammar = build_dataframe_grammar(frame, _base_spec(), name="nan_rolling")
+
+    _value, overflow = eval_term_overflow(
+        A.Rolling(A.Ref("m"), window, "SUM"), "record", {},
+        dataset.observed, dataset.name_model,
+    )
+
+    assert overflow is not None and bool(np.any(overflow))
+
+
+def test_band_centre_overflow_is_refused():
+    """Round-34 review: `value - centre` is post-fit arithmetic the grounding pass never saw."""
+    values = np.full(60, 1.5e308)
+    values[:20] = -1.5e308
+    dataset = _dataset(pd.DataFrame({"m": values}), "band_centre_overflow")
+    rule = A.Rule("record", A.BandDefinition(A.Ref("m"), -1.5e308))
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(tolerance=0.05, hold_rate_threshold=0.62, band_mode="global", seed=0),
+    ).evaluate(rule)
+
+    assert not result.accepted
+    assert "overflow" in result.reason
+
+
+def test_definition_taint_is_confined_to_the_binding_that_blew_up():
+    """Round-34 review: one binding's blow-up must not excuse another binding's failures.
+
+    A frame-row mask applied to every binding removes rows the other bindings never blew up on --
+    and those rows are exactly where a wrong definition fails.
+    """
+    from autogram.discovery.evaluate import _binding_key
+
+    dataset, window = _tainted_definition_dataset("binding_taint", blown=2)
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("target"),
+            A.Sustained(A.Bound(A.Div(A.Ref("num"), A.Ref("den")), ">", 1.0), window),
+        ),
+    )
+    evaluator = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(hold_rate_threshold=0.62, band_mode="global", seed=0,
+                        max_overflow_fraction=0.5),
+    )
+
+    _rejection, tainted = evaluator._definition_overflow_rejection(rule)
+
+    assert isinstance(tainted, dict)
+    assert list(tainted) == [_binding_key({})]
+    assert int(np.count_nonzero(next(iter(tainted.values())))) == 11

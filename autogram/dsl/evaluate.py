@@ -159,7 +159,7 @@ def _window_overflow(mask, window: int, frame: Frame, nm: NameModel):
     """Carry an overflow mask through a rolling window (any tainted member taints the window)."""
     if mask is None:
         return None
-    rolled = _rolling(mask.astype(float), window, "MAX", frame, nm)
+    rolled, _written = _rolling(mask.astype(float), window, "MAX", frame, nm)
     if rolled is None:
         return None
     return np.nan_to_num(rolled, nan=0.0) > 0.0
@@ -243,7 +243,12 @@ def _eval_term_uncached(term: A.Term, binder: str, binding: dict, frame: Frame,
                 out = mat.min(axis=1)
             else:
                 out = mat.max(axis=1)
-        overflow = np.isinf(out) & finite_members
+        # SUM and AVG can return ``NaN`` from finite members when an intermediate partial sum
+        # overflows and then cancels, so every non-finite result counts; MIN and MAX cannot.
+        blown = (
+            ~np.isfinite(out) if term.kind in ("SUM", "AVG") else np.isinf(out)
+        )
+        overflow = blown & finite_members
         return out, (overflow if overflow.any() else None)
     if isinstance(term, A.Mul):
         left, left_overflow = eval_term_overflow(term.left, binder, binding, frame, nm)
@@ -290,14 +295,16 @@ def _eval_term_uncached(term: A.Term, binder: str, binding: dict, frame: Frame,
         inner, inner_overflow = eval_term_overflow(term.term, binder, binding, frame, nm)
         if inner is None:
             return None, None
-        rolled = _rolling(inner, term.window, term.kind, frame, nm)
+        rolled, written = _rolling(inner, term.window, term.kind, frame, nm)
         if rolled is None:
             return None, None
-        # ``_rolling`` only emits a value when every window member is finite, so an infinite output
-        # can only have come from the aggregation itself overflowing.
+        # ``_rolling`` only emits a value when every window member is finite, so a NON-FINITE value
+        # on a row it actually wrote can only have come from the reduction itself blowing up --
+        # including the ``NaN`` that intermediate overflow and cancellation produce, which is not an
+        # infinity and would otherwise pass as ordinary missing data.
         return rolled, _union_overflow(
             _window_overflow(inner_overflow, term.window, frame, nm),
-            np.isinf(rolled),
+            written & ~np.isfinite(rolled),
         )
     if isinstance(term, A.RelatedAgg):
         template = getattr(nm.adapter, "resolve_related", lambda *_: None)(term.role, binder)
@@ -402,10 +409,17 @@ def _lag(values: np.ndarray, steps: int, frame: Frame, nm: NameModel):
 
 
 def _rolling(values: np.ndarray, window: int, kind: str, frame: Frame, nm: NameModel):
+    """Rolling reduction -> ``(values, written)``.
+
+    ``written`` marks the rows a value was actually computed for. Output ``NaN`` is ambiguous on its
+    own -- it means either "no valid window here" (legitimate) or "the reduction itself produced
+    NaN" (an overflow of the candidate's own arithmetic) -- and only the second is a blow-up.
+    """
     groups = _ordered_groups(frame, nm)
     if groups is None:
-        return None
+        return None, None
     out = np.full(frame.n_rows, np.nan, dtype=float)
+    written = np.zeros(frame.n_rows, dtype=bool)
     for rows in groups:
         ordered = np.asarray(values[rows], dtype=float)
         consecutive = _consecutive_window_ends(
@@ -420,18 +434,20 @@ def _rolling(values: np.ndarray, window: int, kind: str, frame: Frame, nm: NameM
             chunk = ordered[end - window + 1:end + 1]
             if not np.all(np.isfinite(chunk)):
                 continue
-            if kind == "SUM":
-                value = float(np.sum(chunk))
-            elif kind == "AVG":
-                value = float(np.mean(chunk))
-            elif kind == "MIN":
-                value = float(np.min(chunk))
-            elif kind == "MAX":
-                value = float(np.max(chunk))
-            else:
-                raise ValueError(f"unknown rolling aggregation {kind!r}")
+            with np.errstate(over="ignore", invalid="ignore"):
+                if kind == "SUM":
+                    value = float(np.sum(chunk))
+                elif kind == "AVG":
+                    value = float(np.mean(chunk))
+                elif kind == "MIN":
+                    value = float(np.min(chunk))
+                elif kind == "MAX":
+                    value = float(np.max(chunk))
+                else:
+                    raise ValueError(f"unknown rolling aggregation {kind!r}")
             out[rows[end]] = value
-    return out
+            written[rows[end]] = True
+    return out, written
 
 
 def _sign_bound_raw_exact(atom, rho: np.ndarray) -> bool:
@@ -925,7 +941,7 @@ def _related_aggregate(template, frame: Frame):
                 any_valid |= partition_valid
                 with np.errstate(over="ignore", invalid="ignore"):
                     accumulated = totals + contribution
-                blown |= np.isinf(accumulated) & np.isfinite(totals) & np.isfinite(contribution)
+                blown |= ~np.isfinite(accumulated) & np.isfinite(totals) & np.isfinite(contribution)
                 totals = accumulated
                 continue
             prior_boundaries = (
@@ -989,7 +1005,7 @@ def _related_aggregate(template, frame: Frame):
             any_valid |= partition_valid
             with np.errstate(over="ignore", invalid="ignore"):
                 accumulated = totals + contribution
-            blown |= np.isinf(accumulated) & np.isfinite(totals) & np.isfinite(contribution)
+            blown |= ~np.isfinite(accumulated) & np.isfinite(totals) & np.isfinite(contribution)
             totals = accumulated
         accepted = complete & any_valid
         output[ordered_parent[accepted]] = totals[accepted]
