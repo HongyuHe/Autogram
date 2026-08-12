@@ -15,9 +15,11 @@ from ..config import DiscoveryConfig
 from ..dsl import ast as A
 from ..dsl.binders import enumerate_bindings
 from ..dsl.evaluate import (
+    _blowup,
     _condition_mask,
     _consecutive_window_ends,
     _ordered_groups,
+    _union_overflow,
     eval_term,
     eval_term_overflow,
     ground,
@@ -382,8 +384,34 @@ class DataOnlyEvaluator:
                 evaluation_mask,
                 evaluation_groups,
             ) = fitted
-            rho = g.left - coefficient_by_point * g.right
-            scale = np.maximum(np.abs(g.left), np.abs(coefficient_by_point * g.right))
+            with np.errstate(over="ignore", invalid="ignore"):
+                rho = g.left - coefficient_by_point * g.right
+                scale = np.maximum(
+                    np.abs(g.left), np.abs(coefficient_by_point * g.right),
+                )
+            # The fitted coefficient introduces arithmetic that `ground()` never saw, so the
+            # finite-arithmetic guard has to be re-applied to the POST-FIT residual: a large
+            # coefficient can overflow the product or the difference on rows whose operands were
+            # perfectly finite. The check covers every grounded row, not just the evaluation split,
+            # because a blow-up is a failure of the rule's own expression wherever it occurs -- the
+            # holdout split is a scoring mechanism, not a restriction on what the rule claims.
+            with np.errstate(over="ignore", invalid="ignore"):
+                scaled_right = coefficient_by_point * g.right
+            fit_overflow = _union_overflow(
+                _blowup(scaled_right, coefficient_by_point, g.right),
+                _blowup(rho, g.left, scaled_right),
+            )
+            if fit_overflow is not None:
+                blown = int(np.count_nonzero(fit_overflow))
+                attempted = int(fit_overflow.size)
+                rejection = self._overflow_reject_if(
+                    rule,
+                    overflow_points=blown,
+                    graded_points=attempted - blown,
+                    fraction=(float(blown) / float(attempted)) if attempted else 0.0,
+                )
+                if rejection is not None:
+                    return rejection
             positive = scale[scale > 0]
             floor = 1e-6 * (robust_median(positive) if positive.size else 1.0)
             scale = np.maximum(scale, floor)
@@ -968,7 +996,6 @@ class DataOnlyEvaluator:
             self.ds.name_model,
         )
         condition_mask = None
-        condition_support = 1.0
         if rule.condition is not None:
             condition_mask = _condition_mask(
                 rule.condition,
@@ -976,10 +1003,6 @@ class DataOnlyEvaluator:
             )
             if condition_mask is None:
                 return self._reject(rule, "band condition could not be grounded")
-            condition_support = (
-                float(np.count_nonzero(condition_mask))
-                / max(1, self.ds.observed.n_rows)
-            )
         for binding in enumerate_bindings(rule.binder, self.ds.name_model):
             vector = eval_term(
                 rule.atom.term,
@@ -1004,12 +1027,16 @@ class DataOnlyEvaluator:
             if groups
             else None
         )
+        # Reported support must describe the rows the band was SCORED on, exactly as
+        # ``Grounded.support`` does for comparisons: a band graded on ten finite rows out of a
+        # hundred is not supported by the whole hundred. Measured unconditionally, not only under a
+        # condition, because a non-finite term shrinks the evidence either way.
+        graded_support = float(population.size) / float(
+            max(1, len(values) * self.ds.observed.n_rows)
+        )
         if rule.condition is not None:
             # Measure the floor on the rows the band can actually grade, not on the rows the
             # condition merely selects: non-finite terms shrink the evidence further.
-            graded_support = float(population.size) / float(
-                max(1, len(values) * self.ds.observed.n_rows)
-            )
             if (
                 population.size < int(self.cfg.min_condition_points)
                 or graded_support < float(self.cfg.min_condition_fraction)
@@ -1076,7 +1103,7 @@ class DataOnlyEvaluator:
             hold_rate_lo=lo,
             hold_rate_hi=hi,
             statistic="hold_rate",
-            support=condition_support,
+            support=graded_support,
             n_points=int(holds.size),
             n_bindings=1,
             mdl_gain=mdl_gain(rule, float(self.cfg.tolerance), relative),
@@ -1133,8 +1160,15 @@ def _fit_proportional(g, frame, nm, cfg):
             continue
         eval_positions = shuffled[:n_eval]
         fit_positions = shuffled[n_eval:]
-        ratios = g.left[fit_positions] / g.right[fit_positions]
-        coefficient = float(np.median(ratios))
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            ratios = g.left[fit_positions] / g.right[fit_positions]
+        # ``np.median`` averages the two central ratios, and that intermediate sum overflows for a
+        # sample near the float64 ceiling -- which would discard a perfectly well-determined
+        # coefficient and fall through to the least-squares branch (a different estimator) for a
+        # purely numerical reason. ``robust_median`` reproduces the median exactly whenever the
+        # ratios are finite, so the least-squares fallback is reached only when they genuinely are
+        # not.
+        coefficient = robust_median(ratios) if np.all(np.isfinite(ratios)) else float("nan")
         if not np.isfinite(coefficient):
             fit_right = g.right[fit_positions]
             fit_left = g.left[fit_positions]

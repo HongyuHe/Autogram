@@ -419,7 +419,8 @@ def test_conditioned_search_space_is_counted_before_expansion():
 
     message = str(excinfo.value)
     match = re.search(
-        r"expand (\d+) conditionable rules over (\d+) conditions = (\d+) conditioned candidates",
+        r"expand at least (\d+) conditionable rules over (\d+) conditions = "
+        r"(\d+) conditioned candidates",
         message,
     )
     assert match, message
@@ -427,3 +428,92 @@ def test_conditioned_search_space_is_counted_before_expansion():
     assert conditionable > 0 and n_conditions > 0
     assert projected == conditionable * n_conditions
     assert projected > 2
+
+
+def test_conditioned_precount_fails_fast_without_consuming_the_whole_stream():
+    """The pre-count must stream, not materialise.
+
+    Round-29 review: a pre-count that first builds ``list(self._candidate_rules())`` trades one
+    memory blow-up for another and cannot fail fast -- it consumes the entire raw search before
+    refusing. The count has to raise the moment the running product crosses the ceiling.
+    """
+    import pytest
+
+    from autogram.discovery.propose import EnumerationProposer, SearchSpaceTruncatedError
+    from autogram.dsl import ast as A
+    from autogram.dsl.grammar import Grammar
+
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=",),
+        ref_roles={"record": ("x", "y")},
+        fam_roles={"record": ()},
+        max_complexity=10,
+        conditional_enabled=True,
+        condition_columns={"regime": ("a", "b")},
+        max_conditioned_rules=1,
+    )
+    proposer = EnumerationProposer(grammar)
+    produced = {"n": 0}
+
+    def _endless():
+        while True:
+            produced["n"] += 1
+            yield A.Rule("record", A.Compare(A.Ref("x"), "~=", A.Ref("y")))
+
+    proposer._candidate_rules = _endless
+
+    with pytest.raises(SearchSpaceTruncatedError):
+        proposer.propose()
+
+    # A materialising pre-count would never return at all on an endless stream; a streaming one
+    # refuses after a couple of candidates.
+    assert produced["n"] <= 4
+
+
+def test_one_rare_value_does_not_disable_a_valid_regime_column():
+    """Round-29 review: `counts.min()` discarded a whole column over a single rare label.
+
+    ``{normal: 80, alert: 39, unknown: 1}`` is a regime label with two well-populated strata. The
+    thin stratum's own conditioned rules are rejected downstream by the evaluator's support floor,
+    which is where that decision belongs -- discarding the column throws away the other two.
+    """
+    from autogram.loader.gtib import infer_tabular_profile
+
+    labels = np.array(["normal"] * 80 + ["alert"] * 39 + ["unknown"], dtype=object)
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=labels.size, freq="1min"),
+        "label": labels,
+        "latency_ms": np.linspace(1.0, 100.0, labels.size),
+    })
+
+    conditions = list(
+        infer_tabular_profile(df).attrs[AUTOGRAM_PROFILE_ATTR]["condition_columns"]
+    )
+
+    assert "label" in conditions
+
+
+def test_regime_test_uses_the_supplied_discovery_config():
+    """The floor must track the configuration a run will actually use, not a frozen default."""
+    from autogram.config import DiscoveryConfig
+    from autogram.loader.gtib import infer_tabular_profile
+
+    n = 60
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=n, freq="1min"),
+        "bucket": [f"b-{index % 10}" for index in range(n)],   # 6 rows per value
+        "latency_ms": np.linspace(1.0, 100.0, n),
+    })
+
+    default_conditions = list(
+        infer_tabular_profile(df).attrs[AUTOGRAM_PROFILE_ATTR]["condition_columns"]
+    )
+    relaxed_conditions = list(
+        infer_tabular_profile(
+            df, DiscoveryConfig(min_condition_points=5, min_condition_fraction=0.0),
+        ).attrs[AUTOGRAM_PROFILE_ATTR]["condition_columns"]
+    )
+
+    assert "bucket" not in default_conditions      # 6 rows per value is below the default floor
+    assert "bucket" in relaxed_conditions          # ... but clears an explicitly lowered one

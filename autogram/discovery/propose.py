@@ -583,28 +583,28 @@ class EnumerationProposer:
         # -- so `conditionable x |conditions|` is not an estimate but exactly the number the ceiling
         # is compared against. Discovering that deep inside expansion means paying for the whole
         # blow-up first; refusing here names both factors, so a mis-declared condition column is
-        # immediately diagnosable. The base rules are only materialised when a ceiling is actually
-        # declared, so an unbounded grammar keeps streaming them and does not pay for a second
-        # simultaneous copy of the candidate list.
-        raw_rules = (
-            list(self._candidate_rules()) if precount else self._candidate_rules()
-        )
+        # immediately diagnosable. The count STREAMS the base rules and raises the moment the
+        # running product crosses the ceiling, so a blow-up is refused without ever materialising
+        # the candidate list -- materialising it would trade one memory blow-up for another and
+        # defeat the purpose.
         if precount:
-            conditionable = sum(
-                1
-                for raw in raw_rules
-                if isinstance(raw.atom, A.Compare)
-                and self._conditional_candidate(raw)
-            )
-            projected = conditionable * len(conditions)
-            if projected > self.G.max_conditioned_rules:
-                raise SearchSpaceTruncatedError(
-                    f"conditioned grammar would expand {conditionable} conditionable rules over "
-                    f"{len(conditions)} conditions = {projected} conditioned candidates, exceeding "
-                    f"max_conditioned_rules={self.G.max_conditioned_rules}; raise the ceiling or "
-                    "tighten explicit condition bounds"
-                )
-        for raw in raw_rules:
+            conditionable = 0
+            for raw in self._candidate_rules():
+                if not (
+                    isinstance(raw.atom, A.Compare)
+                    and self._conditional_candidate(raw)
+                ):
+                    continue
+                conditionable += 1
+                if conditionable * len(conditions) > self.G.max_conditioned_rules:
+                    raise SearchSpaceTruncatedError(
+                        f"conditioned grammar would expand at least {conditionable} conditionable "
+                        f"rules over {len(conditions)} conditions = "
+                        f"{conditionable * len(conditions)} conditioned candidates, exceeding "
+                        f"max_conditioned_rules={self.G.max_conditioned_rules}; raise the ceiling "
+                        "or tighten explicit condition bounds"
+                    )
+        for raw in self._candidate_rules():
             variants = [raw]
             if (
                 isinstance(raw.atom, A.Compare)

@@ -477,49 +477,82 @@ def _col_values(frame, col: str):
     return values if values.size else None
 
 
-def _is_negligible_member(frame, col: str, anchor: np.ndarray, zero_tol: float) -> bool:
-    """Is ``col`` negligible against the anchor on EVERY row the sum can be graded on?
+def _shared_gradeable(anchor: np.ndarray, members: dict) -> np.ndarray:
+    """Rows on which the whole summed grouping can be evaluated.
 
-    Negligibility is what licenses removing a member from a summed grouping, so it has to hold
-    wherever the sum is evaluated -- not merely on a typical row.  Deciding it with a central
-    statistic (the median absolute value) is unsound: a column that is ``0`` on 51% of the rows and
-    ``1000`` on the other 49% has a median of ``0`` and would be dropped, which would credit a known
-    invariant as recovered while it is violated on 49% of the data.  The recall figure is the
-    headline claim of the scoreboard, so the test is pointwise: the member must be within
-    ``zero_tol`` of the anchor's magnitude on *every* gradeable row.
-
-    Rows where either column is missing are excluded: the sum is undefined there, so they cannot
-    witness anything either way.  A row where both are exactly zero satisfies the test, which is
-    what keeps a structurally-zero member droppable on data that also contains all-zero rows.
+    A sum is undefined wherever ANY member is missing, so gradeability is a property of the
+    grouping, not of one member at a time.  Testing a member against the anchor alone would keep a
+    member that is non-zero only on rows the sum cannot be graded on -- a member that provably never
+    changes the relation, whose retention splits two behaviourally identical catalogue entries
+    across the held-out boundary.
     """
-    values = _col_values(frame, col)
-    if values is None or values.shape != anchor.shape:
-        return False
-    gradeable = np.isfinite(values) & np.isfinite(anchor)
-    if not np.any(gradeable):
-        return False
-    return bool(np.all(
-        np.abs(values[gradeable]) <= zero_tol * np.abs(anchor[gradeable])
-    ))
+    gradeable = np.isfinite(anchor)
+    for values in members.values():
+        gradeable = gradeable & np.isfinite(values)
+    return gradeable
 
 
 def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset:
-    """Drop summed columns whose observed data is negligible against the anchor's scale.
+    """Drop summed columns that provably do not change the sum on any gradeable row.
 
-    A column that is (near-)zero on every gradeable row adds ~0 to a sum, so removing it leaves the
-    sum -- and therefore the equality it feeds -- unchanged.  Two groupings that differ only by such
-    columns describe the *same* physical fact.  The negligibility test is anchored on the reference
-    (left-hand side) column and applied row by row, so it is dimensionless, dataset-agnostic, and
-    cannot be satisfied by a member that is merely *usually* zero.  We never reduce a whole group to
-    empty (that would collapse distinct laws), and unknown columns are kept.
+    Two groupings that differ only by such columns describe the *same* physical fact, which is what
+    licenses treating them as one relation.  Three properties make that licence sound:
+
+    * **Pointwise, not central.**  A member must be within ``zero_tol`` of the anchor's magnitude on
+      *every* gradeable row.  A central statistic cannot decide this: a column that is ``0`` on 51%
+      of rows and ``1000`` on the rest has a zero median, and dropping it would credit a known
+      invariant as recovered while it is violated on 49% of the data.
+    * **Collective, not one-at-a-time.**  Individually-negligible members still add up: 607 members
+      each under the tolerance contributed 6% of the total between them.  The members removed
+      together must therefore stay within the same bound *in aggregate*; when they do not, only the
+      members that are exactly zero everywhere are removed, whose combined contribution is exactly
+      zero.  That fallback is also what keeps the transform idempotent -- re-canonicalising the
+      reduced grouping removes nothing further.
+    * **Anchored and dimensionless.**  The bound is a fraction of the reference (left-hand side)
+      column's magnitude on the same row, so the test is scale-free and dataset-agnostic.
+
+    We never reduce a whole group to empty (that would collapse distinct laws), and a column the
+    frame does not carry is always kept.
     """
     if zero_tol <= 0.0:
         return frozenset(cols)                       # exact column-set matching requested
     anchor = _col_values(frame, anchor_col)
     if anchor is None or not np.any(np.isfinite(anchor) & (np.abs(anchor) > 0.0)):
         return frozenset(cols)                       # no usable anchor -> do not canonicalize
-    kept = frozenset(c for c in cols
-                     if not _is_negligible_member(frame, c, anchor, zero_tol))
+    members = {}
+    for col in cols:
+        values = _col_values(frame, col)
+        if values is not None and values.shape == anchor.shape:
+            members[col] = values
+    if not members:
+        return frozenset(cols)
+    gradeable = _shared_gradeable(anchor, members)
+    if not np.any(gradeable):
+        return frozenset(cols)
+    budget = zero_tol * np.abs(anchor[gradeable])
+    candidates = {
+        col: np.abs(values[gradeable])
+        for col, values in members.items()
+    }
+    candidates = {
+        col: magnitude
+        for col, magnitude in candidates.items()
+        if bool(np.all(magnitude <= budget))
+    }
+    if not candidates:
+        return frozenset(cols)
+    combined = np.zeros(int(np.count_nonzero(gradeable)), dtype=float)
+    for magnitude in candidates.values():
+        combined = combined + magnitude
+    if not bool(np.all(combined <= budget)):
+        # Aggregate contribution is material: fall back to the members that contribute exactly
+        # nothing, which is both sound and stable under re-canonicalisation.
+        candidates = {
+            col: magnitude
+            for col, magnitude in candidates.items()
+            if not bool(np.any(magnitude > 0.0))
+        }
+    kept = frozenset(col for col in cols if col not in candidates)
     return kept if kept else frozenset(cols)         # never canonicalize an entire group away
 
 

@@ -330,3 +330,91 @@ def test_definition_without_overflow_is_still_evaluated_normally():
 
     assert "overflow" not in result.reason
     assert result.accepted
+
+
+def test_proportional_fit_overflow_is_refused_not_scored():
+    """Round-29 review: the fitted coefficient introduces arithmetic ``ground()`` never saw.
+
+    ``rho = left - coefficient * right`` and its scale are recomputed AFTER grounding, so a large
+    fitted coefficient can overflow the product on rows whose operands were finite. Those rows were
+    then scored as ordinary residuals behind a full-confidence support figure.
+    """
+    n = 60
+    right = np.full(n, 1.0)
+    left = np.full(n, 1e308)
+    right[-1] = 10.0                      # 1e308 * 10 overflows once the coefficient is fitted
+    left[-1] = 1e308
+    df = pd.DataFrame({"x": right, "y": left})
+    dataset = _dataset(df, "proportional_overflow")
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(tolerance=0.05, hold_rate_threshold=0.62, band_mode="global", seed=0),
+    ).evaluate(A.Rule("record", A.Compare(A.Ref("y"), "~\u221d", A.Ref("x"))))
+
+    assert not result.accepted
+    assert "overflow" in result.reason
+
+
+def test_proportional_coefficient_median_survives_ceiling_scale_ratios():
+    # A well-determined coefficient must not be discarded (and the estimator silently swapped for
+    # least squares) merely because the median's intermediate sum overflowed.
+    from autogram.discovery.evaluate import _fit_proportional
+
+    n = 80
+    x = np.full(n, 1.0)
+    y = np.full(n, 1.5e308)
+    df = pd.DataFrame({"x": x, "y": y})
+    dataset = _dataset(df, "proportional_ceiling")
+    g = ground(
+        A.Rule("record", A.Compare(A.Ref("y"), "~\u221d", A.Ref("x"))),
+        dataset.observed,
+        dataset.name_model,
+    )
+    fitted = _fit_proportional(g, dataset.observed, dataset.name_model, DiscoveryConfig(seed=0))
+
+    assert fitted is not None
+    coefficients = fitted[0]
+    assert all(abs(value - 1.5e308) < 1e295 for value in coefficients.values())
+
+
+def test_band_definition_support_reports_the_graded_population():
+    """Round-29 review: an accepted band reported full support while grading a tenth of the rows."""
+    values = np.full(100, np.nan)
+    values[:10] = 5.0
+    df = pd.DataFrame({"m": values})
+    dataset = _dataset(df, "band_graded_support")
+    rule = A.Rule("record", A.BandDefinition(A.Ref("m"), 5.0))
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(tolerance=0.05, hold_rate_threshold=0.62, band_mode="global", seed=0),
+    ).evaluate(rule)
+
+    assert result.n_points == 10
+    assert abs(result.support - 0.1) < 1e-9
+
+
+def test_null_control_magnitudes_stay_finite_at_ceiling_scale():
+    """Round-29 review: a finite median was not enough to keep the null control finite.
+
+    The lognormal multiplier is unbounded above, so a ceiling-scale column still generated
+    infinities. Those become missing data, the null candidates built on them are refused for
+    overflowing rather than judged on their merits, and the false-discovery control silently goes
+    vacuous -- which is the one thing the calibration protocol cannot tolerate.
+    """
+    from autogram.discovery.validate import _balanced_null_numeric
+
+    for seed in range(5):
+        generated = _balanced_null_numeric(
+            np.full(100, 1.5e308), np.random.default_rng(seed), binary=False,
+        )
+        assert np.all(np.isfinite(generated)), seed
+        assert np.any(generated > 0.0) and np.any(generated < 0.0)
+
+    # Ordinary data must be untouched by the safeguard.
+    ordinary = _balanced_null_numeric(
+        np.linspace(1.0, 100.0, 200), np.random.default_rng(1), binary=False,
+    )
+    assert np.all(np.isfinite(ordinary))
+    assert 10.0 < float(np.median(np.abs(ordinary))) < 200.0

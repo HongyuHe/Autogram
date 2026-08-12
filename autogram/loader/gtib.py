@@ -146,22 +146,54 @@ def profile_dataframe(
     return out
 
 
-def _min_condition_value_rows(n_rows: int) -> int:
+def _min_condition_value_rows(n_rows: int, cfg: DiscoveryConfig | None = None) -> int:
     """Rows one condition value must cover before the column is worth proposing as a condition.
 
     Mirrors the evaluator's condition-support floor (``DiscoveryConfig.min_condition_points`` and
     ``min_condition_fraction``) rather than inventing a second, unrelated constant: a value that
     cannot clear that floor can never produce an accepted conditioned rule, so inferring it only
     multiplies the conditioned search space with candidates that are rejected by construction.
+    Ingestion runs before any evaluation config is chosen, so the defaults apply unless a caller
+    supplies the configuration the run will actually use.
     """
-    floor = DiscoveryConfig()
+    floor = cfg or DiscoveryConfig()
     return max(
         int(floor.min_condition_points),
         int(math.ceil(float(floor.min_condition_fraction) * max(0, int(n_rows)))),
     )
 
 
-def infer_tabular_profile(frame: pd.DataFrame) -> pd.DataFrame:
+def _is_regime_column(counts: pd.Series, n_rows: int, cfg: DiscoveryConfig | None = None) -> bool:
+    """Does a column's value distribution look like a *regime label* rather than an identifier?
+
+    Two properties are required, and both are read off the evaluator's own condition-support floor
+    rather than a new constant:
+
+    * At least one value clears the floor, so the column can actually yield an accepted conditioned
+      rule. A domain of values that are all too thin to be graded is pure search-space inflation.
+    * The domain is small enough that its values could *typically* clear the floor
+      (``distinct x floor <= n_rows``). This is what separates a regime from an identifier: 50
+      distinct values over 100 rows is under the compiler's 64-value ceiling and is not near-unique
+      per row either, yet it is an identifier repeated twice, and expanding it generated a quarter
+      of a million conditions.
+
+    Deliberately NOT ``counts.min() >= floor``: a genuine regime label often carries one rare
+    value -- ``{normal: 80, alert: 39, unknown: 1}`` -- and a single rare stratum is no reason to
+    discard a column whose other values are well populated. The thin stratum's own conditioned
+    rules are still rejected downstream by the support floor, which is where that decision belongs.
+    """
+    if counts.empty or n_rows <= 0:
+        return False
+    floor = _min_condition_value_rows(n_rows, cfg)
+    if int(counts.max()) < floor:
+        return False
+    return int(counts.size) * floor <= n_rows
+
+
+def infer_tabular_profile(
+    frame: pd.DataFrame,
+    discovery_cfg: DiscoveryConfig | None = None,
+) -> pd.DataFrame:
     """Attach conservative generic metadata inferred from common tabular conventions."""
 
     time_index = "timestamp" if "timestamp" in frame.columns else None
@@ -185,19 +217,14 @@ def infer_tabular_profile(frame: pd.DataFrame) -> pd.DataFrame:
             or pd.api.types.is_string_dtype(frame[c])
         ):
             continue
-        # A condition has to name a *regime*, so every value in its domain must carry enough rows to
-        # be evidence.  The precise bar is the evaluator's own condition-support floor: a value that
-        # cannot clear `min_condition_points` rows and `min_condition_fraction` of the table can
-        # never yield an ACCEPTED conditioned rule, so proposing it only inflates the conditioned
-        # search space.  A bounded-domain check alone is not enough -- 50 distinct values over 100
-        # rows is under the compiler's 64-value ceiling and is not "near-unique per row" either, yet
-        # it is an identifier repeated twice, and expanding it generated a quarter of a million
-        # conditions.  Requiring meaningful per-value support subsumes both of those guards.
+        # A condition has to name a *regime*, so its values must be able to carry evidence. The bar
+        # is the evaluator's own condition-support floor, and the shape test lives in
+        # `_is_regime_column`; a bounded-domain check alone is not enough.
         counts = frame[c].value_counts(dropna=True)
         distinct = int(counts.size)
         if distinct < 1 or distinct > _MAX_CONDITION_DOMAIN:
             continue
-        if len(frame) and int(counts.min()) < _min_condition_value_rows(len(frame)):
+        if not _is_regime_column(counts, len(frame), discovery_cfg):
             continue
         conditions.append(c)
     return profile_dataframe(

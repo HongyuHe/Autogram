@@ -127,3 +127,89 @@ def test_member_larger_than_the_anchor_on_a_single_row_is_kept():
     kept = _drop_negligible(frozenset({"d1", "spiky"}), "total", f, zero_tol=1e-4)
 
     assert kept == frozenset({"d1", "spiky"})
+
+
+def test_individually_tiny_members_are_not_dropped_when_they_add_up():
+    """Round-29 review: a per-member bound does not bound the sum of the members removed.
+
+    Six hundred members each under the tolerance contributed 6% of the total between them, which is
+    outside any plausible acceptance band -- yet all of them were canonicalized away.
+    """
+    n_members = 600
+    names = ["total", "real", *[f"m{index}" for index in range(n_members)]]
+    n = 30
+    mat = np.zeros((n, len(names)))
+    mat[:, 1] = 940.0                    # a materially large member, so the group is never emptied
+    for index in range(n_members):
+        mat[:, 2 + index] = 0.1          # 1e-4 of the anchor each, 6% together
+    mat[:, 0] = 1000.0
+    f = Frame(mat, names)
+    members = frozenset(names[1:])
+
+    kept = _drop_negligible(members, "total", f, zero_tol=1e-4)
+
+    # Aggregate contribution is material, so nothing may be canonicalized away -- and the result
+    # must not depend on the "never empty a group" guard rescuing it.
+    assert kept == members
+
+
+def test_exactly_zero_members_are_still_dropped_alongside_material_ones():
+    # The fallback must keep the intended use case working: a structurally-zero member is removable
+    # even when other individually-tiny members are not.
+    names = ["total", "real", "tiny0", "tiny1", "zero"]
+    n = 40
+    mat = np.zeros((n, len(names)))
+    mat[:, 1] = 900.0
+    mat[:, 2] = 0.09                     # individually negligible ...
+    mat[:, 3] = 0.09                     # ... but 0.18 together, over the 0.1 budget
+    mat[:, 4] = 0.0
+    mat[:, 0] = 1000.0
+    f = Frame(mat, names)
+
+    kept = _drop_negligible(
+        frozenset({"real", "tiny0", "tiny1", "zero"}), "total", f, zero_tol=1e-4,
+    )
+
+    assert "zero" not in kept
+    assert kept == frozenset({"real", "tiny0", "tiny1"})
+
+
+def test_member_nonzero_only_where_the_sum_is_ungradeable_is_dropped():
+    """A member that never affects a gradeable row must not split an alias pair.
+
+    The sum is undefined wherever any member is missing, so a member that is non-zero only on those
+    rows provably never changes the relation.
+    """
+    names = ["total", "w", "z"]
+    n = 50
+    mat = np.zeros((n, len(names)))
+    mat[:, 1] = 500.0
+    mat[20:, 1] = np.nan                 # `w` missing on the tail -> the sum is ungradeable there
+    mat[20:, 2] = 900.0                  # `z` is large only where the sum cannot be graded
+    mat[:, 0] = 500.0
+    f = Frame(mat, names)
+
+    kept = _drop_negligible(frozenset({"w", "z"}), "total", f, zero_tol=1e-4)
+
+    assert kept == frozenset({"w"})
+
+
+def test_canonicalize_is_idempotent():
+    for f, sig in (
+        (_frame(), ("ref_sum", ("orig", frozenset({"d1", "d2", "self", "dead"})))),
+        (_bimodal_frame(), ("ref_sum", ("total", frozenset({"d1", "bimodal", "zero"})))),
+    ):
+        once = _canonicalize(sig, f, 1e-4)
+        assert _canonicalize(once, f, 1e-4) == once
+
+    names = ["total", "real", "tiny0", "tiny1", "zero"]
+    n = 30
+    mat = np.zeros((n, len(names)))
+    mat[:, 1] = 900.0
+    mat[:, 2] = 0.09
+    mat[:, 3] = 0.09
+    mat[:, 0] = 1000.0
+    f = Frame(mat, names)
+    sig = ("ref_sum", ("total", frozenset({"real", "tiny0", "tiny1", "zero"})))
+    once = _canonicalize(sig, f, 1e-4)
+    assert _canonicalize(once, f, 1e-4) == once

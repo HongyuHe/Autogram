@@ -898,11 +898,28 @@ def _balanced_null_numeric(
         # null candidate would then be refused for overflowing rather than on its merits, and the
         # false-discovery control would silently become vacuous.
         scale = robust_median(positive) if positive.size else 1.0
-        magnitudes = scale * rng.lognormal(
+        multipliers = rng.lognormal(
             mean=0.0,
             sigma=0.5,
             size=positions.size,
         )
+        # A finite scale is not enough: the lognormal multiplier is unbounded above, so a
+        # ceiling-scale column still generates infinities. Those become missing data, the null
+        # candidates built on them are refused for overflowing rather than judged on their merits,
+        # and the false-discovery control silently goes vacuous. Shrink the scale just enough that
+        # the largest drawn multiplier stays finite; the null's SHAPE (a balanced, sign-symmetric
+        # lognormal spread) is what the control depends on, not its absolute magnitude.
+        largest = float(np.max(multipliers)) if multipliers.size else 1.0
+        if largest > 1.0 and scale > np.finfo(float).max / largest:
+            scale = np.finfo(float).max / largest
+        with np.errstate(over="ignore"):
+            magnitudes = scale * multipliers
+            # The division above can still round up, so halve until the product is finite. This
+            # terminates immediately for every ordinary column and after a couple of steps at the
+            # float64 ceiling.
+            while not np.all(np.isfinite(magnitudes)):
+                scale *= 0.5
+                magnitudes = scale * multipliers
         signs = np.ones(positions.size, dtype=float)
         signs[:positions.size // 2] = -1.0
         if positions.size % 2:
