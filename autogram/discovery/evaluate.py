@@ -19,6 +19,7 @@ from ..dsl.evaluate import (
     _consecutive_window_ends,
     _ordered_groups,
     eval_term,
+    eval_term_overflow,
     ground,
     robust_median,
 )
@@ -328,6 +329,13 @@ class DataOnlyEvaluator:
             support_rejection = self._condition_support_rejection(rule)
             if support_rejection is not None:
                 return support_rejection
+        if isinstance(rule.atom, (A.BooleanDefinition, A.BandDefinition)):
+            # ... and to the same finite-arithmetic guard, for the same reason: a definition marks a
+            # non-finite row invalid, so without this it would be scored on whatever its own
+            # overflow left behind.
+            overflow_rejection = self._definition_overflow_rejection(rule)
+            if overflow_rejection is not None:
+                return overflow_rejection
         if isinstance(rule.atom, A.BooleanDefinition):
             return self._evaluate_boolean_definition(rule)
         if isinstance(rule.atom, A.CategoryDefinition):
@@ -591,17 +599,77 @@ class DataOnlyEvaluator:
         discovery presented with full confidence -- so the candidate is refused outright with a
         reason that names the blow-up rather than being quietly scored on a shrunken population.
         """
-        overflow_points = int(getattr(g, "overflow_points", 0))
-        if overflow_points <= 0:
-            return None
-        fraction = float(getattr(g, "overflow_fraction", 0.0))
-        if fraction <= float(self.cfg.max_overflow_fraction):
+        return self._overflow_reject_if(
+            rule,
+            overflow_points=int(getattr(g, "overflow_points", 0)),
+            graded_points=int(getattr(g, "graded_points", 0)),
+            fraction=float(getattr(g, "overflow_fraction", 0.0)),
+        )
+
+    def _overflow_reject_if(self, rule: A.Rule, *, overflow_points: int,
+                            graded_points: int, fraction: float):
+        if overflow_points <= 0 or fraction <= float(self.cfg.max_overflow_fraction):
             return None
         return self._reject(
             rule,
             "arithmetic overflowed float64 on "
-            f"{overflow_points} of {overflow_points + int(getattr(g, 'graded_points', 0))} "
-            f"grounded rows ({fraction:.3f} of attempted rows)",
+            f"{overflow_points} of {overflow_points + graded_points} grounded rows "
+            f"({fraction:.3f} of attempted rows)",
+        )
+
+    def _definition_overflow_rejection(self, rule: A.Rule):
+        """Apply the same finite-arithmetic guard to a definition, else ``None``.
+
+        Definitions do not go through :func:`ground`; they mark a non-finite row invalid and score
+        the survivors, which is the identical silent-shrink hazard the comparison path had. Every
+        term a definition evaluates -- its target and each bound inside its predicate -- is checked,
+        so a blown-up predicate cannot quietly narrow the population a definition claims to define.
+        """
+        terms = _definition_terms(rule.atom)
+        if not terms:
+            return None
+        frame = self.ds.observed
+        nm = self.ds.name_model
+        condition = (
+            _condition_mask(rule.condition, frame)
+            if rule.condition is not None
+            else None
+        )
+        selected = (
+            np.ones(frame.n_rows, dtype=bool) if condition is None
+            else np.asarray(condition, dtype=bool)
+        )
+        n_selected = int(np.count_nonzero(selected))
+        overflow_points = 0
+        graded_points = 0
+        attempted = 0
+        for binding in enumerate_bindings(rule.binder, nm):
+            binding_overflow = None
+            grounded = True
+            for term in terms:
+                values, overflow = eval_term_overflow(term, rule.binder, binding, frame, nm)
+                if values is None:
+                    grounded = False
+                    break
+                if overflow is not None:
+                    binding_overflow = (
+                        overflow if binding_overflow is None
+                        else (binding_overflow | overflow)
+                    )
+            if not grounded:
+                continue
+            attempted += n_selected
+            if binding_overflow is None:
+                graded_points += n_selected
+                continue
+            blown = int(np.count_nonzero(binding_overflow & selected))
+            overflow_points += blown
+            graded_points += n_selected - blown
+        return self._overflow_reject_if(
+            rule,
+            overflow_points=overflow_points,
+            graded_points=graded_points,
+            fraction=(float(overflow_points) / float(attempted)) if attempted else 0.0,
         )
 
     def _condition_support_rejection(self, rule: A.Rule):
@@ -1087,6 +1155,33 @@ def _fit_proportional(g, frame, nm, cfg):
         evaluation_mask,
         labels[evaluation_mask],
     )
+
+
+def _predicate_terms(predicate: A.Predicate) -> list[A.Term]:
+    """Every numeric term a Boolean predicate evaluates, learned threshold or not."""
+    if isinstance(predicate, A.Bound):
+        return [predicate.term]
+    if isinstance(predicate, A.Sustained):
+        return _predicate_terms(predicate.predicate)
+    if isinstance(predicate, A.Conjunction):
+        out: list[A.Term] = []
+        for item in predicate.predicates:
+            out.extend(_predicate_terms(item))
+        return list(dict.fromkeys(out))
+    return []
+
+
+def _definition_terms(atom) -> list[A.Term]:
+    """Every numeric term a definition evaluates, for the finite-arithmetic guard.
+
+    A category definition reads Boolean context columns rather than evaluating arithmetic, so it
+    contributes no terms and can never overflow.
+    """
+    if isinstance(atom, A.BooleanDefinition):
+        return list(dict.fromkeys([atom.target, *_predicate_terms(atom.predicate)]))
+    if isinstance(atom, A.BandDefinition):
+        return [atom.term]
+    return []
 
 
 def _learned_bounds(predicate: A.Predicate) -> list[A.Bound]:

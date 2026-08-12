@@ -246,3 +246,87 @@ def test_term_cache_charges_both_members_of_a_cached_pair():
 
     assert cache.total_bytes <= 1_024
     assert len(cache) <= 8
+
+
+def _definition_dataset(name: str):
+    """A Boolean target defined by a ratio whose denominator underflows on most rows.
+
+    The predicate is TRUE exactly where the ratio is genuinely large, and the overflowing rows are
+    the ones where the definition would otherwise be scored on nothing at all.
+    """
+    n = 120
+    num = np.full(n, 4.0)
+    den = np.full(n, 1.0)
+    target = np.zeros(n)
+    target[:40] = 1.0
+    num[40:] = 1e300
+    den[40:] = 1e-320          # 1e300 / 1e-320 overflows to +inf
+    df = pd.DataFrame({
+        "target": target.astype(bool),
+        "num": num,
+        "den": den,
+    })
+    return _dataset(df, name)
+
+
+def _definition_rule() -> A.Rule:
+    return A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("target"),
+            A.Bound(A.Div(A.Ref("num"), A.Ref("den")), ">", 2.0),
+        ),
+    )
+
+
+def test_boolean_definition_is_refused_when_its_predicate_overflows():
+    dataset = _definition_dataset("overflow_definition")
+    evaluator = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(hold_rate_threshold=0.62, band_mode="global", seed=0),
+    )
+
+    result = evaluator.evaluate(_definition_rule())
+
+    assert not result.accepted
+    assert "overflow" in result.reason
+
+
+def test_band_definition_is_refused_when_its_term_overflows():
+    df = pd.DataFrame({
+        "num": np.concatenate([np.full(40, 4.0), np.full(80, 1e300)]),
+        "den": np.concatenate([np.full(40, 2.0), np.full(80, 1e-320)]),
+    })
+    dataset = _dataset(df, "overflow_band_definition")
+    rule = A.Rule(
+        "record",
+        A.BandDefinition(A.Div(A.Ref("num"), A.Ref("den")), None),
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(tolerance=0.05, hold_rate_threshold=0.62, band_mode="global", seed=0),
+    ).evaluate(rule)
+
+    assert not result.accepted
+    assert "overflow" in result.reason
+
+
+def test_definition_without_overflow_is_still_evaluated_normally():
+    n = 200
+    rng = np.random.default_rng(3)
+    value = rng.uniform(0.0, 10.0, size=n)
+    df = pd.DataFrame({"target": value > 6.0, "value": value})
+    dataset = _dataset(df, "clean_definition")
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(A.Ref("target"), A.Bound(A.Ref("value"), ">", 6.0)),
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(hold_rate_threshold=0.62, band_mode="global", seed=0),
+    ).evaluate(rule)
+
+    assert "overflow" not in result.reason
+    assert result.accepted

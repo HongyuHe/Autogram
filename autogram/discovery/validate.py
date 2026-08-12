@@ -18,6 +18,7 @@ import pandas as pd
 from ..config import DiscoveryConfig, SearchConfig
 from ..dsl import ast as A
 from ..dsl.binders import enumerate_bindings, resolve_family, resolve_ref
+from ..dsl.evaluate import robust_median
 from ..loader.loader import Dataset, Frame
 from ..schema.spec import RelatedTemplate
 from . import synth as S
@@ -892,7 +893,11 @@ def _balanced_null_numeric(
     else:
         magnitudes = np.abs(source[positions])
         positive = magnitudes[magnitudes > 0.0]
-        scale = float(np.median(positive)) if positive.size else 1.0
+        # ``np.median`` averages the two central values, and that intermediate sum overflows near
+        # the float64 ceiling.  An infinite scale would fill the null column with infinities, every
+        # null candidate would then be refused for overflowing rather than on its merits, and the
+        # false-discovery control would silently become vacuous.
+        scale = robust_median(positive) if positive.size else 1.0
         magnitudes = scale * rng.lognormal(
             mean=0.0,
             sigma=0.5,
