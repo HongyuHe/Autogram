@@ -335,6 +335,9 @@ def _time_vector(frame: Frame, time_index: str) -> np.ndarray:
     return times
 
 
+_MISSING_GROUP = "__missing__"
+
+
 def typed_group_key(label):
     """Identity of a group label that Python's ``==``/hashing does not collapse.
 
@@ -342,10 +345,40 @@ def typed_group_key(label):
     bucketing by the raw label silently merges two genuinely different groups. Merging them here is
     not cosmetic: it lets a stratified subsample drop a group entirely, and a group that is dropped
     cannot fail the per-group gate.
+
+    A missing label is normalised to one sentinel, because ``NaN != NaN``: keeping the raw value
+    would fragment every missing-labelled row into a group of its own, and a group of one is split
+    entirely into the evaluation half where it can neither be fitted nor meaningfully gated.
     """
     if isinstance(label, tuple):
         return ("tuple", tuple(typed_group_key(item) for item in label))
+    if label is None:
+        return ("missing", _MISSING_GROUP)
+    if isinstance(label, float) and label != label:
+        return ("missing", _MISSING_GROUP)
     return (type(label).__name__, label)
+
+
+def typed_sort_key(typed):
+    """Deterministic ordering for typed keys that preserves natural order within a type.
+
+    Sorting by ``str`` alone reorders numerics lexicographically (``"10" < "9"``), and the order
+    partitions are visited in decides the order their contributions are accumulated -- which changes
+    the floating-point total. Ordering by type first and then by the value itself reproduces the
+    natural ordering the previous ``groupby(sort=True)`` produced for a homogeneous column, and
+    falls back to the rendered form only for values that cannot be compared.
+    """
+    if isinstance(typed, tuple) and typed and typed[0] == "tuple":
+        return tuple(typed_sort_key(item) for item in typed[1])
+    kind, value = typed
+    try:
+        if isinstance(value, (bool, int, float)):
+            return (kind, 0, float(value), "")
+        if isinstance(value, str):
+            return (kind, 1, 0.0, value)
+    except (TypeError, ValueError):
+        pass
+    return (kind, 2, 0.0, repr(value))
 
 
 def _ordered_groups(frame: Frame, nm: NameModel):
@@ -723,7 +756,7 @@ def _datetime_ns(values) -> np.ndarray:
 
 
 def _saturating_add_ns(times: np.ndarray, delta_ns: int) -> np.ndarray:
-    """``times + delta_ns`` in nanoseconds, saturating instead of wrapping.
+    """``times + delta_ns`` in nanoseconds -> ``(ends, saturated)``, saturating instead of wrapping.
 
     Timestamps are int64 nanoseconds, and int64 addition WRAPS on overflow: a window that starts
     near ``pd.Timestamp.max`` ends up *before* its own start, so the interval search finds nothing
@@ -734,14 +767,15 @@ def _saturating_add_ns(times: np.ndarray, delta_ns: int) -> np.ndarray:
     limit = np.iinfo(np.int64).max
     delta = int(delta_ns)
     if delta <= 0:
-        return times + delta
+        return times + delta, np.zeros(times.shape, dtype=bool)
     # Compare against ``limit - delta`` rather than computing ``limit - times``: the latter itself
     # overflows for a PRE-EPOCH (negative) timestamp, which reported saturation for every date
     # before 1970 and pushed its window end to the maximum representable instant.
     threshold = limit - delta
+    saturated = times > threshold
     with np.errstate(over="ignore"):
         shifted = times + delta
-    return np.where(times > threshold, limit, shifted)
+    return np.where(saturated, limit, shifted), saturated
 
 
 def _related_key_part(value):
@@ -807,7 +841,10 @@ def _child_partition_index(template, frame: Frame, child):
             buckets.setdefault(key, []).append(position)
         grouped = [
             (key, np.asarray(positions, dtype=int))
-            for key, positions in sorted(buckets.items(), key=lambda item: str(item[0]))
+            for key, positions in sorted(
+                buckets.items(),
+                key=lambda item: tuple(typed_sort_key(part) for part in item[0]),
+            )
         ]
     else:
         grouped = [((), np.arange(len(child), dtype=int))]
@@ -954,7 +991,7 @@ def _related_aggregate(template, frame: Frame):
         if not ordered_parent.size:
             continue
         starts = parent_times[ordered_parent]
-        ends = _saturating_add_ns(starts, window_ns)
+        ends, ends_saturated = _saturating_add_ns(starts, window_ns)
         totals = np.zeros(len(ordered_parent), dtype=float)
         complete = np.ones(len(ordered_parent), dtype=bool)
         any_valid = np.zeros(len(ordered_parent), dtype=bool)
@@ -962,7 +999,14 @@ def _related_aggregate(template, frame: Frame):
         for partition in partitions:
             times = partition["times"]
             interval_starts = np.searchsorted(times, starts, side="left")
-            interval_ends = np.searchsorted(times, ends, side="left")
+            # A saturated window is clamped to the representable ceiling, so its upper bound has
+            # to be inclusive or a reading sitting exactly on the ceiling falls outside a window
+            # that genuinely contains it.
+            interval_ends = np.where(
+                ends_saturated,
+                np.searchsorted(times, ends, side="right"),
+                np.searchsorted(times, ends, side="left"),
+            )
             has_interval = interval_starts < interval_ends
             boundaries = interval_ends - 1
             # A boundary *level* is read as emitted; a counter is carried forward. See
@@ -1095,7 +1139,10 @@ def _span_child_index(template, frame: Frame, child):
             buckets.setdefault(key, []).append(position)
         grouped = [
             (key, np.asarray(positions, dtype=int))
-            for key, positions in sorted(buckets.items(), key=lambda item: str(item[0]))
+            for key, positions in sorted(
+                buckets.items(),
+                key=lambda item: tuple(typed_sort_key(part) for part in item[0]),
+            )
         ]
     else:
         grouped = [((), np.arange(len(child), dtype=int))]
@@ -1170,11 +1217,11 @@ def _span_any(template, frame: Frame, child):
         if not rows.size:
             continue
         starts = parent_times[rows]
-        end_windows = _saturating_add_ns(starts, interval_ns)
-        candidates = np.searchsorted(
-            group["starts"],
-            end_windows,
-            side="left",
+        end_windows, windows_saturated = _saturating_add_ns(starts, interval_ns)
+        candidates = np.where(
+            windows_saturated,
+            np.searchsorted(group["starts"], end_windows, side="right"),
+            np.searchsorted(group["starts"], end_windows, side="left"),
         )
         has_candidate = candidates > 0
         if not np.any(has_candidate):

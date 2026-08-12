@@ -1,6 +1,6 @@
 # GTIB implementation — status and handoff
 
-**Last updated:** end of review round 36.
+**Last updated:** end of review round 37.
 **Branch:** `dev`, pushed to `origin/dev`. The base of this work is commit `3221b4b`; everything since is committed, so `git --no-pager diff 3221b4b..HEAD` shows the whole change and `git --no-pager log 3221b4b..HEAD` explains each step.
 
 This document exists so that another engineer can pick this work up cold. It covers what was built, how it was verified, how the implementation–review loop works, and exactly what is left to do.
@@ -39,7 +39,7 @@ This work is being driven by an iterative adversarial review process. It matters
 5. If `NOT DONE`, remediate and go to step 1.
 6. **Stop condition: two consecutive `DONE` verdicts.**
 
-**Current streak: 0 of 2.** Rounds 28 through 36 all returned `NOT DONE`. Rounds 29-36 found seven, seven, five, two, three, six, four and five Important defects respectively -- every one of them in the *previous* round's remediation. Expect the next round to find something too.
+**Current streak: 0 of 2.** Rounds 28 through 37 all returned `NOT DONE`. Rounds 29-37 found seven, seven, five, two, three, six, four, five and five Important defects respectively -- every one of them in the *previous* round's remediation. Expect the next round to find something too.
 
 **Rules that make the loop work, learned the hard way:**
 
@@ -209,6 +209,36 @@ The four round-28 findings that this document used to list are **all fixed**, to
 thirty-nine further Important defects rounds 29-36 found in that remediation. Read
 `git --no-pager log 3221b4b..HEAD` for the full account; each commit message states the defect, why
 it mattered, and what the fix is.
+
+### 7.1 Open findings from review round 37
+
+Round 37 raised five Important findings. Three are fixed (the two regressions round 36's typed
+identity introduced -- missing labels fragmenting into singleton groups, and partition ordering by
+rendered form changing a floating-point total -- plus saturated windows excluding a reading exactly
+on the representable ceiling). **Two remain open**, both reproduced by the reviewer, neither
+re-derived independently, so reproduce them first:
+
+- **TODO-A — the materialised GTIB join still collapses typed identities.**
+  `autogram/loader/gtib.py` around lines 479-516 and 563-589 uses `groupby`, `astype(str)` and
+  string-keyed lookups, so `True`/`1` merge and `1`/`"1"` collide. The reviewer reports two
+  typed-distinct shards producing materialised `[20, 20]` against streaming `[30, 30]`. That is a
+  streaming-vs-materialised disagreement, which is exactly the class of defect round 27 was about,
+  and the two paths are required to agree. Fix by threading the shared typed key through
+  materialisation and making the generated column names injective.
+
+- **TODO-B — categorical identity is still type-insensitive outside the grouping paths.**
+  `autogram/discovery/loop.py` (~359-361), `autogram/dsl/evaluate.py` (~691-708) and
+  `autogram/discovery/evaluate.py` (~1066-1102) use `pd.unique`, plain equality and membership when
+  profiling condition domains, matching conditions, and scoring categorical definitions. The
+  reviewer reports an enumerable categorical definition accepted at hold rate 1.0 whose
+  type-correct agreement is 2/3. Fix by applying the same typed equality across profiling,
+  validation, enumeration, conditions and definition scoring.
+
+Three Minor findings are also open: `calibrate()` runs an external induction before validating the
+known-count and validation fraction (validate deterministic inputs first); a canonicalisation
+docstring still says approximate removal leaves a sum "unchanged" when it bounds the change by the
+tolerance; and the tier commentary promises *strict* search-space growth where merging can be
+identity-preserving (state non-shrinking growth, or report zero-delta tiers).
 
 What is left:
 

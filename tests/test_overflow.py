@@ -926,12 +926,14 @@ def test_span_window_does_not_wrap_at_the_timestamp_ceiling():
     ceiling = pd_local.Timestamp.max.value
     starts = np.array([ceiling - 1000, ceiling], dtype=np.int64)
 
-    ends = _saturating_add_ns(starts, 10 ** 12)
+    ends, saturated = _saturating_add_ns(starts, 10 ** 12)
+    assert bool(np.all(saturated))
 
     assert np.all(ends >= starts), "the window ended before it started"
     assert np.all(np.isfinite(ends.astype(float)))
     # Ordinary timestamps are untouched.
-    assert int(_saturating_add_ns(np.array([0], dtype=np.int64), 60 * 10 ** 9)[0]) == 60 * 10 ** 9
+    ordinary, ordinary_saturated = _saturating_add_ns(np.array([0], dtype=np.int64), 60 * 10 ** 9)
+    assert int(ordinary[0]) == 60 * 10 ** 9 and not bool(np.any(ordinary_saturated))
 
 
 def test_typed_groups_all_reach_the_evaluation_split():
@@ -1027,6 +1029,48 @@ def test_saturating_add_is_correct_for_pre_epoch_timestamps():
     from autogram.dsl.evaluate import _saturating_add_ns
 
     start = pd_local.Timestamp("1969-12-31 23:59").value
-    end = int(_saturating_add_ns(np.array([start], dtype=np.int64), 60 * 10 ** 9)[0])
+    shifted, saturated = _saturating_add_ns(np.array([start], dtype=np.int64), 60 * 10 ** 9)
+    assert not bool(np.any(saturated)), "a pre-epoch timestamp must not report saturation"
+    end = int(shifted[0])
 
     assert pd_local.Timestamp(end) == pd_local.Timestamp("1970-01-01 00:00:00")
+
+
+def test_missing_group_labels_do_not_fragment_into_singletons():
+    """Round-37 review: ``NaN != NaN``, so a typed identity that keeps it makes every row its own group.
+
+    A group of one is placed entirely in the evaluation half, so it can neither be fitted nor
+    meaningfully gated -- the typed identity that was introduced to stop groups being *merged* would
+    instead shatter them.
+    """
+    from autogram.discovery.evaluate import _typed_label
+    from autogram.dsl.evaluate import typed_group_key
+
+    missing = [float("nan"), float("nan"), None]
+    for identity in (typed_group_key, _typed_label):
+        keys = {identity(value) for value in missing}
+        assert len(keys) == 1, keys
+        assert identity(True) != identity(1)          # the real distinction still holds
+        assert identity((float("nan"), "x")) == identity((None, "x"))
+
+
+def test_partition_order_follows_natural_order_not_string_order():
+    """Round-37 review: partition visit order decides accumulation order, and so the total.
+
+    Sorting typed keys by their rendered form puts ``"10"`` before ``"9"``, which reorders the
+    floating-point accumulation and changes the sum. The order must follow the natural ordering of
+    the values, as the previous ``groupby(sort=True)`` did.
+    """
+    from autogram.dsl.evaluate import typed_group_key, typed_sort_key
+
+    labels = [9, 10, 2]
+    ordered = sorted(labels, key=lambda value: typed_sort_key(typed_group_key(value)))
+    assert ordered == [2, 9, 10]
+
+    mixed = ["b", "a"]
+    assert sorted(mixed, key=lambda v: typed_sort_key(typed_group_key(v))) == ["a", "b"]
+
+    # Types stay grouped, so a mixed column is still deterministically ordered.
+    both = [1, "1", True]
+    keys = [typed_sort_key(typed_group_key(value)) for value in both]
+    assert len(set(keys)) == 3

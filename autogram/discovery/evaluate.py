@@ -157,6 +157,12 @@ def _typed_label(label):
     """
     if isinstance(label, tuple):
         return ("tuple", tuple(_typed_label(item) for item in label))
+    if label is None:
+        return ("missing", "__missing__")
+    if isinstance(label, float) and label != label:
+        # ``NaN != NaN``: keeping the raw value would fragment every missing-labelled row into a
+        # group of its own, and a group of one is split entirely into the evaluation half.
+        return ("missing", "__missing__")
     return (type(label).__name__, label)
 
 
