@@ -327,3 +327,40 @@ print(",".join(sorted(kept)))
         results.add(completed.stdout.strip())
 
     assert len(results) == 1, results
+
+
+def test_member_missing_only_where_a_retained_member_is_also_missing_is_dropped():
+    """Round-31 review: domain preservation must compare masks, not each member to the anchor.
+
+    ``z`` is missing exactly where ``w`` is missing, so the sum is ungradeable on those rows either
+    way and removing ``z`` changes nothing. Requiring ``z`` to be finite wherever the *anchor* is
+    kept it, which split two identically-evaluated sums across the held-out boundary.
+    """
+    names = ["total", "w", "z"]
+    n = 50
+    mat = np.zeros((n, len(names)))
+    mat[:, 0] = 500.0
+    mat[:, 1] = 500.0
+    mat[30:, 1] = np.nan          # `w` missing on the tail -> the sum is ungradeable there
+    mat[:, 2] = 0.0
+    mat[30:, 2] = np.nan          # `z` missing on exactly the same rows
+    f = Frame(mat, names)
+
+    kept = _drop_negligible(frozenset({"w", "z"}), "total", f, zero_tol=1e-4)
+
+    assert kept == frozenset({"w"})
+
+
+def test_stable_row_sum_reports_an_unrepresentable_total_as_infinite():
+    """An aggregate beyond float64 is past any finite budget; it must not crash the run."""
+    from autogram.discovery.known import _stable_row_sum
+
+    columns = {
+        f"m{index}": np.array([1.5e308, 1.0])
+        for index in range(8)
+    }
+
+    total = _stable_row_sum(columns)
+
+    assert np.isinf(total[0])
+    assert total[1] == 8.0

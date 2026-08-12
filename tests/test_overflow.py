@@ -530,3 +530,74 @@ def test_band_support_accounts_for_ungrounded_bindings():
 
     assert half.n_bindings == 1
     assert abs(half.support - 0.5) < 1e-9
+
+
+def test_sustained_definition_overflow_counts_every_tainted_window():
+    """Round-31 review: one blown-up row taints every SUSTAINED window that contains it.
+
+    Counting the source row alone undercounts the population the definition fails to describe, so a
+    single bad row in two hundred passed a 1% cap while ten windows were actually unevaluable.
+    """
+    n = 200
+    window = 10
+    value = np.full(n, 1.0)
+    num = np.full(n, 2.0)
+    den = np.full(n, 1.0)
+    num[50] = 1e300
+    den[50] = 1e-320                        # one overflowing row
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=n, freq="1min"),
+        "consumer_id": ["c0"] * n,
+        "target": (value > 0.5),
+        "num": num,
+        "den": den,
+    })
+    frame = profile_dataframe(
+        df, time_index="timestamp", group_keys=("consumer_id",),
+        temporal_windows=(window,), advanced=True,
+    )
+    dataset, _grammar = build_dataframe_grammar(frame, _base_spec(), name="sustained_overflow")
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("target"),
+            A.Sustained(A.Bound(A.Div(A.Ref("num"), A.Ref("den")), ">", 1.0), window),
+        ),
+    )
+
+    cfg = DiscoveryConfig(hold_rate_threshold=0.62, band_mode="global", seed=0,
+                          max_overflow_fraction=0.01)
+    result = DataOnlyEvaluator(dataset, cfg).evaluate(rule)
+
+    assert not result.accepted
+    assert "overflow" in result.reason
+    # 1/200 is under the 1% cap; the ten tainted windows are not.
+    assert " 10 of " in result.reason
+
+
+def test_proportional_group_keys_do_not_collide_when_stringified():
+    """Round-31 review: distinct group labels that stringify identically must not share a coefficient.
+
+    Keying by ``str(label)`` let group ``1`` and group ``"1"`` collide, so one group's fitted
+    coefficient silently replaced the other's -- and the finite-arithmetic guard then checked the
+    wrong coefficient.
+    """
+    from autogram.discovery.evaluate import _fit_proportional
+    from autogram.dsl.evaluate import ground
+
+    n = 120
+    labels = np.array([1 if index % 2 else "1" for index in range(n)], dtype=object)
+    x = np.full(n, 2.0)
+    y = np.where(labels == 1, 6.0, 20.0)
+    df = pd.DataFrame({"group_id": labels, "x": x, "y": y})
+    frame = profile_dataframe(df, group_keys=("group_id",))
+    dataset, _grammar = build_dataframe_grammar(frame, _base_spec(), name="colliding_groups")
+    rule = A.Rule("record", A.Compare(A.Ref("y"), "~\u221d", A.Ref("x")))
+
+    g = ground(rule, dataset.observed, dataset.name_model)
+    fitted = _fit_proportional(g, dataset.observed, dataset.name_model, DiscoveryConfig(seed=0))
+
+    assert fitted is not None
+    coefficients = fitted[0]
+    assert len(coefficients) == 2, coefficients
+    assert sorted(round(value, 6) for value in coefficients.values()) == [3.0, 10.0]

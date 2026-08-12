@@ -506,8 +506,17 @@ def _stable_row_sum(magnitudes: dict) -> np.ndarray:
         return np.zeros(0, dtype=float)
     ordered = [magnitudes[name] for name in sorted(magnitudes)]
     stacked = np.stack(ordered, axis=0)
+
+    def _row_total(row) -> float:
+        try:
+            return math.fsum(row)
+        except OverflowError:
+            # An aggregate beyond float64 is, by definition, past any finite budget. Reporting it as
+            # infinite keeps the caller's comparison well-defined instead of crashing the run.
+            return float("inf")
+
     return np.fromiter(
-        (math.fsum(row) for row in stacked.T),
+        (_row_total(row) for row in stacked.T),
         dtype=float,
         count=stacked.shape[1],
     )
@@ -542,8 +551,7 @@ def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset
     if zero_tol <= 0.0:
         return frozenset(cols)                       # exact column-set matching requested
     anchor = _col_values(frame, anchor_col)
-    anchor_defined = None if anchor is None else np.isfinite(anchor)
-    if anchor is None or not np.any(anchor_defined & (np.abs(anchor) > 0.0)):
+    if anchor is None or not np.any(np.isfinite(anchor) & (np.abs(anchor) > 0.0)):
         return frozenset(cols)                       # no usable anchor -> do not canonicalize
     members = {}
     for col in sorted(cols):
@@ -558,17 +566,33 @@ def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset
     budget = zero_tol * np.abs(anchor[gradeable])
     candidates = {}
     for col, values in members.items():
-        # Removing a member must not WIDEN the population the relation is graded on. A member that
-        # is itself missing somewhere restricts the sum's domain, so dropping it would hand the
-        # reduced relation rows the original one never had to satisfy -- exactly how
-        # ``total == SUM(real)`` came to be credited as recovering ``total == SUM(real, z)`` while
-        # failing on 90 of 100 rows. Requiring the member to be defined wherever the anchor is
-        # defined makes the domain provably unchanged for any subset removed.
-        if not bool(np.all(np.isfinite(values[anchor_defined]))):
-            continue
         magnitude = np.abs(values[gradeable])
         if bool(np.all(magnitude <= budget)):
             candidates[col] = magnitude
+    # Removing a member must not WIDEN the population the relation is graded on. A member that is
+    # itself missing somewhere restricts the sum's domain, so dropping it would hand the reduced
+    # relation rows the original never had to satisfy -- exactly how ``total == SUM(real)`` came to
+    # be credited with recovering ``total == SUM(real, z)`` while failing on 90 of 100 rows. The
+    # test is on the *resulting* grouping, not on each member against the anchor: a member missing
+    # only where another RETAINED member is missing too changes nothing, and demanding otherwise
+    # would split two identically-evaluated sums across the held-out boundary. Shrinking the removal
+    # set only ever removes constraints, so this fixpoint terminates.
+    while candidates:
+        retained = {
+            col: values for col, values in members.items()
+            if col not in candidates
+        }
+        widened = _shared_gradeable(anchor, retained)
+        if not np.any(widened & ~gradeable):
+            break
+        offenders = [
+            col for col in sorted(candidates)
+            if not bool(np.all(np.isfinite(members[col][widened])))
+        ]
+        if not offenders:
+            break
+        for col in offenders:
+            candidates.pop(col, None)
     if not candidates:
         return frozenset(cols)
     combined = _stable_row_sum(candidates)

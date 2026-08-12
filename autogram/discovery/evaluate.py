@@ -20,6 +20,7 @@ from ..dsl.evaluate import (
     _consecutive_window_ends,
     _ordered_groups,
     _union_overflow,
+    _window_overflow,
     eval_term,
     eval_term_overflow,
     ground,
@@ -428,7 +429,7 @@ class DataOnlyEvaluator:
             scale = np.maximum(scale, floor)
             parameters = {
                 "coefficient": float(robust_median(np.asarray(list(coefficients.values()), dtype=float))),
-                "coefficients": coefficients,
+                "coefficients": _reported_coefficients(coefficients),
             }
             rho = rho[evaluation_mask]
             scale = scale[evaluation_mask]
@@ -645,9 +646,8 @@ class DataOnlyEvaluator:
             return np.full(n_points, largest, dtype=float)
         mapped = np.full(n_points, largest, dtype=float)
         for index, label in enumerate(labels.tolist()):
-            key = str(label) if label != "__global__" else "global"
-            if key in coefficients:
-                mapped[index] = coefficients[key]
+            if label in coefficients:
+                mapped[index] = coefficients[label]
         return mapped
 
     def _overflow_rejection(self, rule: A.Rule, g):
@@ -706,11 +706,15 @@ class DataOnlyEvaluator:
         for binding in enumerate_bindings(rule.binder, nm):
             binding_overflow = None
             grounded = True
-            for term in terms:
+            for term, window in terms:
                 values, overflow = eval_term_overflow(term, rule.binder, binding, frame, nm)
                 if values is None:
                     grounded = False
                     break
+                if overflow is not None and window:
+                    # A sustained predicate reads this term over a trailing window, so the taint
+                    # spreads to every window the blown-up row belongs to.
+                    overflow = _window_overflow(overflow, int(window), frame, nm)
                 if overflow is not None:
                     binding_overflow = (
                         overflow if binding_overflow is None
@@ -1215,8 +1219,11 @@ def _fit_proportional(g, frame, nm, cfg):
             if denom <= 0.0:
                 continue
             coefficient = float(np.dot(fit_right, fit_left) / denom)
-        key = str(label) if label != "__global__" else "global"
-        coefficients[key] = coefficient
+        # Keyed by the RAW group label, not its string form: distinct groups whose labels stringify
+        # identically (``1`` and ``"1"``) would otherwise collide, one group's coefficient would
+        # silently replace the other's, and the finite-arithmetic guard would then check the wrong
+        # coefficient. Stringification happens only when the parameters are reported.
+        coefficients[label] = coefficient
         coefficient_by_point[mask] = coefficient
         evaluation_mask[eval_positions] = True
         evaluation_mask[zero_predictor_positions] = True
@@ -1230,30 +1237,47 @@ def _fit_proportional(g, frame, nm, cfg):
     )
 
 
-def _predicate_terms(predicate: A.Predicate) -> list[A.Term]:
-    """Every numeric term a Boolean predicate evaluates, learned threshold or not."""
+def _reported_coefficients(coefficients: dict) -> dict:
+    """Serialisable view of the per-group coefficients (raw labels -> display keys)."""
+    return {
+        ("global" if label == "__global__" else str(label)): value
+        for label, value in coefficients.items()
+    }
+
+
+def _predicate_terms(predicate: A.Predicate, window=None) -> list[tuple]:
+    """Every numeric term a Boolean predicate evaluates, paired with the window it is read under.
+
+    A ``SUSTAINED`` predicate reads its term over a trailing window, so ONE blown-up row taints
+    every window that contains it. Reporting the raw row count would undercount the population the
+    definition actually fails to describe, which is how a mathematically wrong definition passed a
+    1% overflow cap on a single bad row.
+    """
     if isinstance(predicate, A.Bound):
-        return [predicate.term]
+        return [(predicate.term, window)]
     if isinstance(predicate, A.Sustained):
-        return _predicate_terms(predicate.predicate)
+        return _predicate_terms(predicate.predicate, int(predicate.window))
     if isinstance(predicate, A.Conjunction):
-        out: list[A.Term] = []
+        out: list[tuple] = []
         for item in predicate.predicates:
-            out.extend(_predicate_terms(item))
+            out.extend(_predicate_terms(item, window))
         return list(dict.fromkeys(out))
     return []
 
 
-def _definition_terms(atom) -> list[A.Term]:
-    """Every numeric term a definition evaluates, for the finite-arithmetic guard.
+def _definition_terms(atom) -> list[tuple]:
+    """Every ``(term, window)`` a definition evaluates, for the finite-arithmetic guard.
 
     A category definition reads Boolean context columns rather than evaluating arithmetic, so it
     contributes no terms and can never overflow.
     """
     if isinstance(atom, A.BooleanDefinition):
-        return list(dict.fromkeys([atom.target, *_predicate_terms(atom.predicate)]))
+        return list(dict.fromkeys([
+            (atom.target, None),
+            *_predicate_terms(atom.predicate),
+        ]))
     if isinstance(atom, A.BandDefinition):
-        return [atom.term]
+        return [(atom.term, None)]
     return []
 
 

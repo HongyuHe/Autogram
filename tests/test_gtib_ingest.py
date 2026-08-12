@@ -560,3 +560,79 @@ def test_a_single_fat_value_beside_many_thin_ones_is_not_a_regime():
     )
 
     assert "tag" not in conditions
+
+
+def test_identifier_tail_beside_a_fat_stratum_is_not_a_regime():
+    """Round-31 review: one fat stratum does not license a long identifier tail.
+
+    ``{common: 50, id-0..id-49: 1}`` clears both the "some value is gradeable" and the "eligible
+    values cover most of the table" tests, yet its fifty singletons are an identifier and expanding
+    them projects over a million conditioned variants.
+    """
+    from autogram.loader.gtib import infer_tabular_profile
+
+    labels = np.array(["common"] * 50 + [f"id-{index}" for index in range(50)], dtype=object)
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=labels.size, freq="1min"),
+        "tag": labels,
+        "latency_ms": np.linspace(1.0, 100.0, labels.size),
+    })
+
+    conditions = list(
+        infer_tabular_profile(df).attrs[AUTOGRAM_PROFILE_ATTR]["condition_columns"]
+    )
+
+    assert "tag" not in conditions
+
+
+def test_conditioned_band_definitions_are_counted_against_the_ceiling():
+    """Round-31 review: conditioned band definitions bypassed `max_conditioned_rules` entirely."""
+    import pytest
+
+    from autogram.discovery.propose import EnumerationProposer, SearchSpaceTruncatedError
+    from autogram.dsl.grammar import Grammar
+
+    # A single ref role, so there is no conditionable *comparison* to trip the ceiling: the only
+    # conditioned candidates are the band definitions themselves.
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=",),
+        ref_roles={"record": ("x",)},
+        fam_roles={"record": ()},
+        max_complexity=10,
+        band_enabled=True,
+        conditional_enabled=True,
+        condition_columns={"regime": ("a", "b", "c")},
+        max_conditioned_rules=1,
+    )
+
+    with pytest.raises(SearchSpaceTruncatedError, match="conditioned candidates"):
+        EnumerationProposer(grammar).propose()
+
+
+def test_condition_precount_includes_cross_column_conjunctions():
+    """The pre-count must cover every condition shape it will later materialise."""
+    import pytest
+
+    from autogram.discovery.propose import EnumerationProposer, SearchSpaceTruncatedError
+    from autogram.dsl.grammar import Grammar
+
+    # Two categorical columns of 1000 values each: the per-column equalities alone are only 2000,
+    # but their cross-column conjunctions are ~2,000,000 -- past the trusted ceiling.
+    columns = {
+        "left": tuple(f"l{index}" for index in range(1000)),
+        "right": tuple(f"r{index}" for index in range(1000)),
+    }
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=",),
+        ref_roles={"record": ("x", "y")},
+        fam_roles={"record": ()},
+        max_complexity=10,
+        conditional_enabled=True,
+        condition_columns=columns,
+        max_condition_values=1,
+    )
+
+    with pytest.raises(SearchSpaceTruncatedError, match="condition grammar would enumerate"):
+        EnumerationProposer(grammar).propose()

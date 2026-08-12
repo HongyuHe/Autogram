@@ -316,14 +316,10 @@ class EnumerationProposer:
                     if isinstance(term, A.Ref)
                     and term.role not in set(self.G.booleans_for(binder))
                 ):
+                    # Emitted bare: conditioning happens in one place (`_enumerate`), so every
+                    # conditioned variant -- band definitions included -- is counted against
+                    # `max_conditioned_rules` instead of slipping past it.
                     yield A.Rule(binder, A.BandDefinition(ref, None))
-                    if self.G.conditional_enabled:
-                        for condition in self._conditions():
-                            yield A.Rule(
-                                binder,
-                                A.BandDefinition(ref, None),
-                                condition=condition,
-                            )
             if "~∝" in self.G.ops:
                 refs = [
                     term for term in base_terms
@@ -591,7 +587,7 @@ class EnumerationProposer:
             conditionable = 0
             for raw in self._candidate_rules():
                 if not (
-                    isinstance(raw.atom, A.Compare)
+                    isinstance(raw.atom, (A.Compare, A.BandDefinition))
                     and self._conditional_candidate(raw)
                 ):
                     continue
@@ -607,7 +603,7 @@ class EnumerationProposer:
         for raw in self._candidate_rules():
             variants = [raw]
             if (
-                isinstance(raw.atom, A.Compare)
+                isinstance(raw.atom, (A.Compare, A.BandDefinition))
                 and self.G.conditional_enabled
                 and self._conditional_candidate(raw)
             ):
@@ -806,14 +802,26 @@ class EnumerationProposer:
         # the candidates first and refuse an unbounded grammar rather than exhaust memory.
         import math as _math
 
+        categorical_columns = {
+            column
+            for column, values in self.G.condition_columns.items()
+            if set(values) - {False, True, 0, 1}
+        }
         total = 0
-        for _column, raw_values in ranked:
+        n_simple = 0
+        for column, raw_values in ranked:
             v = len(raw_values)
             if v <= 1:
                 continue
             total += v
+            if column in categorical_columns:
+                n_simple += v
             for subset_size in range(2, min(cap, v - 1) + 1):
                 total += _math.comb(v, subset_size)
+        # The cross-column conjunctions built below are conditions too, and they are quadratic in
+        # the number of simple categorical equalities. Counting only the per-column subsets let
+        # millions of conditions materialise before the ceiling could fire.
+        total += _math.comb(n_simple, 2) if n_simple > 1 else 0
         ceiling = _MAX_CONDITION_CANDIDATES
         if total > ceiling:
             raise SearchSpaceTruncatedError(
@@ -837,11 +845,6 @@ class EnumerationProposer:
                         "in",
                         tuple(sorted(subset, key=str)),
                     ))
-        categorical_columns = {
-            column
-            for column, values in self.G.condition_columns.items()
-            if set(values) - {False, True, 0, 1}
-        }
         simple = [
             condition for condition in out
             if condition.op == "==" and condition.values
@@ -854,6 +857,10 @@ class EnumerationProposer:
 
     def _conditional_candidate(self, rule: A.Rule) -> bool:
         atom = rule.atom
+        # A band definition is conditionable: `x ~band c where regime == A` is a regime-restricted
+        # concentration claim, and it must pass through the same ceiling accounting as the rest.
+        if isinstance(atom, A.BandDefinition):
+            return bool(self.G.band_enabled)
         if not isinstance(atom, A.Compare):
             return False
         # Proportional laws are conditionable.

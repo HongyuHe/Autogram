@@ -175,6 +175,11 @@ def _is_regime_column(counts: pd.Series, n_rows: int, cfg: DiscoveryConfig | Non
       million conditions.
     * The values that clear the floor must cover most of the table, so the column *describes* the
       data rather than labelling a corner of it.
+    * The values that cannot clear the floor must not be numerous.  ``{common: 50, id-0..id-49: 1}``
+      passes both tests above -- one fat stratum covering half the rows -- yet its fifty singleton
+      values are an identifier tail, and expanding them projects over a million conditioned
+      variants.  The bound is again the floor: at most ``n_rows // floor`` strata could each clear
+      it, so a column carrying more thin values than that is not a regime label.
 
     Deliberately NOT ``counts.min() >= floor``, and deliberately not a bound on the domain size
     alone.  A genuine regime label often carries a rare value -- ``{normal: 80, alert: 39,
@@ -189,7 +194,10 @@ def _is_regime_column(counts: pd.Series, n_rows: int, cfg: DiscoveryConfig | Non
     eligible = counts[counts >= floor]
     if eligible.empty:
         return False
-    return int(eligible.sum()) * 2 >= n_rows
+    if int(eligible.sum()) * 2 < n_rows:
+        return False
+    n_thin = int(counts.size) - int(eligible.size)
+    return n_thin <= max(1, n_rows // max(1, floor))
 
 
 def infer_tabular_profile(
