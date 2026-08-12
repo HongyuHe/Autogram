@@ -738,7 +738,7 @@ def test_display_keys_are_injective_for_labels_that_render_alike():
     colliding pair produces two identical keys anyway, and a third group's coefficient vanishes from
     the persisted parameters.
     """
-    from autogram.discovery.evaluate import _display_keys
+    from autogram.discovery.evaluate import _display_keys, _typed_label
 
     for labels in (
         [1, "1", "'1'"],
@@ -746,8 +746,11 @@ def test_display_keys_are_injective_for_labels_that_render_alike():
         [1, 2, 3],
         [(1, "a"), (1, "b")],
         [True, 1, "1"],
+        [(True, "x"), (1, "x")],
     ):
-        keys = _display_keys(labels)
+        typed = [_typed_label(label) for label in labels]
+        assert len(set(typed)) == len(labels), labels        # typed identity keeps them apart
+        keys = _display_keys(typed)
         assert len(set(keys.values())) == len(keys), (labels, keys)
 
 
@@ -857,3 +860,75 @@ def test_definition_taint_is_confined_to_the_binding_that_blew_up():
     assert isinstance(tainted, dict)
     assert list(tainted) == [_binding_key({})]
     assert int(np.count_nonzero(next(iter(tainted.values())))) == 11
+
+
+def test_typed_group_identity_survives_stratified_subsampling():
+    """Round-35 review: a subsample must not drop a group by merging it with another.
+
+    ``True == 1`` and they hash alike, so bucketing by the raw label merged two groups; the merged
+    bucket then contributed one sample and the failing group vanished from the per-group gate.
+    """
+    from autogram.dsl.evaluate import _row_group_keys, _stratified_subsample, typed_group_key
+
+    # A rare typed-distinct group: merged bucketing draws from one pool and misses it, while
+    # typed bucketing is obliged to represent every group.
+    n = 120
+    labels = np.array([True if index < 2 else 1 for index in range(n)], dtype=object)
+    df = pd.DataFrame({
+        "group_id": labels,
+        "x": np.full(n, 2.0),
+        "y": np.where(labels == True, 4.0, 6.0),          # noqa: E712 - typed comparison intended
+    })
+    frame = profile_dataframe(df, group_keys=("group_id",))
+    dataset, _grammar = build_dataframe_grammar(frame, _base_spec(), name="typed_subsample")
+
+    rows = np.arange(n)
+    observed = _row_group_keys(dataset.observed, dataset.name_model, rows)
+    assert observed is not None
+    assert len({typed_group_key(item) for item in observed.tolist()}) == 2
+
+    keep = _stratified_subsample(rows, dataset.observed, dataset.name_model, 4, 0)
+    assert keep is not None
+    kept_groups = {typed_group_key(observed[index]) for index in keep}
+    assert len(kept_groups) == 2, "a typed-distinct group was dropped from the subsample"
+
+
+def test_composite_group_keys_do_not_collapse_across_types():
+    from autogram.discovery.evaluate import _typed_label
+
+    assert _typed_label((True, "x")) != _typed_label((1, "x"))
+    assert _typed_label((1, "x")) == _typed_label((1, "x"))
+    assert _typed_label(((1, True), "y")) != _typed_label(((1, 1), "y"))
+
+
+def test_global_group_sentinel_cannot_collide_with_a_real_label():
+    """A string sentinel reports one group's coefficient under another's name."""
+    from autogram.discovery.evaluate import GLOBAL_GROUP, _reported_coefficients, _typed_label
+
+    coefficients = {
+        _typed_label(GLOBAL_GROUP): 1.0,
+        _typed_label("global"): 2.0,
+        _typed_label("__global__"): 3.0,
+    }
+
+    reported = _reported_coefficients(coefficients)
+
+    assert len(reported) == 3
+    assert reported["global"] == 1.0
+
+
+def test_span_window_does_not_wrap_at_the_timestamp_ceiling():
+    """Round-35 review: int64 timestamps wrap, so a window could end before it starts."""
+    import pandas as pd_local
+
+    from autogram.dsl.evaluate import _saturating_add_ns
+
+    ceiling = pd_local.Timestamp.max.value
+    starts = np.array([ceiling - 1000, ceiling], dtype=np.int64)
+
+    ends = _saturating_add_ns(starts, 10 ** 12)
+
+    assert np.all(ends >= starts), "the window ended before it started"
+    assert np.all(np.isfinite(ends.astype(float)))
+    # Ordinary timestamps are untouched.
+    assert int(_saturating_add_ns(np.array([0], dtype=np.int64), 60 * 10 ** 9)[0]) == 60 * 10 ** 9

@@ -128,6 +128,22 @@ def _group_labels(frame, name_model, row_indices=None):
     return labels
 
 
+class _GlobalGroup:
+    """Sentinel for "the data is not grouped".
+
+    A string sentinel collides with a real group whose label happens to be that string, which then
+    reports one group's coefficient under the other's name.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:                       # pragma: no cover - display only
+        return "global"
+
+
+GLOBAL_GROUP = _GlobalGroup()
+
+
 def _typed_label(label):
     """Identity of a group label that Python's ``==``/hashing does not collapse.
 
@@ -135,12 +151,25 @@ def _typed_label(label):
     merges two genuinely different groups: one group's fitted coefficient replaces the other's, and
     the accepted per-group law can no longer be audited. Qualifying by type keeps them apart while
     leaving the label itself available for display.
+
+    Applied RECURSIVELY through tuples, because a composite group key ``(True, "x")`` and
+    ``(1, "x")`` compare equal and hash alike for exactly the same reason.
     """
+    if isinstance(label, tuple):
+        return ("tuple", tuple(_typed_label(item) for item in label))
     return (type(label).__name__, label)
 
 
+def _untyped_label(typed):
+    """Recover the displayable label from a typed identity."""
+    kind, value = typed
+    if kind == "tuple":
+        return tuple(_untyped_label(item) for item in value)
+    return value
+
+
 def _display_keys(labels) -> dict:
-    """Map raw group labels to collision-free display keys for reporting.
+    """Map TYPED group identities to collision-free display keys for reporting.
 
     Reported parameters are persisted to JSON and to the learned `.dl` portfolio, so they have to
     round-trip the *identity* of a group. Stringifying is lossy: distinct labels ``1`` and ``"1"``
@@ -151,14 +180,15 @@ def _display_keys(labels) -> dict:
     ``"'1'"`` render as ``1``, ``'1'`` and ``'1'``, so a per-label fallback re-collides with a label
     that was never ambiguous to begin with.
     """
-    typed = list(dict.fromkeys(_typed_label(label) for label in labels))
+    typed = list(dict.fromkeys(labels))
+    displayed = [_untyped_label(item) for item in typed]
     for render in (str, repr):
-        keys = [render(label) for _kind, label in typed]
+        keys = [render(label) for label in displayed]
         if len(set(keys)) == len(typed):
             return dict(zip(typed, keys))
     # Neither rendering separates them (``True``/``1`` share both, and two objects can share a
     # repr), so qualify by type and then by position. Injectivity is what the audit trail needs.
-    keys = [f"{kind}:{label!r}" for kind, label in typed]
+    keys = [f"{item[0]}:{label!r}" for item, label in zip(typed, displayed)]
     if len(set(keys)) != len(typed):
         keys = [f"{key}#{index}" for index, key in enumerate(keys)]
     assert len(set(keys)) == len(typed)
@@ -187,7 +217,7 @@ def _group_hold_gate(
     lows = {}
     accepted = True
     ordered_typed = list(dict.fromkeys(_typed_label(item) for item in groups.tolist()))
-    display = _display_keys([label for _kind, label in ordered_typed])
+    display = _display_keys(ordered_typed)
     for typed in ordered_typed:
         label = typed[1]
         mask = np.asarray([
@@ -1244,7 +1274,14 @@ class DataOnlyEvaluator:
         )
         if centre_overflow is not None:
             blown = int(np.count_nonzero(centre_overflow))
-            attempted = max(1, n_bindings * self.ds.observed.n_rows)
+            # Measured against the rows the band was OFFERED under its condition, exactly as the
+            # base guard's `attempted_points` is -- using every frame row instead would divide a
+            # conditioned band's overflow by a population it never claimed.
+            selected_rows = (
+                self.ds.observed.n_rows if condition_mask is None
+                else int(np.count_nonzero(condition_mask))
+            )
+            attempted = max(1, n_bindings * selected_rows)
             rejection = self._overflow_reject_if(
                 rule,
                 overflow_points=blown,
@@ -1258,10 +1295,24 @@ class DataOnlyEvaluator:
                 return self._reject(
                     rule, "band centre overflowed on every evaluated row",
                 )
-            graded_support = (
-                float(int(population.size) - blown)
-                / float(max(1, n_bindings * self.ds.observed.n_rows))
-            ) * (float(n_bindings) / float(n_candidates) if n_candidates else 0.0)
+            graded_points = int(population.size) - blown
+            graded_rows = float(graded_points) / float(
+                max(1, n_bindings * self.ds.observed.n_rows)
+            )
+            graded_support = graded_rows * (
+                float(n_bindings) / float(n_candidates) if n_candidates else 0.0
+            )
+            # A tolerated overflow still shrinks the evidence, so a conditioned band has to clear
+            # the support floor again on what is left of it.
+            if rule.condition is not None and (
+                graded_points < int(self.cfg.min_condition_points)
+                or graded_rows < float(self.cfg.min_condition_fraction)
+            ):
+                return self._reject(
+                    rule,
+                    "condition support below minimum after overflow "
+                    f"({graded_points} points, {graded_rows:.3f} of rows)",
+                )
         observed = population[evaluation_mask]
         scale = np.maximum(np.abs(observed), abs(center))
         positive = scale[scale > 0]
@@ -1332,7 +1383,7 @@ def _fit_proportional(g, frame, nm, cfg):
             for index, values in enumerate(zip(*columns)):
                 labels[index] = tuple(values)
     else:
-        labels = np.full(g.n_points, "__global__", dtype=object)
+        labels = np.full(g.n_points, GLOBAL_GROUP, dtype=object)
 
     coefficients: dict[str, float] = {}
     coefficient_by_point = np.full(g.n_points, np.nan, dtype=float)
@@ -1403,9 +1454,9 @@ def _fit_proportional(g, frame, nm, cfg):
 
 def _reported_coefficients(coefficients: dict) -> dict:
     """Serialisable view of the per-group coefficients (typed labels -> collision-free keys)."""
-    display = _display_keys([label for _kind, label in coefficients])
+    display = _display_keys(coefficients)
     reported = {
-        ("global" if typed[1] == "__global__" else display[typed]): value
+        ("global" if isinstance(typed[1], _GlobalGroup) else display[typed]): value
         for typed, value in coefficients.items()
     }
     assert len(reported) == len(coefficients)

@@ -620,7 +620,7 @@ def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float,
     return kept if kept else frozenset(cols)         # never canonicalize an entire group away
 
 
-def _canonicalize(sig, frame, zero_tol: float, exact: bool = False):
+def _canonicalize(sig, frame, zero_tol: float, exact: bool | None = None):
     """Map a relation signature to a data-canonical form (negligible sum members removed).
 
     Only the sum-shaped signatures carry groupings, so only they are canonicalized; pairwise,
@@ -632,10 +632,15 @@ def _canonicalize(sig, frame, zero_tol: float, exact: bool = False):
     if not isinstance(sig, tuple) or not sig:
         return sig
     if sig[0] == "equality" and len(sig) == 3:
+        # ``exact=None`` means "read the exactness off this signature"; an explicit value is an
+        # OVERRIDE and must win. Deriving it unconditionally made the override inert, so a learned
+        # exact sum could never be canonicalised under the tolerance an approximate known permits
+        # -- and the approximate known it satisfies was reported as unrecovered.
+        resolved = (sig[1] == "exact") if exact is None else bool(exact)
         return (
             sig[0],
             sig[1],
-            _canonicalize(sig[2], frame, zero_tol, exact=sig[1] == "exact"),
+            _canonicalize(sig[2], frame, zero_tol, exact=resolved),
         )
     if sig[0] == "conditional" and len(sig) == 2:
         condition, base = sig[1]
@@ -647,7 +652,12 @@ def _canonicalize(sig, frame, zero_tol: float, exact: bool = False):
         ref_col, cols = sig[1]
         return (
             "ref_sum",
-            (ref_col, _drop_negligible(cols, ref_col, frame, zero_tol, exact=exact)),
+            (
+                ref_col,
+                _drop_negligible(
+                    cols, ref_col, frame, zero_tol, exact=bool(exact),
+                ),
+            ),
         )
     if sig[0] == "agg_ref_balance":
         return (

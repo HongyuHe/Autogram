@@ -387,3 +387,34 @@ def test_exact_zero_member_that_is_missing_elsewhere_is_not_dropped():
     kept = _drop_negligible(frozenset({"real", "z"}), "total", f, zero_tol=1e-4, exact=True)
 
     assert kept == frozenset({"real", "z"})
+
+
+def test_exact_learned_sum_recovers_the_approximate_known_it_satisfies():
+    """Round-35 review: matching must use the tolerance the KNOWN relation permits.
+
+    Canonicalising the learned side by its own exactness left an exact learned
+    ``total == SUM(a, z)`` unmatchable by the approximate known ``total ~= SUM(a)`` it satisfies,
+    reporting recall 0.0 for an invariant the portfolio does contain.
+    """
+    names = ["total", "a", "z"]
+    n = 40
+    mat = np.zeros((n, len(names)))
+    mat[:, 1] = 1000.0
+    mat[:, 2] = 0.05                 # z/total ~ 5e-5, inside the approximate tolerance
+    mat[:, 0] = 1000.05
+    f = Frame(mat, names)
+
+    learned_exact = ("equality", "exact", ("ref_sum", ("total", frozenset({"a", "z"}))))
+    known_approx = ("equality", "approximate", ("ref_sum", ("total", frozenset({"a"}))))
+
+    # Canonicalised under the KNOWN relation's tolerance, the two describe one relation ...
+    assert (
+        _canonicalize(learned_exact, f, 1e-4, exact=False)[2]
+        == _canonicalize(known_approx, f, 1e-4)[2]
+    )
+    # ... while an exact known still refuses to absorb the same member.
+    known_exact = ("equality", "exact", ("ref_sum", ("total", frozenset({"a"}))))
+    assert (
+        _canonicalize(learned_exact, f, 1e-4, exact=True)[2]
+        != _canonicalize(known_exact, f, 1e-4)[2]
+    )

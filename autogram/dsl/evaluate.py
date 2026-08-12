@@ -335,6 +335,19 @@ def _time_vector(frame: Frame, time_index: str) -> np.ndarray:
     return times
 
 
+def typed_group_key(label):
+    """Identity of a group label that Python's ``==``/hashing does not collapse.
+
+    ``True == 1`` and ``hash(True) == hash(1)`` -- and the same holds inside a composite key -- so
+    bucketing by the raw label silently merges two genuinely different groups. Merging them here is
+    not cosmetic: it lets a stratified subsample drop a group entirely, and a group that is dropped
+    cannot fail the per-group gate.
+    """
+    if isinstance(label, tuple):
+        return ("tuple", tuple(typed_group_key(item) for item in label))
+    return (type(label).__name__, label)
+
+
 def _ordered_groups(frame: Frame, nm: NameModel):
     adapter = getattr(nm, "adapter", None)
     time_index = getattr(adapter, "time_index", "")
@@ -352,7 +365,7 @@ def _ordered_groups(frame: Frame, nm: NameModel):
             key = np.asarray(frame.row_context[group_keys[0]], dtype=object)[row]
         else:
             key = tuple(np.asarray(frame.row_context[name], dtype=object)[row] for name in group_keys)
-        groups.setdefault(key, []).append(row)
+        groups.setdefault(typed_group_key(key), []).append(row)
     ordered = []
     for rows in groups.values():
         index = np.asarray(rows, dtype=int)
@@ -508,12 +521,13 @@ def _stratified_subsample(rows: np.ndarray, frame: Frame, nm: NameModel,
     labels = _row_group_keys(frame, nm, rows)
     if labels is None:
         return rng.choice(rows.size, size=subsample, replace=False)
-    unique = list(dict.fromkeys(labels.tolist()))
+    typed = [typed_group_key(label) for label in labels.tolist()]
+    unique = list(dict.fromkeys(typed))
     n_groups = len(unique)
     if subsample < n_groups:
         return None
     index_by_group: dict = {}
-    for idx, label in enumerate(labels.tolist()):
+    for idx, label in enumerate(typed):
         index_by_group.setdefault(label, []).append(idx)
     per_group = max(1, subsample // n_groups)
     keep: list = []
@@ -706,6 +720,25 @@ def _datetime_ns(values) -> np.ndarray:
         .to_numpy(dtype="datetime64[ns]")
         .astype(np.int64)
     )
+
+
+def _saturating_add_ns(times: np.ndarray, delta_ns: int) -> np.ndarray:
+    """``times + delta_ns`` in nanoseconds, saturating instead of wrapping.
+
+    Timestamps are int64 nanoseconds, and int64 addition WRAPS on overflow: a window that starts
+    near ``pd.Timestamp.max`` ends up *before* its own start, so the interval search finds nothing
+    and an event that is active throughout the window reads as absent -- which accepts a false law
+    at a perfect hold rate. Saturating at the int64 maximum keeps the window ordered.
+    """
+    times = np.asarray(times, dtype=np.int64)
+    limit = np.iinfo(np.int64).max
+    delta = int(delta_ns)
+    if delta <= 0:
+        return times + delta
+    room = limit - times
+    with np.errstate(over="ignore"):
+        shifted = times + delta
+    return np.where(room < delta, limit, shifted)
 
 
 def _related_key_part(value):
@@ -906,7 +939,7 @@ def _related_aggregate(template, frame: Frame):
         if not ordered_parent.size:
             continue
         starts = parent_times[ordered_parent]
-        ends = starts + window_ns
+        ends = _saturating_add_ns(starts, window_ns)
         totals = np.zeros(len(ordered_parent), dtype=float)
         complete = np.ones(len(ordered_parent), dtype=bool)
         any_valid = np.zeros(len(ordered_parent), dtype=bool)
@@ -1116,7 +1149,7 @@ def _span_any(template, frame: Frame, child):
         if not rows.size:
             continue
         starts = parent_times[rows]
-        end_windows = starts + interval_ns
+        end_windows = _saturating_add_ns(starts, interval_ns)
         candidates = np.searchsorted(
             group["starts"],
             end_windows,

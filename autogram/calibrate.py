@@ -33,6 +33,7 @@ from .discovery.known import KnownInvariant, abstract_shapes, load_known, recove
 from .discovery.known import _signature as _known_signature
 from .discovery.known import _matching_signatures as _known_matching_signatures
 from .discovery.known import _canonicalize as _known_canonicalize
+from .discovery.known import _candidate_is_exact as _known_is_exact
 from .discovery.loop import (
     build_dataframe_grammar,
     normalize_dataframe_spec,
@@ -398,11 +399,20 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
     ]
     if frame is not None:
         # Canonicalise exactly as `recover_known` does, so two entries it would satisfy with one
-        # rule are grouped together here too.
+        # rule are grouped together here too. Every expansion of an entry is canonicalised under
+        # the tolerance the ENTRY permits, not under its own exactness: `_matching_signatures`
+        # turns an approximate known into an exact candidate, and canonicalising that candidate
+        # strictly would make it unmatchable by the very entry it was derived from -- which is how
+        # an alias pair straddled the split.
         expansions = [
             None if candidates is None
-            else [_known_canonicalize(candidate, frame, zero_tol) for candidate in candidates]
-            for candidates in expansions
+            else [
+                _known_canonicalize(
+                    candidate, frame, zero_tol, exact=_known_is_exact(signature),
+                )
+                for candidate in candidates
+            ]
+            for candidates, signature in zip(expansions, signatures)
         ]
     parent = list(range(len(known)))
 
