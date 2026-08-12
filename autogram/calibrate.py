@@ -785,14 +785,20 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             "between 1 and 500000"
         )
     known = load_known(known_path)
-    split_view = _ColumnScaleView(df)
+    inducer = _make_calibration_inducer(cfg)
+    # Induce the grammar BEFORE the split, purely to learn how the runtime will decode a cell. The
+    # split has to canonicalise known signatures against the same data the runtime frame sees, and
+    # the cell codec is what decides that; assuming the spec default would silently misread a
+    # dataset whose induced codec names a different primary key. The proposal is reused as tier 0,
+    # so this costs no extra induction.
+    initial_spec = induce_spec(list(df.columns), inducer)
+    split_view = _ColumnScaleView(df, primary=initial_spec.cell_codec.primary)
     calib, valid = _split_known(
         known,
         cfg.validation_frac,
         cfg.seed,
         frame=split_view,
     )
-    inducer = _make_calibration_inducer(cfg)
 
     # 1) proxy suite -- a caller-supplied regime is authoritative; otherwise it is derived from the
     #    calibration-split shapes only.  The null control is always included by prepare_proxy_suite.
@@ -870,7 +876,9 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     for ti, caps in enumerate(tiers):
         if iteration_budget is not None and global_iter >= iteration_budget:
             break
-        spec = induce_spec(list(df.columns), inducer)     # (re-)propose the grammar (columns only)
+        # Tier 0 reuses the proposal already made for the split's cell codec; later tiers
+        # (re-)propose the grammar from the columns.
+        spec = initial_spec if ti == 0 else induce_spec(list(df.columns), inducer)
         if ti > 0:
             reinductions += 1
             # Fold the fresh (non-deterministic) proposal back into the accumulated grammar so a

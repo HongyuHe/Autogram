@@ -23,6 +23,7 @@ Supported relation shapes (op / rhs):
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -492,6 +493,26 @@ def _shared_gradeable(anchor: np.ndarray, members: dict) -> np.ndarray:
     return gradeable
 
 
+def _stable_row_sum(magnitudes: dict) -> np.ndarray:
+    """Row-wise sum of per-column magnitudes, in an order that does not depend on hashing.
+
+    Floating-point addition is not associative, so accumulating in ``dict``/``frozenset`` iteration
+    order makes the result depend on string hash randomisation -- and therefore makes the
+    calibration/validation split itself differ between runs on identical input. Summing in
+    name-sorted order is deterministic; ``math.fsum`` then makes each row's total exact, so the
+    aggregate negligibility bound cannot flip on a rounding artefact either.
+    """
+    if not magnitudes:
+        return np.zeros(0, dtype=float)
+    ordered = [magnitudes[name] for name in sorted(magnitudes)]
+    stacked = np.stack(ordered, axis=0)
+    return np.fromiter(
+        (math.fsum(row) for row in stacked.T),
+        dtype=float,
+        count=stacked.shape[1],
+    )
+
+
 def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset:
     """Drop summed columns that provably do not change the sum on any gradeable row.
 
@@ -508,6 +529,10 @@ def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset
       members that are exactly zero everywhere are removed, whose combined contribution is exactly
       zero.  That fallback is also what keeps the transform idempotent -- re-canonicalising the
       reduced grouping removes nothing further.
+    * **Domain-preserving.**  Removal must not widen the population the relation is graded on.  A
+      member that is itself missing somewhere restricts the sum's domain, so dropping it would hand
+      the reduced relation rows the original never had to satisfy; a member is therefore removable
+      only if it is defined wherever the anchor is.
     * **Anchored and dimensionless.**  The bound is a fraction of the reference (left-hand side)
       column's magnitude on the same row, so the test is scale-free and dataset-agnostic.
 
@@ -517,10 +542,11 @@ def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset
     if zero_tol <= 0.0:
         return frozenset(cols)                       # exact column-set matching requested
     anchor = _col_values(frame, anchor_col)
-    if anchor is None or not np.any(np.isfinite(anchor) & (np.abs(anchor) > 0.0)):
+    anchor_defined = None if anchor is None else np.isfinite(anchor)
+    if anchor is None or not np.any(anchor_defined & (np.abs(anchor) > 0.0)):
         return frozenset(cols)                       # no usable anchor -> do not canonicalize
     members = {}
-    for col in cols:
+    for col in sorted(cols):
         values = _col_values(frame, col)
         if values is not None and values.shape == anchor.shape:
             members[col] = values
@@ -530,20 +556,22 @@ def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset
     if not np.any(gradeable):
         return frozenset(cols)
     budget = zero_tol * np.abs(anchor[gradeable])
-    candidates = {
-        col: np.abs(values[gradeable])
-        for col, values in members.items()
-    }
-    candidates = {
-        col: magnitude
-        for col, magnitude in candidates.items()
-        if bool(np.all(magnitude <= budget))
-    }
+    candidates = {}
+    for col, values in members.items():
+        # Removing a member must not WIDEN the population the relation is graded on. A member that
+        # is itself missing somewhere restricts the sum's domain, so dropping it would hand the
+        # reduced relation rows the original one never had to satisfy -- exactly how
+        # ``total == SUM(real)`` came to be credited as recovering ``total == SUM(real, z)`` while
+        # failing on 90 of 100 rows. Requiring the member to be defined wherever the anchor is
+        # defined makes the domain provably unchanged for any subset removed.
+        if not bool(np.all(np.isfinite(values[anchor_defined]))):
+            continue
+        magnitude = np.abs(values[gradeable])
+        if bool(np.all(magnitude <= budget)):
+            candidates[col] = magnitude
     if not candidates:
         return frozenset(cols)
-    combined = np.zeros(int(np.count_nonzero(gradeable)), dtype=float)
-    for magnitude in candidates.values():
-        combined = combined + magnitude
+    combined = _stable_row_sum(candidates)
     if not bool(np.all(combined <= budget)):
         # Aggregate contribution is material: fall back to the members that contribute exactly
         # nothing, which is both sound and stable under re-canonicalisation.

@@ -876,6 +876,14 @@ class _PreparedRuleProposer(EnumerationProposer):
         self._cache = list(rules)
 
 
+# Magnitude envelope for generated null-control columns. A null column is only useful if the
+# candidate grammar can actually be *evaluated* on it, so its values must survive the arithmetic the
+# grammar builds: a degree-2 product of two columns (hence the square root of the float64 maximum)
+# and a bounded additive chain over a handful of terms (hence the divisor). Ordinary data is many
+# orders of magnitude below this, so the cap only ever engages on pathological, ceiling-scale input.
+_NULL_MAGNITUDE_CEILING = float(np.sqrt(np.finfo(float).max)) / 16.0
+
+
 def _balanced_null_numeric(
     values,
     rng,
@@ -903,23 +911,18 @@ def _balanced_null_numeric(
             sigma=0.5,
             size=positions.size,
         )
-        # A finite scale is not enough: the lognormal multiplier is unbounded above, so a
-        # ceiling-scale column still generates infinities. Those become missing data, the null
-        # candidates built on them are refused for overflowing rather than judged on their merits,
-        # and the false-discovery control silently goes vacuous. Shrink the scale just enough that
-        # the largest drawn multiplier stays finite; the null's SHAPE (a balanced, sign-symmetric
-        # lognormal spread) is what the control depends on, not its absolute magnitude.
+        # Finite leaves are not enough. The null control exists to be run through the SAME candidate
+        # grammar as the data -- sums, differences and (at degree 2) products of these columns -- and
+        # at ceiling scale every one of those overflows. The candidates are then refused for
+        # overflowing rather than judged on their merits, and the false-discovery control silently
+        # goes vacuous, which is the one thing the calibration protocol cannot tolerate. Cap the
+        # magnitude at an envelope that survives a degree-2 product and a bounded additive chain;
+        # the null's SHAPE (a balanced, sign-symmetric lognormal spread) is what the control depends
+        # on, not its absolute magnitude, and ordinary data is far below the cap.
         largest = float(np.max(multipliers)) if multipliers.size else 1.0
-        if largest > 1.0 and scale > np.finfo(float).max / largest:
-            scale = np.finfo(float).max / largest
+        scale = min(scale, _NULL_MAGNITUDE_CEILING / max(1.0, largest))
         with np.errstate(over="ignore"):
             magnitudes = scale * multipliers
-            # The division above can still round up, so halve until the product is finite. This
-            # terminates immediately for every ordinary column and after a couple of steps at the
-            # float64 ceiling.
-            while not np.all(np.isfinite(magnitudes)):
-                scale *= 0.5
-                magnitudes = scale * multipliers
         signs = np.ones(positions.size, dtype=float)
         signs[:positions.size // 2] = -1.0
         if positions.size % 2:

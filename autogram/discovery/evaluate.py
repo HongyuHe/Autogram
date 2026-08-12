@@ -392,22 +392,33 @@ class DataOnlyEvaluator:
             # The fitted coefficient introduces arithmetic that `ground()` never saw, so the
             # finite-arithmetic guard has to be re-applied to the POST-FIT residual: a large
             # coefficient can overflow the product or the difference on rows whose operands were
-            # perfectly finite. The check covers every grounded row, not just the evaluation split,
-            # because a blow-up is a failure of the rule's own expression wherever it occurs -- the
-            # holdout split is a scoring mechanism, not a restriction on what the rule claims.
-            with np.errstate(over="ignore", invalid="ignore"):
-                scaled_right = coefficient_by_point * g.right
-            fit_overflow = _union_overflow(
-                _blowup(scaled_right, coefficient_by_point, g.right),
-                _blowup(rho, g.left, scaled_right),
+            # perfectly finite. Three things make the check honest. It runs on the FULL graded
+            # population, not the coreset, because a subsample that happens to miss the blown-up row
+            # would otherwise accept the rule. It covers every grounded row rather than the
+            # evaluation split, because a blow-up is a failure of the rule's own expression wherever
+            # it occurs. And it is measured against the same attempted-row denominator as the base
+            # guard and added to it, so two disjoint sub-cap overflows cannot pass a single cap
+            # between them.
+            full_left = g.full_left if g.full_left is not None else g.left
+            full_right = g.full_right if g.full_right is not None else g.right
+            full_coefficient = self._coefficient_for_points(
+                coefficients, frame, nm, g, full_left.size,
             )
-            if fit_overflow is not None:
-                blown = int(np.count_nonzero(fit_overflow))
-                attempted = int(fit_overflow.size)
+            with np.errstate(over="ignore", invalid="ignore"):
+                full_scaled = full_coefficient * full_right
+                full_rho = full_left - full_scaled
+            fit_overflow = _union_overflow(
+                _blowup(full_scaled, full_coefficient, full_right),
+                _blowup(full_rho, full_left, full_scaled),
+            )
+            fit_blown = 0 if fit_overflow is None else int(np.count_nonzero(fit_overflow))
+            if fit_blown:
+                attempted = int(g.attempted_points) or int(full_left.size)
+                blown = int(g.overflow_points) + fit_blown
                 rejection = self._overflow_reject_if(
                     rule,
                     overflow_points=blown,
-                    graded_points=attempted - blown,
+                    graded_points=max(0, int(g.graded_points) - fit_blown),
                     fraction=(float(blown) / float(attempted)) if attempted else 0.0,
                 )
                 if rejection is not None:
@@ -617,6 +628,27 @@ class DataOnlyEvaluator:
             hold_rate=0.0, hold_rate_lo=0.0, hold_rate_hi=0.0, statistic="hold_rate",
             support=0.0, n_points=0, n_bindings=0, mdl_gain=0.0,
             strictness="reject", descriptor=(rule.binder, rule.length()))
+
+    def _coefficient_for_points(self, coefficients, frame, nm, g, n_points: int):
+        """Map each point of the FULL graded population to its group's fitted coefficient.
+
+        ``_fit_proportional`` returns a coefficient per group aligned to the (possibly subsampled)
+        scoring population.  The finite-arithmetic guard is a universal claim, so it needs the same
+        mapping over every graded row.  When the data is ungrouped, or a group has no fitted
+        coefficient, the largest fitted magnitude is used -- an upper bound, so the guard can only
+        be conservative.
+        """
+        largest = max((abs(value) for value in coefficients.values()), default=0.0)
+        rows = g.full_row_indices if g.full_row_indices is not None else g.row_indices
+        labels = _group_labels(frame, nm, rows) if rows is not None else None
+        if labels is None or labels.size != n_points:
+            return np.full(n_points, largest, dtype=float)
+        mapped = np.full(n_points, largest, dtype=float)
+        for index, label in enumerate(labels.tolist()):
+            key = str(label) if label != "__global__" else "global"
+            if key in coefficients:
+                mapped[index] = coefficients[key]
+        return mapped
 
     def _overflow_rejection(self, rule: A.Rule, g):
         """Refuse a candidate whose own arithmetic exceeded float64, else ``None``.
@@ -1003,7 +1035,9 @@ class DataOnlyEvaluator:
             )
             if condition_mask is None:
                 return self._reject(rule, "band condition could not be grounded")
+        n_candidates = 0
         for binding in enumerate_bindings(rule.binder, self.ds.name_model):
+            n_candidates += 1
             vector = eval_term(
                 rule.atom.term,
                 rule.binder,
@@ -1029,22 +1063,27 @@ class DataOnlyEvaluator:
         )
         # Reported support must describe the rows the band was SCORED on, exactly as
         # ``Grounded.support`` does for comparisons: a band graded on ten finite rows out of a
-        # hundred is not supported by the whole hundred. Measured unconditionally, not only under a
-        # condition, because a non-finite term shrinks the evidence either way.
-        graded_support = float(population.size) / float(
-            max(1, len(values) * self.ds.observed.n_rows)
+        # hundred is not supported by the whole hundred, and neither is one that grounded on half
+        # its bindings. Measured unconditionally, not only under a condition, because a non-finite
+        # term shrinks the evidence either way.
+        n_bindings = len(values)
+        graded_rows = float(population.size) / float(
+            max(1, n_bindings * self.ds.observed.n_rows)
+        )
+        graded_support = graded_rows * (
+            float(n_bindings) / float(n_candidates) if n_candidates else 0.0
         )
         if rule.condition is not None:
             # Measure the floor on the rows the band can actually grade, not on the rows the
             # condition merely selects: non-finite terms shrink the evidence further.
             if (
                 population.size < int(self.cfg.min_condition_points)
-                or graded_support < float(self.cfg.min_condition_fraction)
+                or graded_rows < float(self.cfg.min_condition_fraction)
             ):
                 return self._reject(
                     rule,
                     "condition support below minimum "
-                    f"({population.size} points, {graded_support:.3f} of rows)",
+                    f"({population.size} points, {graded_rows:.3f} of rows)",
                 )
         valid = np.ones(population.size, dtype=bool)
         learned = rule.atom.center is None
@@ -1075,7 +1114,7 @@ class DataOnlyEvaluator:
             op="~band",
             strictness="band",
             complexity=rule.complexity(),
-            n_bindings=1,
+            n_bindings=n_bindings,
             eps=float(self.cfg.tolerance),
         )
         accepted = lo >= threshold
@@ -1105,7 +1144,7 @@ class DataOnlyEvaluator:
             statistic="hold_rate",
             support=graded_support,
             n_points=int(holds.size),
-            n_bindings=1,
+            n_bindings=n_bindings,
             mdl_gain=mdl_gain(rule, float(self.cfg.tolerance), relative),
             strictness="band",
             descriptor=(rule.binder, rule.length()),

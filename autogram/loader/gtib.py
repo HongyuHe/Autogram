@@ -166,28 +166,30 @@ def _min_condition_value_rows(n_rows: int, cfg: DiscoveryConfig | None = None) -
 def _is_regime_column(counts: pd.Series, n_rows: int, cfg: DiscoveryConfig | None = None) -> bool:
     """Does a column's value distribution look like a *regime label* rather than an identifier?
 
-    Two properties are required, and both are read off the evaluator's own condition-support floor
-    rather than a new constant:
+    The bar is read off the evaluator's own condition-support floor rather than a new constant:
 
-    * At least one value clears the floor, so the column can actually yield an accepted conditioned
-      rule. A domain of values that are all too thin to be graded is pure search-space inflation.
-    * The domain is small enough that its values could *typically* clear the floor
-      (``distinct x floor <= n_rows``). This is what separates a regime from an identifier: 50
-      distinct values over 100 rows is under the compiler's 64-value ceiling and is not near-unique
-      per row either, yet it is an identifier repeated twice, and expanding it generated a quarter
-      of a million conditions.
+    * Some value must clear the floor, so the column can actually yield an ACCEPTED conditioned
+      rule.  A domain whose every stratum is too thin to be graded is pure search-space inflation --
+      that is what 50 distinct values over 100 rows is, under the compiler's 64-value ceiling and
+      not near-unique per row, yet an identifier repeated twice that generated a quarter of a
+      million conditions.
+    * The values that clear the floor must cover most of the table, so the column *describes* the
+      data rather than labelling a corner of it.
 
-    Deliberately NOT ``counts.min() >= floor``: a genuine regime label often carries one rare
-    value -- ``{normal: 80, alert: 39, unknown: 1}`` -- and a single rare stratum is no reason to
-    discard a column whose other values are well populated. The thin stratum's own conditioned
-    rules are still rejected downstream by the support floor, which is where that decision belongs.
+    Deliberately NOT ``counts.min() >= floor``, and deliberately not a bound on the domain size
+    alone.  A genuine regime label often carries a rare value -- ``{normal: 80, alert: 39,
+    unknown: 1}`` -- or several small ones beside a dominant stratum -- ``{normal: 50, r0..r4: 10}``
+    -- and a thin stratum is no reason to discard a column whose other values are well populated.
+    The thin strata's own conditioned rules are still rejected downstream by the support floor,
+    which is where that decision belongs.
     """
     if counts.empty or n_rows <= 0:
         return False
     floor = _min_condition_value_rows(n_rows, cfg)
-    if int(counts.max()) < floor:
+    eligible = counts[counts >= floor]
+    if eligible.empty:
         return False
-    return int(counts.size) * floor <= n_rows
+    return int(eligible.sum()) * 2 >= n_rows
 
 
 def infer_tabular_profile(

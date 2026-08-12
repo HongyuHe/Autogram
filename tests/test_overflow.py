@@ -412,9 +412,121 @@ def test_null_control_magnitudes_stay_finite_at_ceiling_scale():
         assert np.all(np.isfinite(generated)), seed
         assert np.any(generated > 0.0) and np.any(generated < 0.0)
 
+    # Finite leaves are not enough: the null control is run through the SAME candidate grammar as
+    # the data, so its sums, differences and degree-2 products must stay finite too. Otherwise every
+    # null candidate is refused for overflowing rather than judged on its merits, and the
+    # false-discovery control silently goes vacuous.
+    left = _balanced_null_numeric(
+        np.full(500, 1.5e308), np.random.default_rng(11), binary=False,
+    )
+    right = _balanced_null_numeric(
+        np.full(500, 1.5e308), np.random.default_rng(12), binary=False,
+    )
+    for combined in (left - right, left + right, left * right):
+        assert np.all(np.isfinite(combined))
+
     # Ordinary data must be untouched by the safeguard.
     ordinary = _balanced_null_numeric(
         np.linspace(1.0, 100.0, 200), np.random.default_rng(1), binary=False,
     )
     assert np.all(np.isfinite(ordinary))
     assert 10.0 < float(np.median(np.abs(ordinary))) < 200.0
+
+
+def test_proportional_overflow_is_caught_even_when_the_subsample_misses_it():
+    """Round-30 review: a coreset must never decide a universal claim.
+
+    With ``subsample`` active, the single overflowing row was dropped from the scoring population
+    and the rule was accepted with coefficient 1e308 and support 1.0, although its own expression
+    overflowed. The guard now reads the full graded population.
+    """
+    n = 400
+    x = np.full(n, 1.0)
+    y = np.full(n, 1e308)
+    x[123] = 10.0                      # 1e308 * 10 overflows once the coefficient is fitted
+    y[123] = 1e308
+    dataset = _dataset(pd.DataFrame({"x": x, "y": y}), "proportional_subsampled")
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.05, hold_rate_threshold=0.62, band_mode="global",
+            seed=0, subsample=50,
+        ),
+    ).evaluate(A.Rule("record", A.Compare(A.Ref("y"), "~\u221d", A.Ref("x"))))
+
+    assert not result.accepted
+    assert "overflow" in result.reason
+
+
+def test_base_and_post_fit_overflow_share_one_cap():
+    """Round-30 review: two disjoint sub-cap overflows must not pass a single cap between them."""
+    n = 100
+    y = np.full(n, 1e308)
+    y2 = np.zeros(n)
+    x = np.full(n, 1.0)
+    y2[:8] = 1e308        # `y + y2` overflows on 8 rows, caught while grounding
+    x[8:16] = 10.0        # `coefficient * x` overflows on 8 more, only after the fit
+    dataset = _dataset(pd.DataFrame({"x": x, "y": y, "y2": y2}), "combined_overflow")
+    rule = A.Rule(
+        "record",
+        A.Compare(A.Add((A.Ref("y"), A.Ref("y2"))), "~\u221d", A.Ref("x")),
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.05, hold_rate_threshold=0.62, band_mode="global", seed=0,
+            max_overflow_fraction=0.10,
+        ),
+    ).evaluate(rule)
+
+    assert not result.accepted
+    # Each source of overflow is 8% on its own -- under the cap -- but they compose to 16%.
+    assert "16 of 100" in result.reason
+
+
+def test_band_support_accounts_for_ungrounded_bindings():
+    """Round-30 review: support must fall when only some bindings ground.
+
+    ``Grounded.support`` multiplies the graded-row fraction by the fraction of bindings that
+    grounded. The band path counted only the rows, so a term resolvable for one binding out of two
+    still reported support 1.0 -- and hard-coded ``n_bindings=1`` besides.
+    """
+    import autogram.discovery.evaluate as E
+
+    df = pd.DataFrame({"m": np.full(60, 5.0)})
+    dataset = _dataset(df, "band_bindings")
+    evaluator = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(tolerance=0.05, hold_rate_threshold=0.62, band_mode="global", seed=0),
+    )
+    rule = A.Rule("record", A.BandDefinition(A.Ref("m"), 5.0))
+
+    grounded = evaluator.evaluate(rule)
+    assert grounded.accepted
+    assert abs(grounded.support - 1.0) < 1e-9
+    assert grounded.n_bindings == 1
+
+    # Offer a second binding whose term does not ground: half the attempted bindings now ground.
+    original_bindings = E.enumerate_bindings
+    original_eval = E.eval_term
+    calls = {"n": 0}
+
+    def _two_bindings(binder, nm):
+        return [{}, {"unused": "second"}]
+
+    def _second_is_out_of_scope(term, binder, binding, frame, nm):
+        calls["n"] += 1
+        return None if calls["n"] == 2 else original_eval(term, binder, binding, frame, nm)
+
+    E.enumerate_bindings = _two_bindings
+    E.eval_term = _second_is_out_of_scope
+    try:
+        half = evaluator.evaluate(rule)
+    finally:
+        E.enumerate_bindings = original_bindings
+        E.eval_term = original_eval
+
+    assert half.n_bindings == 1
+    assert abs(half.support - 0.5) < 1e-9

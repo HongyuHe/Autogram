@@ -49,6 +49,16 @@ class Grounded:
     # evaluator refuses the candidate outright (see ``DiscoveryConfig.max_overflow_fraction``).
     overflow_points: int = 0
     overflow_fraction: float = 0.0
+    # Rows the rule was offered under its condition, across every grounded binding. This is the
+    # denominator every overflow fraction is measured against, including the one a fitted parameter
+    # introduces after grounding, so the separate checks compose into one bound.
+    attempted_points: int = 0
+    # Pre-subsample operands and rows. A coreset is a statistical estimator for the hold rate and
+    # must never decide a universal claim, so a guard over the full graded population (notably the
+    # finite-arithmetic guard on post-fit arithmetic) reads these instead.
+    full_left: np.ndarray | None = None
+    full_right: np.ndarray | None = None
+    full_row_indices: np.ndarray | None = None
     # True only for an atomic sign bound ``x OP 0`` that holds tolerance-free on every grounded row,
     # computed on the FULL population BEFORE any subsampling so a sampled-out violation can never
     # spuriously mark the bound exact.
@@ -293,10 +303,12 @@ def _eval_term_uncached(term: A.Term, binder: str, binding: dict, frame: Frame,
         template = getattr(nm.adapter, "resolve_related", lambda *_: None)(term.role, binder)
         if template is None:
             return None, None
-        joined = _related_aggregate(template, frame)
+        joined, joined_overflow = _related_aggregate(template, frame)
         if joined is None:
             return None, None
-        return joined, _union_overflow(np.isinf(joined))
+        # An infinite result is a blow-up too, but most of them never reach the output: the
+        # aggregation's own validity tests absorb them, which is why the mask is built inside it.
+        return joined, _union_overflow(joined_overflow, np.isinf(joined))
     raise TypeError(f"unknown term {term!r}")
 
 
@@ -584,6 +596,11 @@ def ground(rule: A.Rule, frame: Frame, nm: NameModel,
     # aggregate hold rate and must never decide a universal claim.
     raw_exact_sign = _sign_bound_raw_exact(rule.atom, rho)
     graded_points = int(rho.size)
+    # Keep the pre-subsample operands and rows: a fitted parameter introduces arithmetic this
+    # function never saw, and its finite-arithmetic guard is a UNIVERSAL claim over the graded
+    # population. Checking it on a coreset would let a subsample that happens to miss the blown-up
+    # row accept a rule whose own expression overflows.
+    full_left, full_right, full_rows = left, right, rows
     graded_condition_support = (
         float(graded_points) / float(n_ok * frame.n_rows)
         if n_ok and frame.n_rows
@@ -611,7 +628,10 @@ def ground(rule: A.Rule, frame: Frame, nm: NameModel,
                     graded_points=graded_points,
                     graded_condition_support=graded_condition_support,
                     overflow_points=overflow_points,
-                    overflow_fraction=overflow_fraction)
+                    overflow_fraction=overflow_fraction,
+                    attempted_points=attempted_points,
+                    full_left=full_left, full_right=full_right,
+                    full_row_indices=full_rows)
 
 
 def rel_residual(g: Grounded) -> np.ndarray:
@@ -809,21 +829,33 @@ def _partition_reset_prefix(partition: dict, child, column: str) -> np.ndarray:
 
 
 def _related_aggregate(template, frame: Frame):
+    """Cross-grain aggregate for one role -> ``(values, overflow)``.
+
+    The overflow mask is produced INSIDE the aggregation rather than inferred from the finiteness of
+    the result. A counter difference that exceeds float64 is a blow-up of this aggregation's own
+    arithmetic, but the surrounding validity test would mark that shard invalid and let it
+    contribute zero, so the total came out finite and complete-looking while silently under-counting
+    -- and a false cross-grain law was accepted at hold rate and support 1.0.
+    """
     cache_key = (template.binder, template.role)
     if cache_key in frame.related_cache:
-        return frame.related_cache[cache_key].copy()
+        cached_values, cached_overflow = frame.related_cache[cache_key]
+        return (
+            cached_values.copy(),
+            None if cached_overflow is None else cached_overflow.copy(),
+        )
     child = frame.relations.get(template.relation)
     if child is None:
-        return None
+        return None, None
     if template.mode == "span_any":
         output = _span_any(template, frame, child)
         if output is not None:
-            frame.related_cache[cache_key] = output
-            return output.copy()
-        return None
+            frame.related_cache[cache_key] = (output, None)
+            return output.copy(), None
+        return None, None
     required_parent = {*template.parent_keys, template.parent_time}
     if any(column not in frame.row_context for column in required_parent):
-        return None
+        return None, None
     required_child = {
         *template.child_keys,
         *template.partition_keys,
@@ -834,11 +866,12 @@ def _related_aggregate(template, frame: Frame):
     if template.reset_column:
         required_child.add(template.reset_column)
     if any(column not in child.columns for column in required_child):
-        return None
+        return None, None
 
     parent_times, parent_groups = _parent_time_index(template, frame)
     child_partitions = _child_partition_index(template, frame, child)
     output = np.full(frame.n_rows, np.nan, dtype=float)
+    overflow = np.zeros(frame.n_rows, dtype=bool)
     window_ns = int(pd.Timedelta(seconds=int(template.window_seconds)).value)
     fill_columns = tuple(dict.fromkeys(
         (template.column, *template.validity_columns)
@@ -861,6 +894,7 @@ def _related_aggregate(template, frame: Frame):
         totals = np.zeros(len(ordered_parent), dtype=float)
         complete = np.ones(len(ordered_parent), dtype=bool)
         any_valid = np.zeros(len(ordered_parent), dtype=bool)
+        blown = np.zeros(len(ordered_parent), dtype=bool)
         for partition in partitions:
             times = partition["times"]
             interval_starts = np.searchsorted(times, starts, side="left")
@@ -889,7 +923,10 @@ def _related_aggregate(template, frame: Frame):
                 # then looked complete while quietly under-counting.
                 complete &= partition_valid
                 any_valid |= partition_valid
-                totals += contribution
+                with np.errstate(over="ignore", invalid="ignore"):
+                    accumulated = totals + contribution
+                blown |= np.isinf(accumulated) & np.isfinite(totals) & np.isfinite(contribution)
+                totals = accumulated
                 continue
             prior_boundaries = (
                 np.searchsorted(times, starts, side="left") - 1
@@ -914,16 +951,29 @@ def _related_aggregate(template, frame: Frame):
                     prefix[interval_ends[active]]
                     - prefix[interval_starts[active]]
                 ) == 0
+            active_blown = np.zeros(len(active), dtype=bool)
             for column in template.validity_columns:
-                delta = (
-                    values[column][boundaries[active]]
-                    - values[column][prior_boundaries[active]]
+                end_values = values[column][boundaries[active]]
+                start_values = values[column][prior_boundaries[active]]
+                with np.errstate(over="ignore", invalid="ignore"):
+                    delta = end_values - start_values
+                active_blown |= (
+                    np.isinf(delta)
+                    & np.isfinite(end_values)
+                    & np.isfinite(start_values)
                 )
                 valid &= np.isfinite(delta) & (delta >= 0.0)
-            delta = (
-                values[template.column][boundaries[active]]
-                - values[template.column][prior_boundaries[active]]
+            end_values = values[template.column][boundaries[active]]
+            start_values = values[template.column][prior_boundaries[active]]
+            with np.errstate(over="ignore", invalid="ignore"):
+                delta = end_values - start_values
+            # An infinite difference of two FINITE readings is this aggregation's own arithmetic
+            # blowing up, not a missing reading. Marking the shard invalid would let it contribute
+            # zero to a total that then looks complete.
+            active_blown |= (
+                np.isinf(delta) & np.isfinite(end_values) & np.isfinite(start_values)
             )
+            blown[active[active_blown]] = True
             valid &= np.isfinite(delta) & (delta >= 0.0)
             rows = active[valid]
             partition_valid[rows] = True
@@ -937,12 +987,20 @@ def _related_aggregate(template, frame: Frame):
             # branch is all-or-nothing.
             complete &= coverage
             any_valid |= partition_valid
-            totals += contribution
+            with np.errstate(over="ignore", invalid="ignore"):
+                accumulated = totals + contribution
+            blown |= np.isinf(accumulated) & np.isfinite(totals) & np.isfinite(contribution)
+            totals = accumulated
         accepted = complete & any_valid
         output[ordered_parent[accepted]] = totals[accepted]
+        overflow[ordered_parent[blown]] = True
 
-    frame.related_cache[cache_key] = output
-    return output.copy()
+    result_overflow = overflow if overflow.any() else None
+    frame.related_cache[cache_key] = (output, result_overflow)
+    return (
+        output.copy(),
+        None if result_overflow is None else result_overflow.copy(),
+    )
 
 
 def _span_child_index(template, frame: Frame, child):

@@ -517,3 +517,46 @@ def test_regime_test_uses_the_supplied_discovery_config():
 
     assert "bucket" not in default_conditions      # 6 rows per value is below the default floor
     assert "bucket" in relaxed_conditions          # ... but clears an explicitly lowered one
+
+
+def test_skewed_regime_with_several_small_strata_is_still_inferred():
+    """Round-30 review: a dominant stratum beside several small ones is still a regime.
+
+    ``{normal: 50, r0..r4: 10}`` over 100 rows was rejected by a domain-size shape test, although
+    `normal` alone supplies fifty gradeable conditioned rows.
+    """
+    from autogram.loader.gtib import infer_tabular_profile
+
+    labels = np.array(["normal"] * 50 + sum(([f"r{i}"] * 10 for i in range(5)), []), dtype=object)
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=labels.size, freq="1min"),
+        "mode": labels,
+        "latency_ms": np.linspace(1.0, 100.0, labels.size),
+    })
+
+    conditions = list(
+        infer_tabular_profile(df).attrs[AUTOGRAM_PROFILE_ATTR]["condition_columns"]
+    )
+
+    assert "mode" in conditions
+
+
+def test_a_single_fat_value_beside_many_thin_ones_is_not_a_regime():
+    """A column that only *describes* a corner of the table is not a regime label."""
+    from autogram.loader.gtib import infer_tabular_profile
+
+    n = 600
+    labels = np.array(
+        ["hot"] * 200 + [f"id-{index}" for index in range(400)], dtype=object,
+    )
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=n, freq="1min"),
+        "tag": labels,
+        "latency_ms": np.linspace(1.0, 100.0, n),
+    })
+
+    conditions = list(
+        infer_tabular_profile(df).attrs[AUTOGRAM_PROFILE_ATTR]["condition_columns"]
+    )
+
+    assert "tag" not in conditions

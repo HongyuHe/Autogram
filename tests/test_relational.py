@@ -19,7 +19,7 @@ from autogram.dsl import ast as A
 from autogram.dsl.evaluate import eval_term
 from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
-from autogram.loader.gtib import AUTOGRAM_PROFILE_ATTR, prepare_gtib
+from autogram.loader.gtib import AUTOGRAM_PROFILE_ATTR, prepare_gtib, profile_dataframe
 from autogram.logic.solver import atom_expr
 from autogram.schema.spec import (
     CellCodec,
@@ -657,3 +657,64 @@ def test_materialized_and_streaming_increments_agree_on_every_awkward_minute():
     assert _same(joined, fast), (joined, fast)
     assert np.isnan(joined[1]) and np.isnan(joined[2]), joined
 
+
+
+def test_related_delta_overflow_is_reported_not_absorbed_as_invalidity():
+    """Round-30 review: a counter difference that blows up must not silently contribute zero.
+
+    ``valid &= np.isfinite(delta)`` treats an overflowed increment exactly like a missing reading,
+    so the shard drops out of the sum and the total looks complete while under-counting -- and a
+    false cross-grain law is then accepted at hold rate and support 1.0. The overflow has to be
+    tracked inside the aggregation, because it never reaches the output to be inferred from.
+    """
+    from autogram.dsl.evaluate import _related_aggregate
+
+    timestamps = pd.date_range("2026-01-01", periods=18, freq="10s")
+    frames = []
+    for shard in ("s0", "s1"):
+        counter = np.cumsum(np.full(18, 10.0))
+        if shard == "s1":
+            # Two finite readings whose difference exceeds float64 across the window.
+            counter = np.where(np.arange(18) < 7, -1.5e308, 1.5e308)
+        frames.append(pd.DataFrame({
+            "timestamp": timestamps,
+            "shard_id": shard,
+            "counter": counter,
+            "reset_flag": False,
+        }))
+    raw = pd.concat(frames, ignore_index=True)
+
+    parent = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01 00:01:00", periods=2, freq="1min"),
+        "consumer_id": ["c0", "c0"],
+        "total": [1.0, 1.0],
+    })
+    frame = profile_dataframe(
+        parent,
+        time_index="timestamp",
+        group_keys=("consumer_id",),
+        related_frames={"raw": raw},
+    )
+    dataset, _grammar = build_dataframe_grammar(frame, _base_spec(), name="overflowing_related")
+    template = RelatedTemplate(
+        binder="record",
+        role="raw_counter_delta",
+        relation="raw",
+        column="counter",
+        mode="sum_delta",
+        parent_keys=(),
+        child_keys=(),
+        partition_keys=("shard_id",),
+        parent_time="timestamp",
+        child_time="timestamp",
+        window_seconds=60,
+        reset_column="reset_flag",
+        validity_columns=(),
+    )
+
+    values, overflow = _related_aggregate(template, dataset.observed)
+
+    assert overflow is not None
+    assert bool(np.any(overflow)), "the blown-up shard was absorbed as mere invalidity"
+    # The overflow is invisible in the output: the shard was dropped, so the total stayed finite.
+    assert np.all(np.isfinite(values[~np.isnan(values)]))
