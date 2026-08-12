@@ -735,10 +735,13 @@ def _saturating_add_ns(times: np.ndarray, delta_ns: int) -> np.ndarray:
     delta = int(delta_ns)
     if delta <= 0:
         return times + delta
-    room = limit - times
+    # Compare against ``limit - delta`` rather than computing ``limit - times``: the latter itself
+    # overflows for a PRE-EPOCH (negative) timestamp, which reported saturation for every date
+    # before 1970 and pushed its window end to the maximum representable instant.
+    threshold = limit - delta
     with np.errstate(over="ignore"):
         shifted = times + delta
-    return np.where(room < delta, limit, shifted)
+    return np.where(times > threshold, limit, shifted)
 
 
 def _related_key_part(value):
@@ -762,7 +765,10 @@ def _parent_time_index(template, frame: Frame):
     ]
     groups: dict[tuple, list[int]] = {}
     for row in range(frame.n_rows):
-        key = tuple(_related_key_part(array[row]) for array in key_arrays)
+        key = tuple(
+            typed_group_key(_related_key_part(array[row]))
+            for array in key_arrays
+        )
         groups.setdefault(key, []).append(row)
     indexed = (parent_times, groups)
     frame.related_index_cache[cache_key] = indexed
@@ -784,25 +790,30 @@ def _child_partition_index(template, frame: Frame, child):
         (*template.child_keys, *template.partition_keys)
     ))
     if group_columns:
-        grouped = child.groupby(
-            list(group_columns),
-            sort=True,
-            observed=True,
-            dropna=False,
-        ).indices.items()
+        # Row-wise on the TYPED identity rather than ``groupby``: pandas merges ``True`` with ``1``
+        # (they are equal and hash alike), which silently joins two genuinely different shards and
+        # sums their readings together. Grouping here has to agree with the parent index, so both
+        # sides use the same typed key.
+        columns = [
+            np.asarray(child[column].to_numpy(), dtype=object)
+            for column in group_columns
+        ]
+        buckets: dict[tuple, list[int]] = {}
+        for position in range(len(child)):
+            key = tuple(
+                typed_group_key(_related_key_part(column[position]))
+                for column in columns
+            )
+            buckets.setdefault(key, []).append(position)
+        grouped = [
+            (key, np.asarray(positions, dtype=int))
+            for key, positions in sorted(buckets.items(), key=lambda item: str(item[0]))
+        ]
     else:
         grouped = [((), np.arange(len(child), dtype=int))]
     by_parent: dict[tuple, list[dict]] = {}
     for raw_key, raw_positions in grouped:
-        values = (
-            (raw_key,)
-            if len(group_columns) == 1
-            else tuple(raw_key)
-        )
-        parent_key = tuple(
-            _related_key_part(value)
-            for value in values[:len(template.child_keys)]
-        )
+        parent_key = tuple(raw_key[:len(template.child_keys)])
         positions = np.asarray(raw_positions, dtype=int)
         times = child_times[positions]
         present = times != _NAT_NS
@@ -835,6 +846,10 @@ def _partition_values(partition: dict, child, column: str, forward_fill: bool = 
             child.iloc[partition["positions"]][column],
             errors="coerce",
         )
+        # A non-finite reading is missing data everywhere else in the engine, and forward fill only
+        # carries ``NaN`` -- so an infinity left in place would be treated as a real reading, and
+        # the increment it feeds would silently under-count the counter it stands in for.
+        values = values.mask(~np.isfinite(values.to_numpy(dtype=float)))
         if forward_fill:
             values = values.ffill()
         partition["values"][key] = values.to_numpy(dtype=float)
@@ -1065,22 +1080,28 @@ def _span_child_index(template, frame: Frame, child):
     starts = _datetime_ns(child[template.span_start])
     ends = _datetime_ns(child[template.span_end])
     if template.child_keys:
-        grouped = child.groupby(
-            list(template.child_keys),
-            sort=True,
-            observed=True,
-            dropna=False,
-        ).indices.items()
+        # Row-wise on the typed identity, for the same reason as the partition index: ``groupby``
+        # merges ``True`` with ``1`` before the key is ever seen, joining two different children.
+        columns = [
+            np.asarray(child[column].to_numpy(), dtype=object)
+            for column in template.child_keys
+        ]
+        buckets: dict[tuple, list[int]] = {}
+        for position in range(len(child)):
+            key = tuple(
+                typed_group_key(_related_key_part(column[position]))
+                for column in columns
+            )
+            buckets.setdefault(key, []).append(position)
+        grouped = [
+            (key, np.asarray(positions, dtype=int))
+            for key, positions in sorted(buckets.items(), key=lambda item: str(item[0]))
+        ]
     else:
         grouped = [((), np.arange(len(child), dtype=int))]
     groups = {}
     for raw_key, raw_positions in grouped:
-        values = (
-            (raw_key,)
-            if len(template.child_keys) == 1
-            else tuple(raw_key)
-        )
-        parent_key = tuple(_related_key_part(value) for value in values)
+        parent_key = tuple(raw_key)
         positions = np.asarray(raw_positions, dtype=int)
         group_starts = starts[positions]
         group_ends = ends[positions]

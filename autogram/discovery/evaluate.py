@@ -1733,14 +1733,19 @@ def _parameter_masks(
             return empty, empty
         fit = np.zeros(valid.size, dtype=bool)
         evaluation = np.zeros(valid.size, dtype=bool)
+        # Typed identity again: a raw split can merge two groups and leave one of them entirely out
+        # of the evaluation half, where it can no longer fail the per-group gate.
+        typed_groups = [_typed_label(item) for item in groups.tolist()]
+        typed_array = np.empty(len(typed_groups), dtype=object)
+        typed_array[:] = typed_groups
         for group_index, label in enumerate(
-            dict.fromkeys(groups[valid].tolist())
+            dict.fromkeys(typed_array[valid].tolist())
         ):
             indices = np.flatnonzero(
                 valid
                 & np.asarray([
                     item == label
-                    for item in groups
+                    for item in typed_groups
                 ], dtype=bool)
             )
             if indices.size == 1:

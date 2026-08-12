@@ -524,7 +524,7 @@ def _stable_row_sum(magnitudes: dict) -> np.ndarray:
 
 def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float,
                      exact: bool = False) -> frozenset:
-    """Drop summed columns that provably do not change the sum on any gradeable row.
+    """Drop summed columns that do not materially change the sum on any gradeable row.
 
     Two groupings that differ only by such columns describe the *same* physical fact, which is what
     licenses treating them as one relation.  Three properties make that licence sound:
@@ -541,8 +541,10 @@ def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float,
       reduced grouping removes nothing further.
     * **Domain-preserving.**  Removal must not widen the population the relation is graded on.  A
       member that is itself missing somewhere restricts the sum's domain, so dropping it would hand
-      the reduced relation rows the original never had to satisfy; a member is therefore removable
-      only if it is defined wherever the anchor is.
+      the reduced relation rows the original never had to satisfy.  The test is collective, not
+      per member: a member missing only where another RETAINED member is missing too changes
+      nothing, so the check compares the original and post-removal gradeability masks and shrinks
+      the removal set to a fixpoint.
     * **Anchored and dimensionless.**  The bound is a fraction of the reference (left-hand side)
       column's magnitude on the same row, so the test is scale-free and dataset-agnostic.
 
@@ -725,10 +727,19 @@ def _matching_signatures(sig):
 
 
 def _candidate_is_exact(candidate) -> bool:
-    """Does this known-signature candidate assert an EXACT relation?"""
+    """Does this known-signature candidate assert an EXACT relation?
+
+    Recurses through ``conditional`` nesting: a conditioned exact equality is still exact, and
+    reading only the outer shape canonicalised it with an approximate tolerance -- which matched a
+    conditioned exact known against a learned sum it is false against on every applicable row.
+    """
+    if not isinstance(candidate, tuple) or not candidate:
+        return False
+    if candidate[0] == "conditional" and len(candidate) == 2:
+        _condition, base = candidate[1]
+        return _candidate_is_exact(base)
     return (
-        isinstance(candidate, tuple)
-        and len(candidate) == 3
+        len(candidate) == 3
         and candidate[0] == "equality"
         and candidate[1] == "exact"
     )

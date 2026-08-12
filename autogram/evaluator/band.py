@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ..dsl.evaluate import typed_group_key
+
 
 def violation_magnitude(op: str, rho: np.ndarray, s: np.ndarray) -> np.ndarray:
     """Per-point, dimensionless deviation that the band must cover.
@@ -45,10 +47,14 @@ def _split(n: int, holdout_frac: float, seed: int):
 def _grouped_split(groups: np.ndarray, holdout_frac: float, seed: int):
     calibration = []
     evaluation = []
-    for group_index, label in enumerate(dict.fromkeys(groups.tolist())):
+    # Bucketed by TYPED identity: ``True == 1`` and they hash alike, so raw bucketing merges two
+    # genuinely different groups and the merged split can leave one of them out of the evaluation
+    # half entirely -- a group that never reaches evaluation cannot fail the per-group gate.
+    typed = [typed_group_key(item) for item in groups.tolist()]
+    for group_index, label in enumerate(dict.fromkeys(typed)):
         positions = np.flatnonzero(np.asarray([
             item == label
-            for item in groups
+            for item in typed
         ], dtype=bool))
         if positions.size == 1:
             evaluation.append(int(positions[0]))

@@ -932,3 +932,101 @@ def test_span_window_does_not_wrap_at_the_timestamp_ceiling():
     assert np.all(np.isfinite(ends.astype(float)))
     # Ordinary timestamps are untouched.
     assert int(_saturating_add_ns(np.array([0], dtype=np.int64), 60 * 10 ** 9)[0]) == 60 * 10 ** 9
+
+
+def test_typed_groups_all_reach_the_evaluation_split():
+    """Round-36 review: a grouped holdout split must represent every typed-distinct group.
+
+    Raw bucketing merged ``True`` with ``1``, and the merged split left the failing rows entirely
+    out of the evaluation half -- where they could no longer fail the per-group gate, so a false
+    law was accepted at hold rate 1.0.
+    """
+    from autogram.discovery.evaluate import _parameter_masks
+    from autogram.evaluator.band import _grouped_split
+
+    n = 120
+    labels = np.array([True if index < 2 else 1 for index in range(n)], dtype=object)
+
+    _calibration, evaluation = _grouped_split(labels, 0.3, 0)
+    evaluated = {bool(labels[index]) is True and isinstance(labels[index], bool)
+                 for index in evaluation}
+    assert any(isinstance(labels[index], bool) for index in evaluation), (
+        "the rare typed group never reached the band's evaluation split"
+    )
+    assert evaluated  # both renderings present
+
+    valid = np.ones(n, dtype=bool)
+    cfg = DiscoveryConfig(parameter_holdout_frac=0.3, seed=0)
+    _fit_mask, eval_mask = _parameter_masks(valid, cfg, split=True, groups=labels)
+    assert any(
+        isinstance(labels[index], bool)
+        for index in np.flatnonzero(eval_mask)
+    ), "the rare typed group never reached the definition's evaluation split"
+
+
+def test_related_join_keeps_typed_distinct_keys_apart():
+    """Round-36 review: pandas groupby merges ``True`` with ``1`` before the key is ever seen."""
+    from autogram.dsl.evaluate import _related_aggregate
+    from autogram.schema.spec import RelatedTemplate
+
+    timestamps = pd.date_range("2026-01-01", periods=6, freq="10s")
+    n = len(timestamps)
+    # Built as an object column element-wise: `pd.concat` would coerce `True` to `1` before the
+    # engine ever sees the two shards as distinct.
+    shard_ids = np.empty(2 * n, dtype=object)
+    shard_ids[:n] = True
+    shard_ids[n:] = 1
+    raw = pd.DataFrame({
+        "timestamp": list(timestamps) * 2,
+        "shard_id": shard_ids,
+        "level": np.concatenate([np.full(n, 10.0), np.full(n, 20.0)]),
+    })
+    assert {type(value).__name__ for value in raw["shard_id"]} == {"bool", "int"}
+
+    parent = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01 00:00:00", periods=2, freq="1min"),
+        "consumer_id": ["c0", "c0"],
+        "total": [1.0, 1.0],
+    })
+    frame = profile_dataframe(
+        parent, time_index="timestamp", group_keys=("consumer_id",),
+        related_frames={"raw": raw},
+    )
+    dataset, _grammar = build_dataframe_grammar(frame, _base_spec(), name="typed_related")
+    template = RelatedTemplate(
+        binder="record", role="raw_level", relation="raw", column="level",
+        mode="sum_last", parent_keys=(), child_keys=(), partition_keys=("shard_id",),
+        parent_time="timestamp", child_time="timestamp", window_seconds=60,
+        reset_column="", validity_columns=(),
+    )
+
+    values, _overflow = _related_aggregate(template, dataset.observed)
+
+    # Two typed-distinct shards contribute 10 and 20; merging them would report 30 for one shard.
+    finite = values[np.isfinite(values)]
+    assert finite.size
+    assert np.allclose(finite, 30.0), finite   # the SUM over both shards, computed once each
+
+
+def test_forward_fill_treats_an_infinite_reading_as_missing():
+    """Round-36 review: ffill only carries NaN, so an infinity survives as a real reading."""
+    from autogram.dsl.evaluate import _partition_values
+
+    child = pd.DataFrame({"counter": [10.0, np.inf, 20.0]})
+    partition = {"positions": np.arange(3), "values": {}, "reset_prefix": {}}
+
+    filled = _partition_values(partition, child, "counter", True)
+
+    assert np.allclose(filled, [10.0, 10.0, 20.0])
+
+
+def test_saturating_add_is_correct_for_pre_epoch_timestamps():
+    """Round-36 review: ``limit - times`` itself overflows for a negative timestamp."""
+    import pandas as pd_local
+
+    from autogram.dsl.evaluate import _saturating_add_ns
+
+    start = pd_local.Timestamp("1969-12-31 23:59").value
+    end = int(_saturating_add_ns(np.array([start], dtype=np.int64), 60 * 10 ** 9)[0])
+
+    assert pd_local.Timestamp(end) == pd_local.Timestamp("1970-01-01 00:00:00")

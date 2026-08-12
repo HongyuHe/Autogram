@@ -418,3 +418,37 @@ def test_exact_learned_sum_recovers_the_approximate_known_it_satisfies():
         _canonicalize(learned_exact, f, 1e-4, exact=True)[2]
         != _canonicalize(known_exact, f, 1e-4)[2]
     )
+
+
+def test_conditional_exactness_is_detected_through_the_nesting():
+    """Round-36 review: a conditioned exact equality is still exact.
+
+    Reading only the outer shape canonicalised it with an approximate tolerance, which matched a
+    conditioned exact known against a learned sum it is false against on every applicable row.
+    """
+    from autogram.discovery.known import _candidate_is_exact
+
+    base_exact = ("equality", "exact", ("ref_sum", ("total", frozenset({"a"}))))
+    base_approx = ("equality", "approximate", ("ref_sum", ("total", frozenset({"a"}))))
+    condition = ("label", "==", ("alert",))
+
+    assert _candidate_is_exact(("conditional", (condition, base_exact)))
+    assert not _candidate_is_exact(("conditional", (condition, base_approx)))
+    assert _candidate_is_exact(base_exact)
+    assert not _candidate_is_exact(("zero", "a"))
+
+
+def test_conditional_exact_known_is_not_credited_by_a_different_sum():
+    names = ["total", "a", "z"]
+    n = 40
+    mat = np.zeros((n, len(names)))
+    mat[:, 1] = 1000.0
+    mat[:, 2] = 0.05
+    mat[:, 0] = 1000.05
+    f = Frame(mat, names)
+    condition = ("label", "==", ("alert",))
+
+    known = ("conditional", (condition, ("equality", "exact", ("ref_sum", ("total", frozenset({"a"}))))))
+    learned = ("conditional", (condition, ("equality", "exact", ("ref_sum", ("total", frozenset({"a", "z"}))))))
+
+    assert _canonicalize(known, f, 1e-4) != _canonicalize(learned, f, 1e-4, exact=True)

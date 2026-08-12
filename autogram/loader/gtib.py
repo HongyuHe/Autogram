@@ -529,7 +529,13 @@ def _materialize_raw(
 
         counter_boundaries: dict[str, np.ndarray] = {}
         for counter in _COUNTERS:
-            filled = group[counter].ffill()
+            # Non-finite readings are missing data; forward fill only carries ``NaN``, so leaving an
+            # infinity in place would treat it as a real reading. The streaming path applies the
+            # same rule, and the two implementations of one cross-grain law must agree.
+            numeric = pd.to_numeric(group[counter], errors="coerce")
+            filled = numeric.mask(
+                ~np.isfinite(numeric.to_numpy(dtype=float))
+            ).ffill()
             counter_boundaries[counter] = (
                 filled.groupby(group["_minute_index"], sort=True)
                 .last()
