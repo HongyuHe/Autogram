@@ -45,7 +45,9 @@ from .discovery.validate import (
     CalibrationGridError, null_definitions_at, null_equalities_at, null_temporal_at,
     prepare_proxy_suite, prepare_runtime_null_controls, relation_signature_matches, tune_joint,
 )
+from .schema.adapter import decode_observed_cell
 from .schema.compiler import compile_spec
+from .schema.spec import CellCodec
 
 
 @dataclass
@@ -280,22 +282,84 @@ def precheck(harness: str | None = None, backend: str = "subagent") -> dict:
 class _ColumnScaleView:
     """Minimal frame-like view used only for signature canonicalisation.
 
-    `known._canonicalize` drops summed members whose observed data is negligible against the
-    anchor's scale, which is a *data-dependent* transform. The split has to apply the same
+    `known._canonicalize` drops summed members that are negligible against the anchor on every
+    gradeable row, which is a *data-dependent* transform. The split has to apply the same
     transform, or two catalogue entries that recovery cannot tell apart -- `total == SUM(a)` and
     `total == SUM(a, z)` with `z` identically zero -- can land on opposite sides and the validation
     half stops being held out. Only `has` and `col` are needed for that, so a full `Frame` (which is
     not built until after the split) is unnecessary.
+
+    Decoding goes through the SAME helper the runtime frame uses (:func:`decode_observed_cell`), so
+    a dict-valued CrossCheck cell yields the value the engine will actually see rather than the
+    ``NaN`` a naive numeric coercion produces. The adapter does not exist yet at split time, so the
+    codec's primary key is taken from the spec default and then *verified* against the compiled
+    adapter once the grammar is built (:meth:`assert_matches_runtime`); a cell shape this view
+    cannot decode raises rather than silently becoming ``NaN``.
     """
 
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame, primary: str = CellCodec().primary):
         self._df = df
+        self._primary = str(primary)
+        self._decoded: dict[str, np.ndarray] = {}
+
+    @property
+    def primary(self) -> str:
+        return self._primary
+
+    @property
+    def decoded_columns(self) -> tuple:
+        """Columns the split actually consulted (and therefore has data to verify)."""
+        return tuple(sorted(self._decoded))
 
     def has(self, column: str) -> bool:
         return column in self._df.columns
 
     def col(self, column: str) -> np.ndarray:
-        return pd.to_numeric(self._df[column], errors="coerce").to_numpy(dtype=float)
+        cached = self._decoded.get(column)
+        if cached is not None:
+            return cached
+        values = self._df[column].to_numpy()
+        out = np.empty(values.shape[0], dtype=float)
+        for index, cell in enumerate(values):
+            if hasattr(cell, "get") and self._primary not in cell:
+                raise ValueError(
+                    f"calibration split cannot decode column {column!r}: cell {index} is a mapping "
+                    f"without the codec primary key {self._primary!r} (keys: {sorted(cell)!r}). "
+                    "The split canonicalises known invariants with the same data the runtime frame "
+                    "sees, so an undecodable cell must fail loudly instead of becoming NaN."
+                )
+            try:
+                out[index] = decode_observed_cell(cell, self._primary)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"calibration split cannot decode column {column!r}: cell {index} "
+                    f"({cell!r}) is not numeric ({exc}). A known invariant may only reference "
+                    "columns the engine can read as numbers."
+                ) from exc
+        self._decoded[column] = out
+        return out
+
+    def assert_matches_runtime(self, frame) -> None:
+        """Fail loudly if the runtime frame decodes any consulted column differently.
+
+        The split's whole purpose is that calibration and validation cannot contain two spellings
+        of one relation. That holds only if this view and the runtime frame agree about the data;
+        if they disagree, aliases can straddle the split and the calibration/validation gap stops
+        being an overfitting alarm. Only the columns the split actually consulted are compared, so
+        the check costs nothing on a wide frame.
+        """
+        for column, decoded in self._decoded.items():
+            if not frame.has(column):
+                continue
+            runtime = np.asarray(frame.col(column), dtype=float)
+            if runtime.shape != decoded.shape or not np.array_equal(
+                runtime, decoded, equal_nan=True,
+            ):
+                raise ValueError(
+                    f"calibration split decoded column {column!r} differently from the runtime "
+                    f"frame (split primary key {self._primary!r}). The held-out split would not be "
+                    "held out, so the run is refused."
+                )
 
 
 def _split_known(known: List[KnownInvariant], frac: float, seed: int,
@@ -721,11 +785,12 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             "between 1 and 500000"
         )
     known = load_known(known_path)
+    split_view = _ColumnScaleView(df)
     calib, valid = _split_known(
         known,
         cfg.validation_frac,
         cfg.seed,
-        frame=_ColumnScaleView(df),
+        frame=split_view,
     )
     inducer = _make_calibration_inducer(cfg)
 
@@ -830,6 +895,13 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             search_cfg=scfg,
             name=name,
         )
+        # The split canonicalised known signatures against `split_view` before any adapter existed.
+        # Now that the real one does, confirm the two agree on every column the split consulted --
+        # otherwise an alias pair could have straddled the split and "held out" would be a fiction.
+        # A split whose signatures carry no summed grouping reads no column data at all, and there
+        # is then nothing to verify.
+        if split_view.decoded_columns:
+            split_view.assert_matches_runtime(ds.observed)
         summary = _spec_summary(runtime_spec, ti, caps)
         summary["runtime"] = {
             "agg_kinds": list(getattr(G, "agg_kinds", ())),

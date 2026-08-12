@@ -138,10 +138,14 @@ class AutogramSubagentRunner:
             extra_args if extra_args is not None
             else _split_extra(os.environ.get("AUTOGRAM_SUBAGENT_EXTRA_ARGS", ""))
         )
-        self.log_path = Path(log_path or os.environ.get(
-            "AUTOGRAM_SUBAGENT_LOG",
-            r"artifacts\subagent_schema_induction.jsonl",
-        ))
+        # Path components, not a literal separator: on POSIX a backslash is an ordinary filename
+        # character, so a hardcoded Windows path writes a file called
+        # ``artifacts\subagent_schema_induction.jsonl`` into the working directory.
+        self.log_path = Path(
+            log_path
+            or os.environ.get("AUTOGRAM_SUBAGENT_LOG")
+            or Path("artifacts") / "subagent_schema_induction.jsonl"
+        )
 
     def __call__(self, prompt: str) -> str:
         prompt_id = hashlib.sha256(prompt.encode("utf-8")).hexdigest()

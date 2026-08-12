@@ -33,7 +33,13 @@ class TermCache:
 
     @staticmethod
     def _size(value) -> int:
-        return int(value.nbytes) if isinstance(value, np.ndarray) else 0
+        if isinstance(value, np.ndarray):
+            return int(value.nbytes)
+        if isinstance(value, tuple):
+            # Term evaluation caches ``(value, overflow_mask)`` pairs; charging only the first
+            # member would under-count the cache and let it grow past ``max_bytes``.
+            return sum(TermCache._size(member) for member in value)
+        return 0
 
     def __contains__(self, key) -> bool:
         return key in self._data

@@ -43,6 +43,12 @@ class Grounded:
     # never decide a support question.
     graded_points: int = 0
     graded_condition_support: float = 0.0
+    # Rows on which the candidate's OWN arithmetic exceeded float64 and produced an infinity. These
+    # are not missing data: dropping them silently would shrink the population the rule claims to
+    # describe while leaving its reported support untouched, so they are counted here and the
+    # evaluator refuses the candidate outright (see ``DiscoveryConfig.max_overflow_fraction``).
+    overflow_points: int = 0
+    overflow_fraction: float = 0.0
     # True only for an atomic sign bound ``x OP 0`` that holds tolerance-free on every grounded row,
     # computed on the FULL population BEFORE any subsampling so a sampled-out violation can never
     # spuriously mark the bound exact.
@@ -54,92 +60,243 @@ class Grounded:
 
     @property
     def support(self) -> float:
-        """Fraction of attempted bindings that grounded in scope (Sec. 10.1)."""
+        """Fraction of attempted bindings x rows the rule actually GRADED (Sec. 10.1).
+
+        Reported support must describe the population the rule was scored on, not the population it
+        was offered: rows whose operands are undefined, and rows the rule's arithmetic overflowed,
+        are both absent from the residual population and must not be counted as evidence.
+        ``graded_condition_support`` already measures the graded rows as a fraction of all attempted
+        rows (it subsumes ``condition_support``), so it is the correct row-level factor here.
+        """
         if self.n_candidates == 0:
             return 0.0
-        return (self.n_bindings / self.n_candidates) * self.condition_support
+        return (self.n_bindings / self.n_candidates) * self.graded_condition_support
+
+
+def robust_median(values: np.ndarray) -> float:
+    """Median of a finite sample that cannot itself overflow ``float64``.
+
+    ``np.median`` averages the two central elements of an even-length sample, and that intermediate
+    SUM overflows for values near the float64 ceiling.  The result feeds the relative-residual scale
+    floor, so an infinite "median" floors every scale at infinity, drives every relative residual to
+    zero, and accepts every candidate with a perfect hold rate -- a false discovery manufactured by
+    a numerical artefact.  The fallback averages the two central order statistics as
+    ``lo + (hi - lo) / 2``, which is exact for finite inputs and never leaves their range.
+    """
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return 1.0
+    with np.errstate(over="ignore", invalid="ignore"):
+        med = float(np.median(values))
+    if np.isfinite(med):
+        return med
+    lo = float(np.quantile(values, 0.5, method="lower"))
+    hi = float(np.quantile(values, 0.5, method="higher"))
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        # The sample itself carries an infinity; there is no finite central value to report.
+        finite = values[np.isfinite(values)]
+        return robust_median(finite) if finite.size else 1.0
+    return lo + (hi - lo) / 2.0
+
+
+def _union_overflow(*masks):
+    """OR together the overflow masks of a node's operands (``None`` means "no overflow")."""
+    out = None
+    for mask in masks:
+        if mask is None:
+            continue
+        out = mask.copy() if out is None else (out | mask)
+    return out if out is not None and out.any() else None
+
+
+def _blowup(result, *inputs):
+    """Rows where FINITE operands produced an infinite result -- the expression itself overflowed.
+
+    This is deliberately distinct from a ``NaN`` result.  A ``NaN`` means the term is *undefined*
+    here (missing data, or a guarded division by exact zero), which is a property of the data and
+    is legitimately dropped from the graded population.  An infinity produced from finite operands
+    means the candidate's own arithmetic exceeded ``float64`` -- a property of the *candidate*.
+    Silently dropping those rows would shrink the population a rule claims to describe while
+    leaving its reported support untouched, which is a false-discovery path.
+
+    ``inf - inf`` and ``inf / inf`` yield ``NaN`` from ALREADY-overflowed operands; those rows are
+    caught by the operand's own mask and propagated by :func:`_union_overflow`, so testing for a
+    non-finite result here would only misclassify the guarded ``NaN`` cases.
+    """
+    if result is None:
+        return None
+    bad = np.isinf(result)
+    if not bad.any():
+        return None
+    for value in inputs:
+        bad &= np.isfinite(value)
+        if not bad.any():
+            return None
+    return bad
+
+
+def _shift_overflow(mask, steps: int, frame: Frame, nm: NameModel):
+    """Carry an overflow mask through a lag, so a blown-up row still taints its shifted reader."""
+    if mask is None:
+        return None
+    shifted = _lag(mask.astype(float), steps, frame, nm)
+    if shifted is None:
+        return None
+    return np.nan_to_num(shifted, nan=0.0) > 0.0
+
+
+def _window_overflow(mask, window: int, frame: Frame, nm: NameModel):
+    """Carry an overflow mask through a rolling window (any tainted member taints the window)."""
+    if mask is None:
+        return None
+    rolled = _rolling(mask.astype(float), window, "MAX", frame, nm)
+    if rolled is None:
+        return None
+    return np.nan_to_num(rolled, nan=0.0) > 0.0
 
 
 def eval_term(term: A.Term, binder: str, binding: dict, frame: Frame,
               nm: NameModel):
     """Evaluate a term for one binding -> (N,) array, or ``None`` if out of scope."""
+    return eval_term_overflow(term, binder, binding, frame, nm)[0]
+
+
+def eval_term_overflow(term: A.Term, binder: str, binding: dict, frame: Frame,
+                       nm: NameModel):
+    """Evaluate a term and the rows on which its own arithmetic overflowed.
+
+    Returns ``(value, overflow)``.  ``value`` is ``None`` when the term is out of scope, and
+    ``overflow`` is either ``None`` (nothing overflowed) or a boolean row mask.
+    """
     key = (
         binder,
         tuple(sorted(binding.items())),
         term,
     )
     if key not in frame.term_cache:
-        value = _eval_term_uncached(
+        pair = _eval_term_uncached(
             term,
             binder,
             binding,
             frame,
             nm,
         )
-        frame.term_cache[key] = value
-        return value
+        frame.term_cache[key] = pair
+        return pair
     return frame.term_cache[key]
 
 
 def _eval_term_uncached(term: A.Term, binder: str, binding: dict, frame: Frame,
                         nm: NameModel):
     if isinstance(term, A.Const):
-        return np.full(frame.n_rows, float(term.value))
+        return np.full(frame.n_rows, float(term.value)), None
     if isinstance(term, A.Ref):
         col = B.resolve_ref(term.role, binder, binding, nm)
         if col is None or not frame.has(col):
-            return None
-        return frame.col(col)
+            return None, None
+        # A non-finite value already present in the DATA is missing/undefined, not an overflow of
+        # this rule's arithmetic, so a leaf never originates an overflow mask.
+        return frame.col(col), None
     if isinstance(term, A.Scale):
-        inner = eval_term(term.term, binder, binding, frame, nm)
-        return None if inner is None else term.coeff * inner
+        inner, inner_overflow = eval_term_overflow(term.term, binder, binding, frame, nm)
+        if inner is None:
+            return None, None
+        with np.errstate(over="ignore", invalid="ignore"):
+            out = term.coeff * inner
+        return out, _union_overflow(inner_overflow, _blowup(out, inner))
     if isinstance(term, A.Add):
         acc = np.zeros(frame.n_rows)
+        overflow = None
         for t in term.terms:
-            v = eval_term(t, binder, binding, frame, nm)
+            v, v_overflow = eval_term_overflow(t, binder, binding, frame, nm)
             if v is None:
-                return None
-            acc = acc + v
-        return acc
+                return None, None
+            with np.errstate(over="ignore", invalid="ignore"):
+                nxt = acc + v
+            overflow = _union_overflow(overflow, v_overflow, _blowup(nxt, acc, v))
+            acc = nxt
+        return acc, overflow
     if isinstance(term, A.Agg):
         cols = B.resolve_family(term.family_role, binder, binding, nm)
         if not cols:
-            return None
+            return None, None
         mat = np.stack([frame.col(c) for c in cols], axis=1)
-        if term.kind == "SUM":
-            return mat.sum(axis=1)
-        if term.kind == "AVG":
-            return mat.mean(axis=1)
-        if term.kind == "MIN":
-            return mat.min(axis=1)
-        if term.kind == "MAX":
-            return mat.max(axis=1)
+        if term.kind not in ("SUM", "AVG", "MIN", "MAX"):
+            raise TypeError(f"unknown term {term!r}")
+        finite_members = np.all(np.isfinite(mat), axis=1)
+        with np.errstate(over="ignore", invalid="ignore"):
+            if term.kind == "SUM":
+                out = mat.sum(axis=1)
+            elif term.kind == "AVG":
+                out = mat.mean(axis=1)
+            elif term.kind == "MIN":
+                out = mat.min(axis=1)
+            else:
+                out = mat.max(axis=1)
+        overflow = np.isinf(out) & finite_members
+        return out, (overflow if overflow.any() else None)
     if isinstance(term, A.Mul):
-        left = eval_term(term.left, binder, binding, frame, nm)
-        right = eval_term(term.right, binder, binding, frame, nm)
-        return None if left is None or right is None else left * right
+        left, left_overflow = eval_term_overflow(term.left, binder, binding, frame, nm)
+        right, right_overflow = eval_term_overflow(term.right, binder, binding, frame, nm)
+        if left is None or right is None:
+            return None, None
+        with np.errstate(over="ignore", invalid="ignore"):
+            out = left * right
+        return out, _union_overflow(left_overflow, right_overflow, _blowup(out, left, right))
     if isinstance(term, A.Div):
-        num = eval_term(term.num, binder, binding, frame, nm)
-        den = eval_term(term.den, binder, binding, frame, nm)
+        num, num_overflow = eval_term_overflow(term.num, binder, binding, frame, nm)
+        den, den_overflow = eval_term_overflow(term.den, binder, binding, frame, nm)
         if num is None or den is None:
-            return None
-        with np.errstate(divide="ignore", invalid="ignore"):
-            return np.where(den == 0.0, np.nan, num / den)
+            return None, None
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            out = np.where(den == 0.0, np.nan, num / den)
+        # Division by exact zero is deliberately ``NaN`` (undefined), and ``_blowup`` only fires on
+        # an infinity, so the guarded case is never mistaken for an overflow.  A finite but tiny
+        # denominator IS an overflow and is caught here.
+        return out, _union_overflow(num_overflow, den_overflow, _blowup(out, num, den))
     if isinstance(term, A.Lag):
-        inner = eval_term(term.term, binder, binding, frame, nm)
-        return None if inner is None else _lag(inner, term.steps, frame, nm)
-    if isinstance(term, A.Diff):
-        inner = eval_term(term.term, binder, binding, frame, nm)
+        inner, inner_overflow = eval_term_overflow(term.term, binder, binding, frame, nm)
         if inner is None:
-            return None
+            return None, None
         lagged = _lag(inner, term.steps, frame, nm)
-        return None if lagged is None else inner - lagged
+        if lagged is None:
+            return None, None
+        return lagged, _shift_overflow(inner_overflow, term.steps, frame, nm)
+    if isinstance(term, A.Diff):
+        inner, inner_overflow = eval_term_overflow(term.term, binder, binding, frame, nm)
+        if inner is None:
+            return None, None
+        lagged = _lag(inner, term.steps, frame, nm)
+        if lagged is None:
+            return None, None
+        with np.errstate(over="ignore", invalid="ignore"):
+            out = inner - lagged
+        return out, _union_overflow(
+            inner_overflow,
+            _shift_overflow(inner_overflow, term.steps, frame, nm),
+            _blowup(out, inner, lagged),
+        )
     if isinstance(term, A.Rolling):
-        inner = eval_term(term.term, binder, binding, frame, nm)
-        return None if inner is None else _rolling(inner, term.window, term.kind, frame, nm)
+        inner, inner_overflow = eval_term_overflow(term.term, binder, binding, frame, nm)
+        if inner is None:
+            return None, None
+        rolled = _rolling(inner, term.window, term.kind, frame, nm)
+        if rolled is None:
+            return None, None
+        # ``_rolling`` only emits a value when every window member is finite, so an infinite output
+        # can only have come from the aggregation itself overflowing.
+        return rolled, _union_overflow(
+            _window_overflow(inner_overflow, term.window, frame, nm),
+            np.isinf(rolled),
+        )
     if isinstance(term, A.RelatedAgg):
         template = getattr(nm.adapter, "resolve_related", lambda *_: None)(term.role, binder)
-        return None if template is None else _related_aggregate(template, frame)
+        if template is None:
+            return None, None
+        joined = _related_aggregate(template, frame)
+        if joined is None:
+            return None, None
+        return joined, _union_overflow(np.isinf(joined))
     raise TypeError(f"unknown term {term!r}")
 
 
@@ -357,23 +514,34 @@ def ground(rule: A.Rule, frame: Frame, nm: NameModel,
         float(np.count_nonzero(condition_mask)) / frame.n_rows
         if frame.n_rows else 0.0
     )
-    lefts, rights, rhos, scales, row_indices = [], [], [], [], []
+    lefts, rights, rhos, scales, row_indices, overflows = [], [], [], [], [], []
     n_ok = 0
     for b in bindings:
-        L = eval_term(rule.atom.left, rule.binder, b, frame, nm)
-        R = eval_term(rule.atom.right, rule.binder, b, frame, nm)
+        L, left_overflow = eval_term_overflow(rule.atom.left, rule.binder, b, frame, nm)
+        R, right_overflow = eval_term_overflow(rule.atom.right, rule.binder, b, frame, nm)
         if L is None or R is None:
             continue
         n_ok += 1
         L = L[condition_mask]
         R = R[condition_mask]
-        rho = L - R
+        with np.errstate(over="ignore", invalid="ignore"):
+            rho = L - R
         s = np.maximum(np.abs(L), np.abs(R))
+        # The residual itself can overflow even when both sides are finite, so the subtraction is
+        # checked here in addition to the masks the two sides carry up.
+        overflow = _union_overflow(
+            None if left_overflow is None else left_overflow[condition_mask],
+            None if right_overflow is None else right_overflow[condition_mask],
+            _blowup(rho, L, R),
+        )
         lefts.append(L)
         rights.append(R)
         rhos.append(rho)
         scales.append(s)
         row_indices.append(np.flatnonzero(condition_mask))
+        overflows.append(
+            np.zeros(rho.shape, dtype=bool) if overflow is None else overflow
+        )
     if n_ok == 0:
         empty = np.empty(0)
         return Grounded(
@@ -392,7 +560,18 @@ def ground(rule: A.Rule, frame: Frame, nm: NameModel,
     rho = np.concatenate(rhos)
     scale = np.concatenate(scales)
     rows = np.concatenate(row_indices)
-    mask = np.isfinite(rho) & np.isfinite(scale)
+    overflowed = np.concatenate(overflows)
+    # An overflowed row is excluded from the residual population -- an infinity would poison every
+    # median, band fit and hold-rate on it -- but it is COUNTED, because a row the candidate blew up
+    # on is a row the candidate fails to describe, not a row the data failed to supply.  Downstream
+    # arithmetic can even map an infinity back to a finite value (``1/inf == 0``), so the taint is
+    # tracked explicitly rather than inferred from the final value's finiteness.
+    overflow_points = int(np.count_nonzero(overflowed))
+    attempted_points = int(n_ok * np.count_nonzero(condition_mask))
+    overflow_fraction = (
+        float(overflow_points) / float(attempted_points) if attempted_points else 0.0
+    )
+    mask = np.isfinite(rho) & np.isfinite(scale) & ~overflowed
     left, right, rho, scale, rows = (
         left[mask],
         right[mask],
@@ -423,14 +602,16 @@ def ground(rule: A.Rule, frame: Frame, nm: NameModel,
                 rows[keep],
             )
     # global floor keeps near-zero-scale points from exploding the relative residual
-    med = np.median(scale[scale > 0]) if np.any(scale > 0) else 1.0
+    med = robust_median(scale[scale > 0]) if np.any(scale > 0) else 1.0
     floor = scale_floor_frac * med
     scale = np.maximum(scale, floor)
     return Grounded(rho=rho, scale=scale, left=left, right=right, n_bindings=n_ok,
                     n_candidates=len(bindings), degenerate=False, row_indices=rows,
                     condition_support=condition_support, raw_exact_sign=raw_exact_sign,
                     graded_points=graded_points,
-                    graded_condition_support=graded_condition_support)
+                    graded_condition_support=graded_condition_support,
+                    overflow_points=overflow_points,
+                    overflow_fraction=overflow_fraction)
 
 
 def rel_residual(g: Grounded) -> np.ndarray:

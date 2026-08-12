@@ -328,3 +328,102 @@ def test_high_cardinality_identifier_is_not_inferred_as_a_condition():
     )
     assert "bucket" not in wide_conditions
 
+
+
+def test_identifier_repeated_twice_is_not_inferred_as_a_condition():
+    """Round-29 / TODO-4: a bounded, repeating domain is still not a regime.
+
+    50 distinct values over 100 rows clears both round-27 guards -- 50 is under the compiler's
+    64-value ceiling, and 50 is not strictly greater than ``len(frame) // 2`` -- yet it is an
+    identifier that happens to repeat twice. Expanding it produced a quarter of a million
+    conditions. What is actually wanted is meaningful per-value support.
+    """
+    from autogram.loader.gtib import _min_condition_value_rows, infer_tabular_profile
+    from autogram.schema.compiler import _MAX_CONDITION_DOMAIN
+
+    n = 100
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=n, freq="1min"),
+        "session_id2": [f"s-{index % 50}" for index in range(n)],
+        "latency_ms": np.linspace(1.0, 100.0, n),
+    })
+    distinct = int(df["session_id2"].nunique())
+    assert distinct == 50
+    assert distinct <= _MAX_CONDITION_DOMAIN            # passes the domain-ceiling guard
+    assert not distinct > max(1, len(df) // 2)          # passes the near-unique guard
+
+    conditions = list(
+        infer_tabular_profile(df).attrs[AUTOGRAM_PROFILE_ATTR]["condition_columns"]
+    )
+
+    assert "session_id2" not in conditions
+    assert _min_condition_value_rows(n) > 2
+
+
+def test_genuine_regime_label_is_still_inferred_as_a_condition():
+    from autogram.loader.gtib import infer_tabular_profile
+
+    n = 600
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=n, freq="1min"),
+        "mode": np.resize(np.array(["steady", "burst", "drain"], dtype=object), n),
+        "latency_ms": np.linspace(1.0, 100.0, n),
+    })
+
+    conditions = list(
+        infer_tabular_profile(df).attrs[AUTOGRAM_PROFILE_ATTR]["condition_columns"]
+    )
+
+    assert "mode" in conditions
+
+
+def test_condition_value_floor_tracks_the_evaluator_support_floor():
+    from autogram.config import DiscoveryConfig
+    from autogram.loader.gtib import _min_condition_value_rows
+
+    floor = DiscoveryConfig()
+    assert _min_condition_value_rows(100) == int(floor.min_condition_points)
+    # Once the table is large enough, the fractional floor dominates the absolute one.
+    assert _min_condition_value_rows(100_000) == int(
+        floor.min_condition_fraction * 100_000
+    )
+
+
+def test_conditioned_search_space_is_counted_before_expansion():
+    """The ceiling must fire on a pre-count, not after the blow-up has been materialised.
+
+    The message names both factors -- the number of conditionable rules and the number of
+    conditions -- which is only knowable before expansion; the old check could only report that a
+    running tally had crossed the ceiling, after paying for every variant built up to that point.
+    """
+    import re
+
+    import pytest
+
+    from autogram.discovery.propose import EnumerationProposer, SearchSpaceTruncatedError
+    from autogram.dsl.grammar import Grammar
+
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=", "=="),
+        ref_roles={"record": ("x", "y", "z")},
+        fam_roles={"record": ()},
+        max_complexity=10,
+        conditional_enabled=True,
+        condition_columns={"regime": ("a", "b", "c", "d")},
+        max_conditioned_rules=2,
+    )
+
+    with pytest.raises(SearchSpaceTruncatedError) as excinfo:
+        EnumerationProposer(grammar).propose()
+
+    message = str(excinfo.value)
+    match = re.search(
+        r"expand (\d+) conditionable rules over (\d+) conditions = (\d+) conditioned candidates",
+        message,
+    )
+    assert match, message
+    conditionable, n_conditions, projected = (int(group) for group in match.groups())
+    assert conditionable > 0 and n_conditions > 0
+    assert projected == conditionable * n_conditions
+    assert projected > 2

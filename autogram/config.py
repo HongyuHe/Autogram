@@ -29,6 +29,12 @@ class DiscoveryConfig:
     seed: int = 0
     min_condition_points: int = 20
     min_condition_fraction: float = 0.01
+    # Fraction of a candidate's attempted rows that may overflow float64 before it is refused
+    # outright. An overflow is a failure of the CANDIDATE's arithmetic, not of the data, so the
+    # default of 0.0 refuses any candidate that blows up on even one row: dropping those rows
+    # instead would shrink the graded population behind a full-confidence support figure, which is
+    # a false-discovery path. Raising this only ever admits more candidates, never fewer.
+    max_overflow_fraction: float = 0.0
     parameter_holdout_frac: float = 0.3
     min_proportional_points: int = 8
     definition_min_lift: float = 0.05

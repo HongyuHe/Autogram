@@ -1376,7 +1376,13 @@ def _validate_schema_completeness(spec: GrammarSpec, columns: Sequence[str]) -> 
 
 
 def _log_schema_event(event: str, payload: dict) -> None:
-    path = Path(os.environ.get("AUTOGRAM_SUBAGENT_LOG", r"artifacts\subagent_schema_induction.jsonl"))
+    # Built from path components rather than a literal separator: a backslash is an ordinary
+    # filename character on POSIX, so a hardcoded Windows path creates a file literally named
+    # ``artifacts\subagent_schema_induction.jsonl`` in the working directory instead of a log inside
+    # ``artifacts/``.
+    path = Path(os.environ.get("AUTOGRAM_SUBAGENT_LOG", "")) if os.environ.get(
+        "AUTOGRAM_SUBAGENT_LOG"
+    ) else Path("artifacts") / "subagent_schema_induction.jsonl"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         record = {"ts": datetime.now(timezone.utc).isoformat(), "event": event, **payload}

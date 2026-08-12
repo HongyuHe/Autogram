@@ -5,8 +5,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 
+import math
+
 import numpy as np
 import pandas as pd
+
+from ..config import DiscoveryConfig
 
 
 AUTOGRAM_PROFILE_ATTR = "autogram_profile"
@@ -142,6 +146,21 @@ def profile_dataframe(
     return out
 
 
+def _min_condition_value_rows(n_rows: int) -> int:
+    """Rows one condition value must cover before the column is worth proposing as a condition.
+
+    Mirrors the evaluator's condition-support floor (``DiscoveryConfig.min_condition_points`` and
+    ``min_condition_fraction``) rather than inventing a second, unrelated constant: a value that
+    cannot clear that floor can never produce an accepted conditioned rule, so inferring it only
+    multiplies the conditioned search space with candidates that are rejected by construction.
+    """
+    floor = DiscoveryConfig()
+    return max(
+        int(floor.min_condition_points),
+        int(math.ceil(float(floor.min_condition_fraction) * max(0, int(n_rows)))),
+    )
+
+
 def infer_tabular_profile(frame: pd.DataFrame) -> pd.DataFrame:
     """Attach conservative generic metadata inferred from common tabular conventions."""
 
@@ -166,16 +185,19 @@ def infer_tabular_profile(frame: pd.DataFrame) -> pd.DataFrame:
             or pd.api.types.is_string_dtype(frame[c])
         ):
             continue
-        # A condition has to name a *regime*, so its domain must be small and repeated. A free-text
-        # or identifier column is object-dtyped too, and inferring it as a condition made ingestion
-        # fail outright: the compiler rejects any condition domain above 64 values, so an ordinary
-        # CSV carrying a `request_id` could not be loaded at all. Require a bounded domain that
-        # actually repeats, and let anything else through as a plain column.
-        distinct = int(frame[c].nunique(dropna=True))
+        # A condition has to name a *regime*, so every value in its domain must carry enough rows to
+        # be evidence.  The precise bar is the evaluator's own condition-support floor: a value that
+        # cannot clear `min_condition_points` rows and `min_condition_fraction` of the table can
+        # never yield an ACCEPTED conditioned rule, so proposing it only inflates the conditioned
+        # search space.  A bounded-domain check alone is not enough -- 50 distinct values over 100
+        # rows is under the compiler's 64-value ceiling and is not "near-unique per row" either, yet
+        # it is an identifier repeated twice, and expanding it generated a quarter of a million
+        # conditions.  Requiring meaningful per-value support subsumes both of those guards.
+        counts = frame[c].value_counts(dropna=True)
+        distinct = int(counts.size)
         if distinct < 1 or distinct > _MAX_CONDITION_DOMAIN:
             continue
-        if len(frame) and distinct > max(1, len(frame) // 2):
-            # Near-unique per row: an identifier, not a regime label.
+        if len(frame) and int(counts.min()) < _min_condition_value_rows(len(frame)):
             continue
         conditions.append(c)
     return profile_dataframe(

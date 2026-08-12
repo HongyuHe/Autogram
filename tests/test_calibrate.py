@@ -794,3 +794,121 @@ def test_known_split_merges_entries_that_data_canonicalization_makes_identical()
         valid = {item.name for item in validation}
         assert calib.isdisjoint(valid)
         assert ("plain" in calib) == ("padded" in calib), seed
+
+
+def _crosscheck_columns(df: pd.DataFrame) -> list[str]:
+    return [str(column) for column in df.columns if str(column).startswith(("low_", "high_"))]
+
+
+def test_column_scale_view_decodes_dict_cells_like_the_runtime_frame():
+    """Round-29 / TODO-3: the split's view and the runtime frame must not decode differently.
+
+    CrossCheck cells are dicts whose ``ground_truth`` key carries the datum. ``pd.to_numeric``
+    coerces every one of them to ``NaN``, so the view and the runtime frame disagreed about a
+    column's data -- and therefore about which summed members are negligible -- which is exactly how
+    an alias pair can straddle a split that is supposed to hold the validation half out.
+    """
+    from autogram.calibrate import _ColumnScaleView
+    from autogram.discovery.loop import build_dataframe_grammar
+    from tests.test_crosscheck_golden import _crosscheck_spec
+
+    df = pd.read_pickle("data/crosscheck-samples/abilene_sample_1000.pkl")
+    columns = _crosscheck_columns(df)
+    assert columns
+
+    # The naive coercion the view used to perform loses the data entirely.
+    naive = pd.to_numeric(df[columns[0]], errors="coerce").to_numpy(dtype=float)
+    assert np.all(np.isnan(naive))
+
+    dataset, _grammar = build_dataframe_grammar(
+        df, _crosscheck_spec(link_demand_context=True), name="abilene_view_check",
+    )
+    view = _ColumnScaleView(df)
+
+    compared = 0
+    for column in columns:
+        if not dataset.observed.has(column):
+            continue
+        assert np.array_equal(view.col(column), dataset.observed.col(column), equal_nan=True)
+        compared += 1
+    assert compared > 0
+    assert not np.all(np.isnan(view.col(columns[0])))
+    view.assert_matches_runtime(dataset.observed)     # must not raise
+
+
+def test_split_keeps_aliases_together_on_dict_valued_cells():
+    """The alias pair must stay on one side of the split for CrossCheck-shaped data too.
+
+    With ``pd.to_numeric`` every column decoded to all-``NaN``, so no member ever looked negligible
+    and ``total == SUM(a)`` / ``total == SUM(a, z)`` were treated as two different relations.
+    """
+    from autogram.calibrate import _ColumnScaleView
+
+    n = 60
+    def cells(values):
+        return [
+            {"ground_truth": float(value), "hidden_ground_truth": float(value)}
+            for value in values
+        ]
+
+    df = pd.DataFrame({
+        "total": cells(np.linspace(10.0, 20.0, n)),
+        "a": cells(np.linspace(10.0, 20.0, n)),
+        "z": cells(np.zeros(n)),
+        "p": cells(np.linspace(1.0, 2.0, n)),
+        "q": cells(np.linspace(3.0, 4.0, n)),
+    })
+    known = [
+        KnownInvariant("plain", "==", "total", {"sum": ["a"]}),
+        KnownInvariant("padded", "==", "total", {"sum": ["a", "z"]}),
+        KnownInvariant("other", "==", "p", "q"),
+        KnownInvariant("third", "==", "q", "p"),
+        KnownInvariant("fourth", ">=", "p", 0),
+    ]
+
+    for seed in range(25):
+        calibration, validation = _split_known(
+            known, frac=0.4, seed=seed, frame=_ColumnScaleView(df),
+        )
+        calib = {item.name for item in calibration}
+        valid = {item.name for item in validation}
+        assert calib.isdisjoint(valid)
+        assert ("plain" in calib) == ("padded" in calib), seed
+
+
+def test_column_scale_view_fails_loudly_on_an_undecodable_cell():
+    from autogram.calibrate import _ColumnScaleView
+
+    df = pd.DataFrame({"total": [{"value": 1.0}, {"value": 2.0}]})
+
+    with pytest.raises(ValueError, match="cannot decode column"):
+        _ColumnScaleView(df).col("total")
+
+
+def test_column_scale_view_detects_a_runtime_decoding_mismatch():
+    from autogram.calibrate import _ColumnScaleView
+
+    class _Frame:
+        def has(self, column: str) -> bool:
+            return True
+
+        def col(self, column: str) -> np.ndarray:
+            return np.zeros(4)
+
+    df = pd.DataFrame({
+        "total": [{"ground_truth": float(v)} for v in (1.0, 2.0, 3.0, 4.0)],
+    })
+    view = _ColumnScaleView(df)
+    view.col("total")
+
+    with pytest.raises(ValueError, match="differently from the runtime frame"):
+        view.assert_matches_runtime(_Frame())
+
+
+def test_column_scale_view_fails_loudly_on_a_non_numeric_cell():
+    from autogram.calibrate import _ColumnScaleView
+
+    df = pd.DataFrame({"archetype": ["steady", "burst", "drain"]})
+
+    with pytest.raises(ValueError, match="is not numeric"):
+        _ColumnScaleView(df).col("archetype")

@@ -33,6 +33,27 @@ import pandas as pd
 from ..loader.names import ColumnSemantics
 
 
+def decode_observed_cell(value, primary: str) -> float:
+    """Decode one stored cell to its observed scalar -- the ONE decoding rule in the engine.
+
+    A cell is either a mapping (the CrossCheck format, whose ``primary`` key carries the observed
+    value) or a plain number.  This is exported as a module-level function, rather than living only
+    inside :meth:`SchemaAdapter.decode_observed`, so that any code which has to reproduce the
+    runtime frame's view of a column -- notably the calibration split, which must canonicalize
+    known-invariant signatures exactly as recovery does but runs before an adapter exists -- shares
+    the rule instead of re-implementing it and drifting from it.
+    """
+    if hasattr(value, "get"):
+        value = value.get(primary)
+    if value is None:
+        return float("nan")
+    try:
+        missing = bool(pd.isna(value))
+    except (TypeError, ValueError):
+        missing = False
+    return float("nan") if missing else float(value)
+
+
 @dataclass
 class _Pattern:
     """One compiled :class:`~autogram.schema.spec.ColumnPattern`."""
@@ -249,15 +270,9 @@ class SchemaAdapter:
 
     # -- seam 4: cell codec --------------------------------------------------
     def decode_observed(self, v) -> float:
-        if self.codec_kind == "scalar":
-            if hasattr(v, "get"):
-                value = v.get(self.codec_primary)
-                return float("nan") if value is None or bool(pd.isna(value)) else float(value)
-            return float("nan") if v is None or bool(pd.isna(v)) else float(v)
-        if not hasattr(v, "get"):
-            return float("nan") if v is None or bool(pd.isna(v)) else float(v)
-        x = v.get(self.codec_primary)
-        return float("nan") if x is None or bool(pd.isna(x)) else float(x)
+        # Both codec kinds resolve a mapping cell through ``codec_primary`` and pass a scalar cell
+        # through unchanged, so there is a single shared rule; see :func:`decode_observed_cell`.
+        return decode_observed_cell(v, self.codec_primary)
 
     # -- glyphs (interpretability; role names are reused so engine unparse is unchanged) --
     def ref_glyph(self, role: str) -> str:

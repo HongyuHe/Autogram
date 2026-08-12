@@ -573,7 +573,38 @@ class EnumerationProposer:
         seen = set()
         conditioned_emitted = 0
         conditions = self._conditions()
-        for raw in self._candidate_rules():
+        precount = bool(
+            conditions
+            and self.G.conditional_enabled
+            and self.G.max_conditioned_rules > 0
+        )
+        # Pre-count the conditioned expansion before building any of it. ``conditioned_emitted``
+        # below counts conditioned VARIANTS -- before dedup, admissibility and triviality screening
+        # -- so `conditionable x |conditions|` is not an estimate but exactly the number the ceiling
+        # is compared against. Discovering that deep inside expansion means paying for the whole
+        # blow-up first; refusing here names both factors, so a mis-declared condition column is
+        # immediately diagnosable. The base rules are only materialised when a ceiling is actually
+        # declared, so an unbounded grammar keeps streaming them and does not pay for a second
+        # simultaneous copy of the candidate list.
+        raw_rules = (
+            list(self._candidate_rules()) if precount else self._candidate_rules()
+        )
+        if precount:
+            conditionable = sum(
+                1
+                for raw in raw_rules
+                if isinstance(raw.atom, A.Compare)
+                and self._conditional_candidate(raw)
+            )
+            projected = conditionable * len(conditions)
+            if projected > self.G.max_conditioned_rules:
+                raise SearchSpaceTruncatedError(
+                    f"conditioned grammar would expand {conditionable} conditionable rules over "
+                    f"{len(conditions)} conditions = {projected} conditioned candidates, exceeding "
+                    f"max_conditioned_rules={self.G.max_conditioned_rules}; raise the ceiling or "
+                    "tighten explicit condition bounds"
+                )
+        for raw in raw_rules:
             variants = [raw]
             if (
                 isinstance(raw.atom, A.Compare)

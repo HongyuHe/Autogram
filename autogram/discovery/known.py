@@ -469,45 +469,68 @@ def _exact_lag_bound_columns(result: DiscoveryResult, lag_op: str) -> set:
 
 
 
-def _col_scale(frame, col: str) -> float:
-    """Robust magnitude (median absolute value) of a column's observed data.
-
-    Returns 0.0 for a column the frame does not carry, so an unknown column is never treated as
-    negligible (it is kept, which keeps matching conservative).
-    """
+def _col_values(frame, col: str):
+    """Observed values of a column as a float vector, or ``None`` when the frame lacks it."""
     if not frame.has(col):
-        return 0.0
-    v = frame.col(col)
-    if v.size == 0:
-        return 0.0
-    v = v[~np.isnan(v)]
-    return float(np.median(np.abs(v))) if v.size else 0.0
+        return None
+    values = np.asarray(frame.col(col), dtype=float)
+    return values if values.size else None
+
+
+def _is_negligible_member(frame, col: str, anchor: np.ndarray, zero_tol: float) -> bool:
+    """Is ``col`` negligible against the anchor on EVERY row the sum can be graded on?
+
+    Negligibility is what licenses removing a member from a summed grouping, so it has to hold
+    wherever the sum is evaluated -- not merely on a typical row.  Deciding it with a central
+    statistic (the median absolute value) is unsound: a column that is ``0`` on 51% of the rows and
+    ``1000`` on the other 49% has a median of ``0`` and would be dropped, which would credit a known
+    invariant as recovered while it is violated on 49% of the data.  The recall figure is the
+    headline claim of the scoreboard, so the test is pointwise: the member must be within
+    ``zero_tol`` of the anchor's magnitude on *every* gradeable row.
+
+    Rows where either column is missing are excluded: the sum is undefined there, so they cannot
+    witness anything either way.  A row where both are exactly zero satisfies the test, which is
+    what keeps a structurally-zero member droppable on data that also contains all-zero rows.
+    """
+    values = _col_values(frame, col)
+    if values is None or values.shape != anchor.shape:
+        return False
+    gradeable = np.isfinite(values) & np.isfinite(anchor)
+    if not np.any(gradeable):
+        return False
+    return bool(np.all(
+        np.abs(values[gradeable]) <= zero_tol * np.abs(anchor[gradeable])
+    ))
 
 
 def _drop_negligible(cols, anchor_col: str, frame, zero_tol: float) -> frozenset:
     """Drop summed columns whose observed data is negligible against the anchor's scale.
 
-    A column that is (near-)zero across all observations adds ~0 to a sum, so removing it leaves
-    the sum -- and therefore the equality it feeds -- unchanged.  Two groupings that differ only by
-    such columns describe the *same* physical fact.  The negligibility scale is anchored on the
-    reference (left-hand side) column, so the test is dimensionless and dataset-agnostic.  We never
-    reduce a whole group to empty (that would collapse distinct laws), and unknown columns are kept.
+    A column that is (near-)zero on every gradeable row adds ~0 to a sum, so removing it leaves the
+    sum -- and therefore the equality it feeds -- unchanged.  Two groupings that differ only by such
+    columns describe the *same* physical fact.  The negligibility test is anchored on the reference
+    (left-hand side) column and applied row by row, so it is dimensionless, dataset-agnostic, and
+    cannot be satisfied by a member that is merely *usually* zero.  We never reduce a whole group to
+    empty (that would collapse distinct laws), and unknown columns are kept.
     """
-    scale = _col_scale(frame, anchor_col)
-    if scale <= 0.0:
-        return frozenset(cols)                       # no usable anchor scale -> do not canonicalize
-    thresh = zero_tol * scale
+    if zero_tol <= 0.0:
+        return frozenset(cols)                       # exact column-set matching requested
+    anchor = _col_values(frame, anchor_col)
+    if anchor is None or not np.any(np.isfinite(anchor) & (np.abs(anchor) > 0.0)):
+        return frozenset(cols)                       # no usable anchor -> do not canonicalize
     kept = frozenset(c for c in cols
-                     if not (frame.has(c) and _col_scale(frame, c) < thresh))
+                     if not _is_negligible_member(frame, c, anchor, zero_tol))
     return kept if kept else frozenset(cols)         # never canonicalize an entire group away
 
 
 def _canonicalize(sig, frame, zero_tol: float):
-    """Map a relation signature to a data-canonical form (near-zero sum members removed).
+    """Map a relation signature to a data-canonical form (negligible sum members removed).
 
     Only the sum-shaped signatures carry groupings, so only they are canonicalized; pairwise,
     zero, presence and one-sided signatures pass through unchanged.  The transform is idempotent
-    and strictly widens matching: anything that matched exactly still matches after canonicalizing.
+    and strictly widens matching: a member is removed only when it is negligible against the anchor
+    on *every* gradeable row, so the sum it feeds is unchanged everywhere it is evaluated, and
+    anything that matched exactly still matches after canonicalizing.
     """
     if not isinstance(sig, tuple) or not sig:
         return sig

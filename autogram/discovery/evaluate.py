@@ -20,6 +20,7 @@ from ..dsl.evaluate import (
     _ordered_groups,
     eval_term,
     ground,
+    robust_median,
 )
 from ..dsl.typecheck import _has_boolean_ref
 from ..evaluator.band import fit_band_auto, violation_magnitude
@@ -336,6 +337,9 @@ class DataOnlyEvaluator:
         op = rule.atom.op
 
         g = ground(rule, frame, nm, subsample=cfg.subsample, seed=cfg.seed)
+        overflow_rejection = self._overflow_rejection(rule, g)
+        if overflow_rejection is not None:
+            return overflow_rejection
         if rule.condition is not None and (
             g.graded_points < int(cfg.min_condition_points)
             or g.graded_condition_support < float(cfg.min_condition_fraction)
@@ -373,10 +377,10 @@ class DataOnlyEvaluator:
             rho = g.left - coefficient_by_point * g.right
             scale = np.maximum(np.abs(g.left), np.abs(coefficient_by_point * g.right))
             positive = scale[scale > 0]
-            floor = 1e-6 * (float(np.median(positive)) if positive.size else 1.0)
+            floor = 1e-6 * (robust_median(positive) if positive.size else 1.0)
             scale = np.maximum(scale, floor)
             parameters = {
-                "coefficient": float(np.median(list(coefficients.values()))),
+                "coefficient": float(robust_median(np.asarray(list(coefficients.values()), dtype=float))),
                 "coefficients": coefficients,
             }
             rho = rho[evaluation_mask]
@@ -481,6 +485,9 @@ class DataOnlyEvaluator:
             subsample=cfg.subsample,
             seed=cfg.seed,
         )
+        overflow_rejection = self._overflow_rejection(rule, g)
+        if overflow_rejection is not None:
+            return overflow_rejection
         if g.degenerate or g.n_points == 0:
             return self._reject(
                 rule,
@@ -574,6 +581,28 @@ class DataOnlyEvaluator:
             hold_rate=0.0, hold_rate_lo=0.0, hold_rate_hi=0.0, statistic="hold_rate",
             support=0.0, n_points=0, n_bindings=0, mdl_gain=0.0,
             strictness="reject", descriptor=(rule.binder, rule.length()))
+
+    def _overflow_rejection(self, rule: A.Rule, g):
+        """Refuse a candidate whose own arithmetic exceeded float64, else ``None``.
+
+        An overflowed row is not missing data: the operands were finite and the candidate's
+        expression blew up on them.  Dropping such rows would leave a rule graded on whatever
+        survived while its reported support still described the full population -- a false
+        discovery presented with full confidence -- so the candidate is refused outright with a
+        reason that names the blow-up rather than being quietly scored on a shrunken population.
+        """
+        overflow_points = int(getattr(g, "overflow_points", 0))
+        if overflow_points <= 0:
+            return None
+        fraction = float(getattr(g, "overflow_fraction", 0.0))
+        if fraction <= float(self.cfg.max_overflow_fraction):
+            return None
+        return self._reject(
+            rule,
+            "arithmetic overflowed float64 on "
+            f"{overflow_points} of {overflow_points + int(getattr(g, 'graded_points', 0))} "
+            f"grounded rows ({fraction:.3f} of attempted rows)",
+        )
 
     def _condition_support_rejection(self, rule: A.Rule):
         """Reject a conditioned rule whose condition selects too few rows, else ``None``.
@@ -933,14 +962,14 @@ class DataOnlyEvaluator:
         if not np.any(evaluation_mask):
             return self._reject(rule, "band center could not be fit")
         center = (
-            float(np.median(population[fit_mask]))
+            robust_median(population[fit_mask])
             if learned
             else float(rule.atom.center)
         )
         observed = population[evaluation_mask]
         scale = np.maximum(np.abs(observed), abs(center))
         positive = scale[scale > 0]
-        floor = 1e-6 * (float(np.median(positive)) if positive.size else 1.0)
+        floor = 1e-6 * (robust_median(positive) if positive.size else 1.0)
         scale = np.maximum(scale, floor)
         relative = np.abs(observed - center) / scale
         holds = relative <= float(self.cfg.tolerance) + 1e-15
