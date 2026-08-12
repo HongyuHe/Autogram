@@ -128,6 +128,25 @@ def _group_labels(frame, name_model, row_indices=None):
     return labels
 
 
+def _display_keys(labels) -> dict:
+    """Map raw group labels to collision-free display keys for reporting.
+
+    Reported parameters are persisted to JSON and to the learned `.dl` portfolio, so they have to
+    round-trip the *identity* of a group. Stringifying is lossy: distinct labels ``1`` and ``"1"``
+    collapse to one key and one group's fitted coefficient silently overwrites the other's, leaving
+    an accepted per-group law that cannot be audited or reproduced. Plain ``str`` is kept while it
+    is unambiguous -- that is the readable common case -- and only the colliding labels fall back to
+    ``repr``, which distinguishes them.
+    """
+    labels = list(labels)
+    plain = [str(label) for label in labels]
+    duplicated = {key for key in plain if plain.count(key) > 1}
+    return {
+        label: (repr(label) if text in duplicated else text)
+        for label, text in zip(labels, plain)
+    }
+
+
 def _group_hold_gate(
     holds,
     groups,
@@ -144,7 +163,9 @@ def _group_hold_gate(
     rates = {}
     lows = {}
     accepted = True
-    for label in dict.fromkeys(groups.tolist()):
+    ordered_labels = list(dict.fromkeys(groups.tolist()))
+    display = _display_keys(ordered_labels)
+    for label in ordered_labels:
         mask = np.asarray([
             item == label
             for item in groups
@@ -155,7 +176,7 @@ def _group_hold_gate(
             count,
             z=z,
         )
-        key = str(label)
+        key = display[label]
         rates[key] = group_rate
         lows[key] = group_lo
         gate_value = group_lo if use_wilson else group_rate
@@ -369,6 +390,7 @@ class DataOnlyEvaluator:
 
         rho = g.rho
         scale = g.scale
+        overflow_support = None
         parameters = {}
         evaluation_groups = _group_labels(
             frame,
@@ -424,6 +446,30 @@ class DataOnlyEvaluator:
                 )
                 if rejection is not None:
                     return rejection
+                # Tolerated overflow is still not evidence. The blown-up rows leave the scored
+                # population, and the reported support shrinks with them; otherwise a rule that is
+                # allowed a small overflow budget would be graded on the survivors while still
+                # claiming the full population, which is the very inflation the guard exists to
+                # prevent.
+                with np.errstate(over="ignore", invalid="ignore"):
+                    scored_scaled = coefficient_by_point * g.right
+                scored_overflow = _union_overflow(
+                    _blowup(scored_scaled, coefficient_by_point, g.right),
+                    _blowup(rho, g.left, scored_scaled),
+                )
+                if scored_overflow is not None:
+                    evaluation_mask = evaluation_mask & ~scored_overflow
+                    if not np.any(evaluation_mask):
+                        return self._reject(
+                            rule,
+                            "proportional law overflowed on every evaluated row",
+                        )
+                overflow_support = self._support_excluding(g, fit_blown)
+                support_rejection = self._graded_support_rejection(
+                    rule, g, fit_blown,
+                )
+                if support_rejection is not None:
+                    return support_rejection
             positive = scale[scale > 0]
             floor = 1e-6 * (robust_median(positive) if positive.size else 1.0)
             scale = np.maximum(scale, floor)
@@ -433,6 +479,11 @@ class DataOnlyEvaluator:
             }
             rho = rho[evaluation_mask]
             scale = scale[evaluation_mask]
+            # `_fit_proportional` sliced the group labels with the mask it returned; narrowing the
+            # mask above means they have to be re-sliced or they would be row-misaligned.
+            all_labels = _group_labels(frame, nm, g.row_indices)
+            if all_labels is not None:
+                evaluation_groups = all_labels[evaluation_mask]
 
         rel = np.abs(rho) / scale
         if op == "<|>":
@@ -509,7 +560,8 @@ class DataOnlyEvaluator:
         return Evaluation(
             rule=rule, accepted=ok, reason=reason, eps=eps,
             hold_rate=phat, hold_rate_lo=lo, hold_rate_hi=hi, statistic="hold_rate",
-            support=g.support, n_points=int(holds.size), n_bindings=g.n_bindings,
+            support=(g.support if overflow_support is None else overflow_support),
+            n_points=int(holds.size), n_bindings=g.n_bindings,
             mdl_gain=gain, strictness=strict, descriptor=descriptor, threshold=thr,
             raw_exact_sign=g.raw_exact_sign,
             parameters=parameters)
@@ -649,6 +701,37 @@ class DataOnlyEvaluator:
             if label in coefficients:
                 mapped[index] = coefficients[label]
         return mapped
+
+    @staticmethod
+    def _support_excluding(g, blown: int) -> float:
+        """``g.support`` with ``blown`` further rows removed from the graded population.
+
+        Tolerated overflow is still not evidence: the rows leave the scored population, so the
+        reported support has to leave with them.
+        """
+        attempted = int(g.attempted_points)
+        if not attempted or not g.n_candidates:
+            return g.support
+        graded = max(0, int(g.graded_points) - int(blown))
+        return (g.n_bindings / g.n_candidates) * (float(graded) / float(attempted))
+
+    def _graded_support_rejection(self, rule: A.Rule, g, blown: int):
+        """Re-apply the conditioned support floor after overflowed rows are excluded, else ``None``."""
+        if rule.condition is None:
+            return None
+        graded = max(0, int(g.graded_points) - int(blown))
+        attempted = int(g.n_bindings) * int(self.ds.observed.n_rows)
+        support = (float(graded) / float(attempted)) if attempted else 0.0
+        if (
+            graded < int(self.cfg.min_condition_points)
+            or support < float(self.cfg.min_condition_fraction)
+        ):
+            return self._reject(
+                rule,
+                "condition support below minimum after overflow "
+                f"({graded} points, {support:.3f} of rows)",
+            )
+        return None
 
     def _overflow_rejection(self, rule: A.Rule, g):
         """Refuse a candidate whose own arithmetic exceeded float64, else ``None``.
@@ -1238,9 +1321,10 @@ def _fit_proportional(g, frame, nm, cfg):
 
 
 def _reported_coefficients(coefficients: dict) -> dict:
-    """Serialisable view of the per-group coefficients (raw labels -> display keys)."""
+    """Serialisable view of the per-group coefficients (raw labels -> collision-free keys)."""
+    display = _display_keys(coefficients)
     return {
-        ("global" if label == "__global__" else str(label)): value
+        ("global" if label == "__global__" else display[label]): value
         for label, value in coefficients.items()
     }
 

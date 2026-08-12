@@ -240,12 +240,23 @@ def test_robust_median_matches_numpy_on_ordinary_samples():
 
 
 def test_term_cache_charges_both_members_of_a_cached_pair():
-    cache = TermCache(max_entries=8, max_bytes=1_024)
-    for index in range(10):
-        cache[index] = (np.ones(100, dtype=float), np.zeros(100, dtype=bool))
+    # Exact accounting, not a bound: charging only the first member reports zero bytes for every
+    # entry, which satisfies any "<= max_bytes" assertion while letting the cache grow unbounded.
+    values = np.ones(100, dtype=float)
+    overflow = np.zeros(100, dtype=bool)
+    entry_bytes = int(values.nbytes) + int(overflow.nbytes)
 
-    assert cache.total_bytes <= 1_024
-    assert len(cache) <= 8
+    cache = TermCache(max_entries=8, max_bytes=10 * entry_bytes)
+    cache["only"] = (values.copy(), overflow.copy())
+    assert cache.total_bytes == entry_bytes
+
+    for index in range(10):
+        cache[index] = (values.copy(), overflow.copy())
+
+    # The byte ceiling, not the entry ceiling, is what evicts here.
+    assert cache.total_bytes == len(cache) * entry_bytes
+    assert cache.total_bytes <= 10 * entry_bytes
+    assert 0 < len(cache) <= 8
 
 
 def _definition_dataset(name: str):
@@ -601,3 +612,53 @@ def test_proportional_group_keys_do_not_collide_when_stringified():
     coefficients = fitted[0]
     assert len(coefficients) == 2, coefficients
     assert sorted(round(value, 6) for value in coefficients.values()) == [3.0, 10.0]
+
+
+def test_tolerated_post_fit_overflow_still_shrinks_reported_support():
+    """Round-32 review: an overflow inside the cap is tolerated, but it is not evidence.
+
+    With a non-zero `max_overflow_fraction` the rule is allowed through, yet the blown-up rows were
+    still scored and the reported support still described the whole population.
+    """
+    n = 1000
+    x = np.full(n, 1.0)
+    y = np.full(n, 1e308)
+    x[500] = 10.0                       # one post-fit overflow, 0.1% of the rows
+    dataset = _dataset(pd.DataFrame({"x": x, "y": y}), "tolerated_overflow")
+    cfg = DiscoveryConfig(
+        tolerance=0.05, hold_rate_threshold=0.62, band_mode="global", seed=0,
+        max_overflow_fraction=0.01,
+    )
+
+    result = DataOnlyEvaluator(dataset, cfg).evaluate(
+        A.Rule("record", A.Compare(A.Ref("y"), "~\u221d", A.Ref("x"))),
+    )
+
+    assert result.support < 1.0
+    assert abs(result.support - 0.999) < 1e-9
+
+
+def test_reported_group_keys_survive_labels_that_stringify_alike():
+    """Round-32 review: reporting re-introduced the collision that fitting had just removed.
+
+    The persisted parameters are the audit trail for an accepted per-group law, so two distinct
+    labels must not collapse into one key and lose a coefficient.
+    """
+    n = 120
+    labels = np.array([1 if index % 2 else "1" for index in range(n)], dtype=object)
+    x = np.full(n, 2.0)
+    y = np.where(labels == 1, 6.0, 20.0)
+    frame = profile_dataframe(
+        pd.DataFrame({"group_id": labels, "x": x, "y": y}), group_keys=("group_id",),
+    )
+    dataset, _grammar = build_dataframe_grammar(frame, _base_spec(), name="reported_groups")
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(tolerance=0.02, hold_rate_threshold=0.85, band_mode="global", seed=0),
+    ).evaluate(A.Rule("record", A.Compare(A.Ref("y"), "~\u221d", A.Ref("x"))))
+
+    reported = result.parameters["coefficients"]
+    assert len(reported) == 2, reported
+    assert sorted(round(value, 6) for value in reported.values()) == [3.0, 10.0]
+    assert len(result.parameters["group_hold_rates"]) == 2

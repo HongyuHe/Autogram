@@ -636,3 +636,41 @@ def test_condition_precount_includes_cross_column_conjunctions():
 
     with pytest.raises(SearchSpaceTruncatedError, match="condition grammar would enumerate"):
         EnumerationProposer(grammar).propose()
+
+
+def test_condition_precount_matches_what_is_actually_generated():
+    """Round-32 review: the ceiling must not refuse a grammar it could actually enumerate.
+
+    Only pairs from DIFFERENT columns become conjunctions, so counting `C(total_values, 2)`
+    overcounted by every same-column pair -- 1,000,405 projected against 956,038 generated, which
+    rejected a grammar that fits under the trusted ceiling.
+    """
+    from autogram.discovery.propose import EnumerationProposer
+    from autogram.dsl.grammar import Grammar
+
+    columns = {
+        f"c{index}": tuple(f"v{value}" for value in range(64))
+        for index in range(22)
+    }
+    columns["small"] = tuple(f"s{value}" for value in range(6))
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=",),
+        ref_roles={"record": ("x", "y")},
+        fam_roles={"record": ()},
+        max_complexity=10,
+        conditional_enabled=True,
+        condition_columns=columns,
+        max_condition_values=1,
+    )
+
+    # Does not raise, and the count it would have refused on is the count it really produces.
+    generated = EnumerationProposer(grammar)._conditions()
+
+    values = [len(v) for v in columns.values()]
+    simple_pairs = sum(
+        values[i] * values[j]
+        for i in range(len(values))
+        for j in range(i + 1, len(values))
+    )
+    assert len(generated) == sum(values) + simple_pairs

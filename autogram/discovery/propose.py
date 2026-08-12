@@ -808,20 +808,25 @@ class EnumerationProposer:
             if set(values) - {False, True, 0, 1}
         }
         total = 0
-        n_simple = 0
+        simple_per_column = []
         for column, raw_values in ranked:
             v = len(raw_values)
             if v <= 1:
                 continue
             total += v
             if column in categorical_columns:
-                n_simple += v
+                simple_per_column.append(v)
             for subset_size in range(2, min(cap, v - 1) + 1):
                 total += _math.comb(v, subset_size)
         # The cross-column conjunctions built below are conditions too, and they are quadratic in
         # the number of simple categorical equalities. Counting only the per-column subsets let
-        # millions of conditions materialise before the ceiling could fire.
-        total += _math.comb(n_simple, 2) if n_simple > 1 else 0
+        # millions of conditions materialise before the ceiling could fire. Only pairs from
+        # DIFFERENT columns are generated, so same-column pairs must not be counted or the ceiling
+        # would refuse a grammar it could actually enumerate.
+        running = 0
+        for v in simple_per_column:
+            total += running * v
+            running += v
         ceiling = _MAX_CONDITION_CANDIDATES
         if total > ceiling:
             raise SearchSpaceTruncatedError(

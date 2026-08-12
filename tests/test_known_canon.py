@@ -265,6 +265,84 @@ def test_stable_row_sum_is_order_independent_and_exact():
     ``frozenset``/``dict`` order makes the result depend on string hash randomisation -- and with it
     which members are canonicalized away, and therefore which side of the held-out boundary a
     catalogue entry lands on. The summation must be both deterministically ordered and exact.
+
+    Tested at this seam rather than through ``_drop_negligible``: a whole-function test cannot force
+    an adversarial iteration order, so it passes whether or not the summation is ordered, which is
+    no test at all (round-32 review).
+    """
+    from autogram.discovery.known import _stable_row_sum
+
+    columns = {
+        "a": np.array([0.03630875, 1e16]),
+        "b": np.array([0.04805217, 1.0]),
+        "c": np.array([0.04447561, -1e16]),
+        "d": np.array([0.02008216, 1.0]),
+    }
+
+    reference = _stable_row_sum(columns)
+    for order in (("d", "c", "b", "a"), ("b", "a", "d", "c"), ("c", "a", "d", "b")):
+        shuffled = {name: columns[name] for name in order}
+        assert _stable_row_sum(shuffled).tobytes() == reference.tobytes()
+
+    # Exact, not merely reproducible: naive accumulation of the second row loses the two ones.
+    assert reference[1] == 2.0
+    assert float(np.stack([columns[name] for name in ("a", "b", "c", "d")], axis=0).sum(axis=0)[1]) != 2.0
+
+
+def test_removal_may_not_widen_the_graded_population():
+    """Round-30 review: a member's own missingness restricts the sum's domain.
+
+    ``z`` is 0 on ten rows and missing on the other ninety, so ``total == SUM(real, z)`` is graded
+    on ten rows only. Dropping ``z`` produced ``total == SUM(real)``, which is graded on all one
+    hundred -- and fails on ninety of them. Canonicalisation may not hand the reduced relation rows
+    the original never had to satisfy.
+    """
+    names = ["total", "real", "z"]
+    n = 100
+    mat = np.zeros((n, len(names)))
+    mat[:, 1] = 500.0
+    mat[:, 0] = 500.0
+    mat[10:, 0] = 999.0          # `total == SUM(real)` is false on the last ninety rows
+    mat[:, 2] = np.nan
+    mat[:10, 2] = 0.0            # `z` is defined (and zero) only on the first ten rows
+    f = Frame(mat, names)
+
+    kept = _drop_negligible(frozenset({"real", "z"}), "total", f, zero_tol=1e-4)
+
+    assert kept == frozenset({"real", "z"})
+    assert _canonicalize(("ref_sum", ("total", frozenset({"real", "z"}))), f, 1e-4) != (
+        "ref_sum", ("total", frozenset({"real"}))
+    )
+
+
+def test_all_defined_zero_member_is_still_dropped():
+    # The domain-preserving requirement must not break the intended case: a member defined on every
+    # row where the anchor is defined, and zero throughout, is still removable.
+    names = ["total", "real", "z"]
+    n = 60
+    mat = np.zeros((n, len(names)))
+    mat[:, 1] = 500.0
+    mat[:, 0] = 500.0
+    mat[:, 2] = 0.0
+    mat[40:, 0] = np.nan         # the anchor itself is missing on the tail; `z` still qualifies
+    f = Frame(mat, names)
+
+    kept = _drop_negligible(frozenset({"real", "z"}), "total", f, zero_tol=1e-4)
+
+    assert kept == frozenset({"real"})
+
+
+def test_stable_row_sum_is_order_independent_and_exact():
+    """Round-30 review: the aggregate bound must not depend on hash-randomised iteration order.
+
+    Floating-point addition is not associative, so accumulating per-column magnitudes in
+    ``frozenset``/``dict`` order makes the result depend on string hash randomisation -- and with it
+    which members are canonicalized away, and therefore which side of the held-out boundary a
+    catalogue entry lands on. The summation must be both deterministically ordered and exact.
+
+    Tested at this seam rather than through ``_drop_negligible``: a whole-function test cannot force
+    an adversarial iteration order, so it passes whether or not the summation is ordered, which is
+    no test at all (round-32 review).
     """
     from autogram.discovery.known import _stable_row_sum
 
