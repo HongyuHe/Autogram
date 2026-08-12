@@ -1,0 +1,564 @@
+"""Ratio declarations and robust proportional-equality evaluation."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+
+from autogram.config import DiscoveryConfig
+from autogram.cli import _portfolio_payload
+from autogram.discovery.archive import ParetoArchive
+from autogram.discovery.evaluate import DataOnlyEvaluator
+from autogram.discovery.known import KnownInvariant, _signature, recover_known, shapes_for_invariant
+from autogram.discovery.loop import build_dataframe_grammar
+from autogram.discovery.propose import EnumerationProposer
+from autogram.discovery.validate import score_recovery
+from autogram.dsl import ast as A
+from autogram.dsl.grammar import Grammar
+from autogram.dsl.typecheck import is_admissible
+from autogram.loader.gtib import profile_dataframe
+from autogram.logic.solver import atom_expr, equivalent
+from autogram.schema.spec import CellCodec, ColumnPattern, GrammarSpec, RoleOntology
+
+
+def _base_spec() -> GrammarSpec:
+    return GrammarSpec(
+        name="flat",
+        patterns=(
+            ColumnPattern(
+                name="placeholder",
+                matcher="regex",
+                kind="unused",
+                direction="unused",
+                regex=r"^does_not_match$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("network",),
+            ref_roles={"network": ()},
+            fam_roles={"network": ()},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={"network": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+
+
+def _grammar() -> Grammar:
+    return Grammar(
+        binders=("record",),
+        ops=("~=", "==", "~∝"),
+        ref_roles={"record": ("x", "y", "ratio")},
+        fam_roles={"record": ()},
+        max_complexity=10,
+        max_degree=2,
+    )
+
+
+def test_proportional_operator_is_typed_enumerated_and_solver_screenable():
+    grammar = _grammar()
+    rule = A.Rule("record", A.Compare(A.Ref("y"), "~∝", A.Ref("x")))
+
+    assert is_admissible(rule, grammar)[0] is True
+    assert atom_expr(rule.atom, {}) is not None
+    assert any(r.atom.op == "~∝" for r in EnumerationProposer(grammar).propose())
+
+
+def test_proposer_enumerates_conditioned_proportionality():
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "x": np.arange(1.0, 41.0),
+            "y": np.arange(2.0, 82.0, 2.0),
+            "label": np.resize(
+                np.array(["normal", "alert"], dtype=object),
+                40,
+            ),
+        }),
+        condition_columns=("label",),
+        proportional=True,
+    )
+    _dataset, grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="conditioned_proportional",
+    )
+    target = A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+        condition=A.Condition("label", "==", ("normal",)),
+    )
+
+    assert target.signature() in {
+        rule.signature()
+        for rule in EnumerationProposer(grammar).propose()
+    }
+
+
+def test_proportional_evaluator_fits_robust_coefficient_per_group():
+    rng = np.random.default_rng(7)
+    n = 120
+    x = rng.uniform(10.0, 100.0, size=2 * n)
+    group = np.repeat(["a", "b"], n)
+    expected = np.where(group == "a", 1.7, 0.6)
+    y = expected * x
+    y[[5, 19, 131, 177]] *= 8.0
+    frame = profile_dataframe(
+        pd.DataFrame({"group_id": group, "x": x, "y": y}),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(frame, _base_spec(), name="proportional")
+    evaluator = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.02,
+            hold_rate_threshold=0.85,
+            band_mode="global",
+        ),
+    )
+
+    result = evaluator.evaluate(
+        A.Rule("record", A.Compare(A.Ref("y"), "~∝", A.Ref("x")))
+    )
+
+    assert result.accepted
+    assert result.strictness == "proportional"
+    assert abs(result.parameters["coefficients"]["a"] - 1.7) < 1e-9
+    assert abs(result.parameters["coefficients"]["b"] - 0.6) < 1e-9
+    assert result.hold_rate > 0.97
+    payload = _portfolio_payload(SimpleNamespace(
+        dataset=dataset,
+        rounds_run=1,
+        progress_history=[],
+        diagnostics=[],
+        portfolio=[result],
+    ))
+    assert payload["portfolio"][0]["parameters"]["coefficients"] == {
+        "a": 1.7,
+        "b": 0.6,
+    }
+
+
+def test_proportional_evaluator_checks_zero_predictor_rows():
+    x = np.ones(100, dtype=float)
+    x[:30] = 0.0
+    y = 2.0 * x
+    y[:30] = 5.0
+    frame = profile_dataframe(pd.DataFrame({"x": x, "y": y}))
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="proportional_zero",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.01,
+            hold_rate_threshold=0.9,
+            band_mode="global",
+            seed=0,
+        ),
+    ).evaluate(
+        A.Rule("record", A.Compare(A.Ref("y"), "~∝", A.Ref("x")))
+    )
+
+    assert not result.accepted
+    assert result.hold_rate < 0.7
+    assert result.n_points > 30
+
+
+def test_proportional_evaluator_keeps_all_zero_predictor_groups():
+    group = np.repeat(["valid", "violating"], [240, 120])
+    x = np.concatenate([
+        np.linspace(1.0, 240.0, 240),
+        np.zeros(120),
+    ])
+    y = np.concatenate([
+        2.0 * x[:240],
+        np.full(120, 7.0),
+    ])
+    frame = profile_dataframe(
+        pd.DataFrame({"group_id": group, "x": x, "y": y}),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="proportional_zero_group",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.01,
+            hold_rate_threshold=0.9,
+            band_mode="global",
+            seed=0,
+        ),
+    ).evaluate(
+        A.Rule("record", A.Compare(A.Ref("y"), "~\u221d", A.Ref("x")))
+    )
+
+    assert not result.accepted
+    assert result.hold_rate < 0.5
+    assert result.n_points >= 120
+
+
+def test_proportional_evaluator_requires_every_group_to_hold():
+    large_x = np.linspace(1.0, 990.0, 990)
+    small_x = np.linspace(1.0, 10.0, 10)
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "group_id": np.repeat(["large", "small"], [990, 10]),
+            "x": np.concatenate([large_x, small_x]),
+            "y": np.concatenate([
+                2.0 * large_x,
+                np.where(np.arange(10) % 2 == 0, small_x, 10.0 * small_x),
+            ]),
+        }),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="proportional_group_obligation",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.01,
+            hold_rate_threshold=0.9,
+            band_mode="global",
+            seed=0,
+        ),
+    ).evaluate(
+        A.Rule("record", A.Compare(A.Ref("y"), "~\u221d", A.Ref("x")))
+    )
+
+    assert not result.accepted
+    assert result.parameters["group_hold_rates"]["small"] < 0.9
+
+
+def test_adaptive_proportional_band_keeps_every_fitted_group():
+    large_x = np.linspace(1.0, 990.0, 990)
+    small_x = np.linspace(1.0, 10.0, 10)
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "group_id": np.repeat(["large", "small"], [990, 10]),
+            "x": np.concatenate([large_x, small_x]),
+            "y": np.concatenate([
+                2.0 * large_x,
+                np.where(
+                    np.arange(10) % 2 == 0,
+                    small_x,
+                    10.0 * small_x,
+                ),
+            ]),
+        }),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="adaptive_proportional_group_obligation",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.01,
+            hold_rate_threshold=0.62,
+            band_mode="adaptive",
+            seed=2,
+        ),
+    ).evaluate(
+        A.Rule("record", A.Compare(A.Ref("y"), "~\u221d", A.Ref("x")))
+    )
+
+    assert not result.accepted
+    assert set(result.parameters["group_hold_rates"]) == {"large", "small"}
+    assert result.parameters["group_hold_rate_lows"]["small"] < 0.62
+
+
+def test_adaptive_band_scores_only_held_out_rows():
+    n_rows = 400
+    permutation = np.random.default_rng(0).permutation(n_rows)
+    n_calibration = int(round(0.7 * n_rows))
+    calibration_rows = permutation[:n_calibration]
+    x = np.ones(n_rows, dtype=float)
+    y = np.full(n_rows, 2.0, dtype=float)
+    y[calibration_rows] = 1.0
+    frame = profile_dataframe(pd.DataFrame({"x": x, "y": y}))
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="adaptive_holdout",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.1,
+            hold_rate_threshold=0.62,
+            band_mode="adaptive",
+            band_holdout_frac=0.3,
+            seed=0,
+        ),
+    ).evaluate(
+        A.Rule("record", A.Compare(A.Ref("y"), "~=", A.Ref("x")))
+    )
+
+    assert not result.accepted
+    assert result.n_points == 120
+    assert result.hold_rate == 0.0
+
+
+def test_adaptive_band_keeps_and_gates_every_declared_group():
+    group = np.repeat(["large", "small"], [100, 2])
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "group_id": group,
+            "x": np.ones(102),
+            "y": np.concatenate([
+                np.ones(100),
+                np.full(2, 10.0),
+            ]),
+        }),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="adaptive_group_holdout",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.05,
+            hold_rate_threshold=0.8,
+            band_mode="adaptive",
+            seed=1,
+        ),
+    ).evaluate(
+        A.Rule("record", A.Compare(A.Ref("y"), "~=", A.Ref("x")))
+    )
+
+    assert not result.accepted
+    assert set(result.parameters["group_hold_rates"]) == {
+        "large",
+        "small",
+    }
+    assert result.parameters["group_hold_rate_lows"]["small"] < 0.8
+
+
+def test_exact_equality_rejects_soft_law_and_matching_is_one_way():
+    x = np.arange(1.0, 121.0)
+    soft_frame = profile_dataframe(pd.DataFrame({
+        "x": x,
+        "y": 1.04 * x,
+    }))
+    soft_dataset, _grammar_obj = build_dataframe_grammar(
+        soft_frame,
+        _base_spec(),
+        name="soft_equality",
+    )
+    evaluator = DataOnlyEvaluator(
+        soft_dataset,
+        DiscoveryConfig(
+            tolerance=0.05,
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    )
+    approximate = evaluator.evaluate(
+        A.Rule("record", A.Compare(A.Ref("y"), "~=", A.Ref("x")))
+    )
+    exact = evaluator.evaluate(
+        A.Rule("record", A.Compare(A.Ref("y"), "==", A.Ref("x")))
+    )
+    exact_known = [KnownInvariant("exact", "==", "y", "x")]
+
+    assert approximate.accepted
+    assert approximate.strictness == "soft"
+    assert not exact.accepted
+    assert recover_known(
+        SimpleNamespace(dataset=soft_dataset, portfolio=[approximate]),
+        exact_known,
+    )["recall"] == 0.0
+
+    exact_frame = profile_dataframe(pd.DataFrame({"x": x, "y": x.copy()}))
+    exact_dataset, _grammar_obj = build_dataframe_grammar(
+        exact_frame,
+        _base_spec(),
+        name="exact_equality",
+    )
+    exact_result = DataOnlyEvaluator(
+        exact_dataset,
+        DiscoveryConfig(hold_rate_threshold=0.9),
+    ).evaluate(
+        A.Rule("record", A.Compare(A.Ref("y"), "==", A.Ref("x")))
+    )
+    approximate_known = [KnownInvariant("approximate", "~=", "y", "x")]
+
+    assert exact_result.accepted
+    assert recover_known(
+        SimpleNamespace(dataset=exact_dataset, portfolio=[exact_result]),
+        approximate_known,
+    )["recall"] == 1.0
+
+
+def test_exact_equality_uses_ulp_scale_and_remains_distinct_in_archive():
+    x = np.full(400, 1e12, dtype=float)
+    y = x.copy()
+    y[-20:] = np.nextafter(x[-20:], np.inf)
+    too_far = x + 0.5
+    frame = profile_dataframe(pd.DataFrame({
+        "x": x,
+        "y": y,
+        "too_far": too_far,
+    }))
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="ulp_equality",
+    )
+    evaluator = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.05,
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    )
+    exact_rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "==", A.Ref("x")),
+    )
+    approximate_rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~=", A.Ref("x")),
+    )
+    too_far_rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("too_far"), "==", A.Ref("x")),
+    )
+    exact = evaluator.evaluate(exact_rule)
+    approximate = evaluator.evaluate(approximate_rule)
+    archive = ParetoArchive()
+    assert archive.add(approximate)
+    assert archive.add(exact)
+
+    assert exact.accepted
+    assert approximate.accepted
+    assert not evaluator.evaluate(too_far_rule).accepted
+    assert not equivalent(exact_rule, approximate_rule)
+    assert {evaluation.rule.atom.op for evaluation in archive.portfolio()} >= {
+        "==",
+        "~=",
+    }
+
+
+def test_ratio_and_proportional_known_signatures_recover():
+    x = np.arange(1.0, 121.0)
+    numerator = 3.0 * x
+    denominator = x + 2.0
+    ratio = numerator / denominator
+    proportional = 1.25 * x
+    frame = profile_dataframe(pd.DataFrame({
+        "x": x,
+        "numerator": numerator,
+        "denominator": denominator,
+        "ratio": ratio,
+        "proportional": proportional,
+    }))
+    dataset, _grammar_obj = build_dataframe_grammar(frame, _base_spec(), name="known")
+    evaluator = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(tolerance=1e-9, hold_rate_threshold=0.95, band_mode="global"),
+    )
+    ratio_rule = A.Rule(
+        "record",
+        A.Compare(
+            A.Ref("ratio"),
+            "==",
+            A.Div(A.Ref("numerator"), A.Ref("denominator")),
+        ),
+    )
+    proportional_rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("proportional"), "~∝", A.Ref("x")),
+    )
+    portfolio = [evaluator.evaluate(ratio_rule), evaluator.evaluate(proportional_rule)]
+    result = SimpleNamespace(portfolio=portfolio, dataset=dataset)
+    known = [
+        KnownInvariant(
+            "ratio",
+            "==",
+            "ratio",
+            {"ratio": ["numerator", "denominator"]},
+        ),
+        KnownInvariant("proportional", "~∝", "proportional", "x"),
+    ]
+
+    report = recover_known(result, known)
+
+    assert report["recall"] == 1.0
+    assert _signature(known[0])[:2] == ("equality", "exact")
+    assert _signature(known[0])[2][0] == "ratio"
+    assert _signature(known[1])[0] == "proportional"
+    assert shapes_for_invariant(known[0]) == ["ratio"]
+    assert shapes_for_invariant(known[1]) == ["proportional"]
+
+
+def test_ratio_and_proportional_proxy_recovery_fields_are_numeric(monkeypatch):
+    result = SimpleNamespace(portfolio=[])
+    planted = {
+        "ratio": {("ratio", "numerator", "denominator")},
+        "proportional": {("proportional", "x")},
+    }
+    monkeypatch.setattr(
+        "autogram.discovery.validate.portfolio_relations",
+        lambda _result: {
+            ("ratio", ("ratio", "numerator", "denominator")),
+            ("proportional", ("proportional", "x")),
+        },
+    )
+
+    recovery = score_recovery(result, planted)
+
+    assert recovery.ratio == 1.0
+    assert recovery.proportional == 1.0
+
+
+def test_proportional_rule_rejects_one_coefficient_per_unique_group():
+    rng = np.random.default_rng(11)
+    n = 100
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "request_id": [f"request-{index}" for index in range(n)],
+            "x": rng.uniform(1.0, 10.0, size=n),
+            "y": rng.uniform(1.0, 10.0, size=n),
+        }),
+        group_keys=("request_id",),
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(frame, _base_spec(), name="unique")
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.01,
+            hold_rate_threshold=0.8,
+            band_mode="global",
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+    ))
+
+    assert not result.accepted
+    assert "coefficient could not be fit" in result.reason

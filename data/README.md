@@ -470,9 +470,9 @@ Unlike `crosscheck-samples` (one wide pickle whose columns carry the entity iden
 
 | File | Grain (one row =) | Rows × cols | Contents |
 |------|-------------------|-------------|----------|
-| [`gtib-emulation/timeseries_raw.csv`](gtib-emulation/timeseries_raw.csv) | one shard at one 10 s scrape | 36720 × 7 | the two observed cumulative counters + `missing_flag`/`reset_flag` |
-| [`gtib-emulation/timeseries_derived.csv`](gtib-emulation/timeseries_derived.csv) | one consumer at one 1 min step | 2160 × 16 | per-minute rates, ratios, the alert outputs, hidden ground truth, and labels |
-| [`gtib-emulation/events.csv`](gtib-emulation/events.csv) | one injected event | 13 × 12 | the ground-truth catalogue of what was injected, where, and whether it should alert |
+| [`gtib-emulation/timeseries_raw.csv`](gtib-emulation/timeseries_raw.csv) | one shard at one 10 s scrape | 36720 × 9 | the two observed cumulative counters, quality flags, and per-shard hidden backlog/loss state |
+| [`gtib-emulation/timeseries_derived.csv`](gtib-emulation/timeseries_derived.csv) | one consumer at one 1 min step | 2160 × 17 | per-minute rates, ratios, the alert outputs, workload archetype, hidden ground truth, and labels |
+| [`gtib-emulation/events.csv`](gtib-emulation/events.csv) | one injected event | 27 × 12 | the ground-truth catalogue of what was injected, where, and whether it should alert |
 | [`gtib-emulation/manifest.json`](gtib-emulation/manifest.json) | the whole run | — | seed, effective config, scale, event counts, summary stats, and the static-vs-oracle evaluation |
 
 Time axis: 10 s raw scrapes aggregate to 1 min rates, which smooth over a 60 min window.
@@ -480,7 +480,7 @@ Default scale: 6 consumers (4 steady, 2 bursty), 17 shards total, 360 minutes, 2
 
 ### What the columns mean
 
-**`timeseries_raw.csv`** (the observed, noisy inputs a detector actually sees):
+**`timeseries_raw.csv`** (the observed, noisy counters plus optional hidden state used to validate cross-grain discovery):
 
 | Column | dtype | Meaning |
 |--------|-------|---------|
@@ -489,12 +489,13 @@ Default scale: 6 consumers (4 steady, 2 bursty), 17 shards total, 360 minutes, 2
 | `presenter_output_counted` | float64 | cumulative bytes counted at the Presenter (same behaviour; already carries the metering offset and scrape noise) |
 | `missing_flag` | bool | this scrape was dropped (counter is NaN) |
 | `reset_flag` | bool | the counter restarted at this step (a task death) |
+| `backlog_bytes`, `cum_lost_bytes` | float64 | per-shard hidden physical state emitted when `include_hidden_state` is enabled; these make the B7 boundary sums testable |
 
 **`timeseries_derived.csv`** (the per-minute alerting math plus hidden ground truth and labels):
 
 | Column | dtype | Layer | Meaning |
 |--------|-------|-------|---------|
-| `timestamp`, `consumer_id`, `minute_index` | str/int | identity | minute boundary and tenant |
+| `timestamp`, `consumer_id`, `minute_index`, `archetype` | str/int | identity | minute boundary, tenant, and workload class (`steady` or `bursty_ml`) |
 | `input_rate_bytes_per_min`, `output_rate_bytes_per_min` | float64 | observed | per-minute byte increments summed over the consumer's shards |
 | `completeness_ratio` | float64 | derived | `output_rate / input_rate` over one minute |
 | `completeness_ratio_1h` | float64 | derived | 60-minute rolling ratio-of-sums |
@@ -505,7 +506,7 @@ Default scale: 6 consumers (4 steady, 2 bursty), 17 shards total, 360 minutes, 2
 | `label` | str | label | `normal` / `true_loss` / `benign_burst` / `artifact` (priority `true_loss` ≻ `benign_burst` ≻ `artifact` ≻ `normal`) |
 | `oracle_alert` | bool | label | the correct answer: equals `is_true_loss` |
 
-Default `label` distribution: `normal` 1380, `true_loss` 644, `benign_burst` 133, `artifact` 3.
+Default `label` distribution: `normal` 1425, `true_loss` 644, `benign_burst` 88, `artifact` 3.
 
 ### Reading a value out of a cell
 
@@ -552,12 +553,13 @@ Shorthand: raw per shard `s` at step `t` — `I[s,t] = collector_input_counted`,
 | B4 | Static-alert definition | `SA = 1` iff `CR1h < 0.99` for ≥ 10 consecutive minutes | sustained-threshold run-length predicate |
 | B5 | Trajectory-alert definition | `TA = (CR1h < 0.98) ∧ (Σ_{last 45 min}(IR − OR) > 0) ∧ (CR1h[m] − CR1h[m−45] ≤ 0)` | conjunction of a bound, a windowed-deficit sign, and a lagged slope |
 | B6 | Oracle and label identities | `oracle_alert = is_true_loss`; `label` is the priority pick over the masks; each mask is the OR of event spans covering the minute | categorical / boolean-from-spans |
-| B7 | Hidden-GT minute aggregation | `B[c,m] = Σ_s Q[s, last step of m]`, `L[c,m] = Σ_s cum_true_loss[s, last step of m]` | n-ary SUM at a boundary |
+| B7 | Hidden-GT minute aggregation | `B[c,m] = Σ_s Q[s, last step of m]`, `L[c,m] = Σ_s cum_true_loss[s, last step of m]` | n-ary cross-grain SUM at a boundary, now directly testable from the raw hidden-state columns |
 
 A further modeled relation is **metering proportionality**: each observed output increment is approximately `eta` times the physical increment, with a per-consumer constant `eta ∈ [0.98, 1.0]` (default `≈ 0.998`).
 It is the gtib analogue of the ~2% origination/termination deficit in `crosscheck-samples`, but here it is an explicit multiplicative constant rather than an additive gap.
+The physical output increment is not emitted, so this exact metering relation cannot be recovered from the CSVs; `configs/gtib_known.yaml` instead includes observed input/output proportionality as a generic fitted-coefficient exercise and does not label it as the hidden metering law.
 
-**Deliberate anti-invariant.** `CR` is **not** bounded above by 1: after a burst, the queue drains faster than it filled, so the output rate temporarily exceeds the input rate and the ratio overshoots (this run reaches `4.85`).
+**Deliberate anti-invariant.** `CR` is **not** bounded above by 1: after a burst, the queue drains faster than it filled, so the output rate temporarily exceeds the input rate and the ratio overshoots (this run reaches `4.94675`).
 A detector that assumes `ratio ≤ 1` is wrong on gtib.
 
 ### Comparison to `crosscheck-samples`
@@ -571,7 +573,7 @@ The two datasets share a **data-generation philosophy** (a physical system plus 
 | Where identity lives | in column names (`low_X_egress_to_Y`, `high_S_D`) | in row values (`consumer_id`, `shard_id`, `minute_index`) |
 | Time semantics | rows are independent, exchangeable snapshots | intrinsically a time series (rates, rolling windows, cumulative counters, sustained alerts) |
 | Dominant invariant shapes | per-snapshot algebraic (equality, family sum, conservation, zero, presence, non-negativity) | temporal and dynamic (rates, windowed ratios, monotonicity, run-length predicates, guarded relations) |
-| Scale (default) | 237 / 681 vars × 1000 snapshots | 16 derived + 7 raw columns × 2160 / 36720 rows |
+| Scale (default) | 237 / 681 vars × 1000 snapshots | 17 derived + 9 raw columns × 2160 / 36720 rows |
 
 **Shared invariant shapes** (the same forms `crosscheck-samples` exercises):
 
@@ -621,10 +623,9 @@ print("B1 max abs error:", err)
 Expected output:
 
 ```
-raw (36720, 7) | derived (2160, 16) | events (13, 12)
-labels: {'normal': 1380, 'true_loss': 644, 'benign_burst': 133, 'artifact': 3}
+raw (36720, 9) | derived (2160, 17) | events (27, 12)
+labels: {'normal': 1425, 'true_loss': 644, 'benign_burst': 88, 'artifact': 3}
 B1 max abs error: 4.4e-16
 ```
 
 To re-run the emulator's own hard/soft invariant checks: `cd ../generator && uv run python -m gtib_emulator validate --config config.yaml`.
-

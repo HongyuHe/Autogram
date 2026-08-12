@@ -1,8 +1,7 @@
 """Typed, total DSL for soft data invariants.
 
 The genotype the discovery search manipulates is a :class:`Rule`: a *quantified atom*
-``forall b in Binder: left(b) <op> right(b)``.  Terms are a small, total, side-effect-free
-algebra (field reference, constant, scalar multiply, n-ary add, family aggregation).
+``forall b in Binder: atom(b)``. Terms are a small, total, side-effect-free algebra over field references, constants, bounded arithmetic, family/related aggregation, and grouped temporal operators; atoms also include bounded Boolean and categorical definitions.
 Everything is plain data -- no embedded Python code -- so a rule is serializable, statically
 checkable, and trivially terminating.
 
@@ -21,16 +20,43 @@ Surface syntax (ASCII):
     <|>    bidirectional structural presence
     *    scalar multiply
     SUM/MIN/MAX/AVG(role)   family aggregation
+    LAG_k(term), DELTA_k(term), ROLL_SUM_k(term)   grouped temporal terms
+    RELATED(role)   declared cross-grain aggregation
+    target := ALWAYS_k(bound) | conjunction | categorical priority map
 """
 
 from __future__ import annotations
 
+import json
+import math
+import numbers
 from dataclasses import dataclass
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 # Operator and aggregation vocabularies are intrinsic to the DSL (not dataset-specific).
-OPS = ("~=", "==", "<=", ">=", "!=", "<|>")
+OPS = ("~=", "==", "<=", ">=", "<", ">", "!=", "<|>", "~∝")
 AGG_KINDS = ("SUM", "MIN", "MAX", "AVG")
+
+
+def _scalar_unparse(value: object) -> str:
+    if value is None or isinstance(value, (str, bool)):
+        scalar = value
+    elif isinstance(value, numbers.Integral):
+        scalar = int(value)
+    elif isinstance(value, numbers.Real):
+        scalar = float(value)
+        if not math.isfinite(scalar):
+            raise ValueError("DSL scalar values must be finite")
+    else:
+        raise TypeError(
+            f"DSL scalar values must be strings, booleans, numbers, or null; got {value!r}"
+        )
+    return json.dumps(
+        scalar,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +177,75 @@ class Div:
         return f"({self.num.unparse()} / {self.den.unparse()})"
 
 
-Term = Union[Ref, Const, Scale, Add, Agg, Mul, Div]
+@dataclass(frozen=True)
+class Lag:
+    """Backshift ``B^steps term`` within each ordered group."""
+
+    term: "Term"
+    steps: int = 1
+
+    def complexity(self) -> int:
+        return 1 + self.term.complexity()
+
+    def degree(self) -> int:
+        return self.term.degree()
+
+    def unparse(self) -> str:
+        return f"LAG_{self.steps}({self.term.unparse()})"
+
+
+@dataclass(frozen=True)
+class Diff:
+    """Finite difference ``term[t] - term[t-steps]`` within an ordered group."""
+
+    term: "Term"
+    steps: int = 1
+
+    def complexity(self) -> int:
+        return 1 + self.term.complexity()
+
+    def degree(self) -> int:
+        return self.term.degree()
+
+    def unparse(self) -> str:
+        return f"DELTA_{self.steps}({self.term.unparse()})"
+
+
+@dataclass(frozen=True)
+class Rolling:
+    """Trailing full-window aggregation within each ordered group."""
+
+    term: "Term"
+    window: int
+    kind: str = "SUM"
+
+    def complexity(self) -> int:
+        return 1 + self.term.complexity()
+
+    def degree(self) -> int:
+        return self.term.degree()
+
+    def unparse(self) -> str:
+        return f"ROLL_{self.kind}_{self.window}({self.term.unparse()})"
+
+
+@dataclass(frozen=True)
+class RelatedAgg:
+    """A declared aggregation over a related finer-grain frame."""
+
+    role: str
+
+    def complexity(self) -> int:
+        return 2
+
+    def degree(self) -> int:
+        return 1
+
+    def unparse(self) -> str:
+        return f"RELATED({self.role})"
+
+
+Term = Union[Ref, Const, Scale, Add, Agg, Mul, Div, Lag, Diff, Rolling, RelatedAgg]
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +266,103 @@ class Compare:
 
 
 @dataclass(frozen=True)
+class Bound:
+    """A numeric bound used inside a Boolean definition."""
+
+    term: Term
+    op: str
+    threshold: Optional[float] = None
+
+    def complexity(self) -> int:
+        return 1 + self.term.complexity()
+
+    def unparse(self) -> str:
+        threshold = "?" if self.threshold is None else Const(float(self.threshold)).unparse()
+        return f"{self.term.unparse()} {self.op} {threshold}"
+
+
+@dataclass(frozen=True)
+class Sustained:
+    """A predicate that must hold for a full trailing window."""
+
+    predicate: Bound
+    window: int
+
+    def complexity(self) -> int:
+        return 1 + self.predicate.complexity()
+
+    def unparse(self) -> str:
+        return f"ALWAYS_{self.window}({self.predicate.unparse()})"
+
+
+@dataclass(frozen=True)
+class Conjunction:
+    """A bounded conjunction of Boolean predicates."""
+
+    predicates: Tuple[Union[Bound, Sustained], ...]
+
+    def complexity(self) -> int:
+        return 1 + sum(predicate.complexity() for predicate in self.predicates)
+
+    def unparse(self) -> str:
+        return " AND ".join(f"({predicate.unparse()})" for predicate in self.predicates)
+
+
+Predicate = Union[Bound, Sustained, Conjunction]
+
+
+@dataclass(frozen=True)
+class BooleanDefinition:
+    """A Boolean measured target defined by a total predicate."""
+
+    target: Term
+    predicate: Predicate
+
+    def complexity(self) -> int:
+        return 1 + self.target.complexity() + self.predicate.complexity()
+
+    def unparse(self) -> str:
+        return f"{self.target.unparse()} := {self.predicate.unparse()}"
+
+
+@dataclass(frozen=True)
+class CategoryDefinition:
+    """A priority map from Boolean context columns to one categorical target."""
+
+    target_column: str
+    cases: Tuple[Tuple[str, object], ...]
+    default: object
+
+    def complexity(self) -> int:
+        return 2 + len(self.cases)
+
+    def unparse(self) -> str:
+        cases = ", ".join(
+            f"{column}->{_scalar_unparse(value)}"
+            for column, value in self.cases
+        )
+        return (
+            f"{self.target_column} := PRIORITY("
+            f"{cases}; default={_scalar_unparse(self.default)})"
+        )
+
+
+@dataclass(frozen=True)
+class BandDefinition:
+    """A measured term concentrated around a learned or declared center."""
+
+    term: Term
+    center: Optional[float] = None
+
+    def complexity(self) -> int:
+        return 1 + self.term.complexity()
+
+    def unparse(self) -> str:
+        center = "?" if self.center is None else Const(float(self.center)).unparse()
+        return f"{self.term.unparse()} ~band {center}"
+
+
+@dataclass(frozen=True)
 class Rule:
     """A quantified atom: ``forall b in <binder>: <atom>``.
 
@@ -179,19 +370,45 @@ class Rule:
     affects evaluation.
     """
     binder: str
-    atom: Compare
+    atom: Union[Compare, BooleanDefinition, CategoryDefinition, BandDefinition]
     tag: str = ""
+    condition: Optional["Condition"] = None
 
     def complexity(self) -> int:
-        return 1 + self.atom.complexity()
+        return 1 + self.atom.complexity() + (1 if self.condition is not None else 0)
 
     def length(self) -> int:
         """Token length used as the parsimony axis of the Pareto archive."""
         return self.atom.complexity()
 
     def unparse(self) -> str:
-        return f"[forall {self.binder}] {self.atom.unparse()}"
+        suffix = f" where {self.condition.unparse()}" if self.condition is not None else ""
+        return f"[forall {self.binder}] {self.atom.unparse()}{suffix}"
 
     def signature(self) -> str:
         """Structural identity ignoring the tag (used for dedup / archive keys)."""
-        return f"{self.binder}::{self.atom.unparse()}"
+        condition = f" where {self.condition.unparse()}" if self.condition is not None else ""
+        return f"{self.binder}::{self.atom.unparse()}{condition}"
+
+
+@dataclass(frozen=True)
+class Condition:
+    """A bounded row filter over one categorical or Boolean context column."""
+
+    column: str
+    op: str
+    values: Tuple[object, ...]
+
+    def unparse(self) -> str:
+        if self.op == "all":
+            return "ALL(" + ", ".join(
+                value.unparse() for value in self.values
+                if isinstance(value, Condition)
+            ) + ")"
+        if self.op == "in":
+            return (
+                f"{self.column} in ("
+                f"{', '.join(_scalar_unparse(value) for value in self.values)})"
+            )
+        value = self.values[0] if self.values else ""
+        return f"{self.column} {self.op} {_scalar_unparse(value)}"

@@ -2,13 +2,48 @@
 
 from __future__ import annotations
 
+import numpy as np
+
 from autogram.config import DiscoveryConfig
 from autogram.discovery.evaluate import DataOnlyEvaluator
 from autogram.dsl import ast as A
+from autogram.loader.loader import TermCache
 
 
 def _rule(binder, left, op, right):
     return A.Rule(binder, A.Compare(left, op, right))
+
+
+def test_matrix_build_dataset_populates_declared_time_context():
+    # Round-22: the matrix path must publish the declared time index (and any grouping columns) into
+    # ``Frame.row_context``, exactly like the DataFrame path. Storing timestamps only on the Dataset
+    # left temporal grounding unable to find the time column, so every temporal rule grounded to
+    # ZERO points and the whole temporal tier silently vanished for matrix-built datasets.
+    from dataclasses import replace as dc_replace
+
+    from autogram.discovery import synth
+    from autogram.discovery.induce import induce_spec
+    from autogram.dsl.evaluate import ground
+    from autogram.loader.loader import build_dataset
+    from autogram.schema import compile_spec
+
+    data = synth.make_synthetic(n_entities=3, n_snapshots=20, noise=0.0, seed=0)
+    spec = dc_replace(induce_spec(data.columns), time_index="timestamp", group_keys=())
+    adapter = compile_spec(spec)
+    timestamps = np.arange(data.matrix.shape[0])
+
+    dataset = build_dataset(data.columns, data.matrix, adapter, "matrix", timestamps=timestamps)
+
+    assert dataset.time_index == "timestamp"
+    assert "timestamp" in dataset.observed.row_context
+    binder = spec.ontology.binders[0]
+    role = adapter.ref_roles[binder][0]
+    grounded = ground(
+        A.Rule(binder, A.Compare(A.Diff(A.Ref(role), 1), ">=", A.Const(0))),
+        dataset.observed,
+        dataset.name_model,
+    )
+    assert grounded.n_points > 0
 
 
 def test_accepts_two_end_agreement_by_hold_rate(dataset):
@@ -77,6 +112,25 @@ def test_accepts_one_sided_nonnegativity(dataset):
     assert res.accepted
     assert res.hold_rate == 1.0
     assert res.strictness == "one-sided"
+
+
+def test_term_cache_is_bounded_by_entries_and_bytes():
+    cache = TermCache(max_entries=3, max_bytes=1_024)
+    for index in range(10):
+        cache[index] = np.ones(100, dtype=float)
+
+    assert len(cache) <= 3
+    assert cache.total_bytes <= 1_024
+
+
+def test_term_cache_can_release_all_retained_arrays():
+    cache = TermCache()
+    cache["value"] = np.ones(100, dtype=float)
+
+    cache.clear()
+
+    assert len(cache) == 0
+    assert cache.total_bytes == 0
 
 
 def test_solver_rejects_tautology(dataset):

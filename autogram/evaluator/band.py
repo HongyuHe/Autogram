@@ -28,9 +28,9 @@ def violation_magnitude(op: str, rho: np.ndarray, s: np.ndarray) -> np.ndarray:
     (it rewards *large* separation), so it is treated two-sided here for fitting purposes.
     """
     r = rho / s
-    if op == "<=":
+    if op in ("<=", "<"):
         return np.maximum(0.0, r)
-    if op == ">=":
+    if op in (">=", ">"):
         return np.maximum(0.0, -r)
     return np.abs(r)
 
@@ -42,6 +42,32 @@ def _split(n: int, holdout_frac: float, seed: int):
     return idx[:n_cal], idx[n_cal:]
 
 
+def _grouped_split(groups: np.ndarray, holdout_frac: float, seed: int):
+    calibration = []
+    evaluation = []
+    for group_index, label in enumerate(dict.fromkeys(groups.tolist())):
+        positions = np.flatnonzero(np.asarray([
+            item == label
+            for item in groups
+        ], dtype=bool))
+        if positions.size == 1:
+            evaluation.append(int(positions[0]))
+            continue
+        rng = np.random.default_rng(int(seed) + group_index)
+        shuffled = rng.permutation(positions)
+        n_cal = max(
+            1,
+            int(round((1.0 - holdout_frac) * positions.size)),
+        )
+        n_cal = min(n_cal, positions.size - 1)
+        calibration.extend(shuffled[:n_cal].tolist())
+        evaluation.extend(shuffled[n_cal:].tolist())
+    return (
+        np.asarray(calibration, dtype=int),
+        np.asarray(evaluation, dtype=int),
+    )
+
+
 @dataclass
 class BandFit:
     eps: float            # dimensionless tolerance on |rho|/s
@@ -49,6 +75,7 @@ class BandFit:
     cov_eval: float       # honest coverage on the held-out split
     n_eval: int           # held-out point count (for Wilson CI)
     k_eval: int           # held-out points inside the band
+    eval_indices: np.ndarray
 
 
 def _knee_index(vs: np.ndarray) -> int:
@@ -81,7 +108,8 @@ def knee_coverage(v: np.ndarray) -> float:
 
 
 def fit_band_auto(op: str, rho: np.ndarray, s: np.ndarray,
-                  holdout_frac: float, seed: int, cap: float | None = None):
+                  holdout_frac: float, seed: int, cap: float | None = None,
+                  groups: np.ndarray | None = None):
     """Self-calibrated band fit: set ``eps`` at the residual knee, coverage honest on held-out.
 
     The band edge is the *core's upper value* at the knee (split-conformal when there are
@@ -100,8 +128,30 @@ def fit_band_auto(op: str, rho: np.ndarray, s: np.ndarray,
     v = violation_magnitude(op, rho, s)
     n = v.size
     if n == 0:
-        return BandFit(0.0, 0.0, 0.0, 0, 0), 0.0
-    cal, ev = _split(n, holdout_frac, seed)
+        return BandFit(
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0,
+            np.array([], dtype=int),
+        ), 0.0
+    if groups is None:
+        cal, ev = _split(n, holdout_frac, seed)
+    else:
+        groups = np.asarray(groups, dtype=object)
+        if groups.shape != (n,):
+            raise ValueError("band-fit groups must align with residual points")
+        cal, ev = _grouped_split(groups, holdout_frac, seed)
+        if not cal.size or not ev.size:
+            return BandFit(
+                0.0,
+                0.0,
+                0.0,
+                0,
+                0,
+                np.array([], dtype=int),
+            ), 0.0
     vc = np.sort(v[cal])
     i = _knee_index(vc)
     eps = float(vc[i])
@@ -109,8 +159,10 @@ def fit_band_auto(op: str, rho: np.ndarray, s: np.ndarray,
     if capped:
         eps = float(cap)
     cov_cal = float(np.mean(v[cal] <= eps + 1e-15))
-    k_eval = int(np.count_nonzero(v[ev] <= eps + 1e-15))
-    cov_eval = k_eval / ev.size if ev.size else cov_cal
+    eval_indices = ev if ev.size else cal
+    k_eval = int(np.count_nonzero(v[eval_indices] <= eps + 1e-15))
+    cov_eval = k_eval / eval_indices.size if eval_indices.size else cov_cal
     coverage = cov_cal if capped else (i + 1) / cal.size
     return BandFit(eps=eps, cov_cal=cov_cal, cov_eval=cov_eval,
-                   n_eval=int(ev.size), k_eval=k_eval), coverage
+                   n_eval=int(eval_indices.size), k_eval=k_eval,
+                   eval_indices=eval_indices), coverage

@@ -45,3 +45,34 @@ def test_no_exclusions_allows_everything():
     G = _grammar([])
     r = A.Rule("node", A.Compare(A.Ref("temp"), "~=", A.Ref("count")))
     assert is_admissible(r, G)[0] is True
+
+
+def test_add_arity_admissibility_respects_binder_specific_cap():
+    # A binder whose additive arity is capped tighter than the global bound must not admit a
+    # wider sum: admissibility is the exact enumeration contract, so a deserialized rule with a
+    # 3-term sum under a binder capped at arity 2 has to be rejected.
+    G = Grammar(
+        binders=("node",),
+        ops=("~=", "==", "<=", ">="),
+        ref_roles={"node": ("a", "b", "c", "d")},
+        fam_roles={"node": ()},
+        max_add_arity=4,
+        max_add_arity_by_binder={"node": 2},
+        max_complexity=20,
+    )
+    two = A.Rule(
+        "node",
+        A.Compare(A.Add((A.Ref("a"), A.Ref("b"))), "~=", A.Ref("c")),
+    )
+    three = A.Rule(
+        "node",
+        A.Compare(
+            A.Add((A.Ref("a"), A.Ref("b"), A.Ref("c"))),
+            "~=",
+            A.Ref("d"),
+        ),
+    )
+
+    assert is_admissible(two, G)[0] is True
+    ok, reason = is_admissible(three, G)
+    assert ok is False

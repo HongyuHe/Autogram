@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
@@ -25,6 +26,7 @@ from ..schema.spec import (
     FamilySelector,
     PRED_SLOTS,
     RefTemplate,
+    RelatedTemplate,
     RoleOntology,
     GrammarSpec,
 )
@@ -81,9 +83,24 @@ class SubagentSchemaInducer(SchemaInducer):
         for attempt in range(self.max_attempts):
             try:
                 raw = _load_json_object(payload)
-                spec = _spec_from_json(raw)
+                raw, spec, cleanup_notes = _normalize_prune_schema(
+                    raw, columns
+                )
                 _validate_schema_completeness(spec, columns)
-                _log_schema_event("schema_complete", {"attempt": attempt + 1, "backend": self.backend})
+                _log_schema_event(
+                    (
+                        "schema_repaired"
+                        if cleanup_notes
+                        else "schema_complete"
+                    ),
+                    {
+                        "attempt": attempt + 1,
+                        "backend": self.backend,
+                        **({
+                            "repairs": cleanup_notes,
+                        } if cleanup_notes else {}),
+                    },
+                )
                 return spec
             except SchemaCompletenessError as exc:
                 last_error = exc
@@ -91,13 +108,20 @@ class SubagentSchemaInducer(SchemaInducer):
                 if repair_notes:
                     try:
                         spec = _spec_from_json(repaired)
+                        spec, prune_notes = _prune_dead_roles(
+                            spec,
+                            columns,
+                        )
                         _validate_schema_completeness(spec, columns)
                         _log_schema_event(
                             "schema_repaired",
                             {
                                 "attempt": attempt + 1,
                                 "backend": self.backend,
-                                "repairs": repair_notes,
+                                "repairs": [
+                                    *repair_notes,
+                                    *prune_notes,
+                                ],
                                 "reason": str(exc)[:1000],
                             },
                         )
@@ -146,14 +170,18 @@ class OpenAISchemaInducer(SchemaInducer):
             msg = client.responses.create(model=self.model, input=prompt)
             payload = msg.output_text
         raw = _load_json_object(payload)
-        spec = _spec_from_json(raw)
         try:
+            _raw, spec, _cleanup_notes = _normalize_prune_schema(
+                raw, columns
+            )
             _validate_schema_completeness(spec, columns)
             return spec
         except SchemaCompletenessError as exc:
             repaired, repair_notes = _repair_schema_completeness(raw, columns)
             if repair_notes:
-                spec = _spec_from_json(repaired)
+                _raw, spec, _cleanup_notes = _normalize_prune_schema(
+                    repaired, columns
+                )
                 _validate_schema_completeness(spec, columns)
                 return spec
             raise RuntimeError("OpenAI returned incomplete GrammarSpec JSON") from exc
@@ -218,14 +246,21 @@ def _schema_prompt(columns, sample_rows) -> str:
         "EXACT_COLUMNS_BEGIN\n" + head + "\nEXACT_COLUMNS_END\n\n"
         "Top-level keys MUST be exactly: name, patterns, ontology, ref_templates, "
         "family_selectors, binder_enumerate, cell_codec, noisy_kind, demand_kind, "
-        "link_marker_direction, max_degree, role_exclusions, notes. The object must contain key 'ontology'.\n\n"
+        "link_marker_direction, max_degree, role_exclusions, notes, time_index, group_keys, "
+        "condition_columns, temporal_enabled, max_lag, windows, conditional_enabled, "
+        "max_condition_values, related_templates, boolean_roles, advanced_enabled, run_lengths, "
+        "max_conjunction_terms, metadata_columns, band_enabled. The object must contain key 'ontology'. Use empty strings, arrays, "
+        "or objects and false capability flags when a feature is not present.\n\n"
         "ColumnPattern fields: name, matcher, kind, direction, regex, node_groups, source_group, "
         "destination_group, peer_group, token_groups, prefix, sep, split_slots. Use matcher='regex' and "
         "anchored regexes. Ontology fields: binders, ref_roles, fam_roles, ops, agg_kinds, "
         "ref_glyphs, fam_glyphs. IMPORTANT: ref_roles and fam_roles must be JSON objects/maps "
         "from binder name to an array of role strings, not arrays of objects. RefTemplate fields: "
         "binder, role, template. FamilySelector fields: binder, family_role, match_kind, "
-        "match_direction, predicates. binder_enumerate must be a JSON object whose values are "
+        "match_direction, predicates, columns. RelatedTemplate fields: binder, role, relation, "
+        "column, mode, parent_keys, child_keys, partition_keys, parent_time, child_time, "
+        "window_seconds, reset_column, validity_columns, span_start, span_end, filter_column, "
+        "filter_values. binder_enumerate must be a JSON object whose values are "
         "plain strategy strings, never objects or column lists.\n\n"
         "Use these Autogram role conventions:\n"
         "1. Always include binder 'cell' with ref role 'self', fam roles [], strategy "
@@ -263,8 +298,11 @@ def _schema_prompt(columns, sample_rows) -> str:
         "If entity tokens do not contain underscores, generic [^_]+ groups are OK for measured "
         "columns, but demand columns with punctuation still need whole-token matching. "
         "Preserve observed kind and direction spellings exactly in regexes and templates. "
-        "Use cell_codec {'kind':'dict_gt_hidden','primary':'ground_truth','clean':'hidden_ground_truth'}, "
-        "ops ['~=','==','!=','<=','>=','<|>'], and agg_kinds — a JSON array of the aggregations "
+        "Use cell_codec {'kind':'dict_gt_hidden','primary':'ground_truth','clean':'hidden_ground_truth'} "
+        "for dict-valued CrossCheck cells and {'kind':'scalar','primary':'ground_truth',"
+        "'clean':'hidden_ground_truth'} for scalar tables. Use base ops ['~=','==','!=','<=','>=','<|>']; "
+        "add strict '<'/'>' only for temporal or threshold predicates, and add '~∝' only when proportional "
+        "relationships are plausible. agg_kinds is a JSON array of the aggregations "
         "meaningful for this dataset: always include 'SUM'; add 'MIN'/'MAX'/'AVG' ONLY when "
         "extremal or mean relationships across a family are plausible from the column semantics. "
         "Set max_degree to 1 (linear) by DEFAULT; set it to 2 ONLY if ratio or product "
@@ -275,7 +313,10 @@ def _schema_prompt(columns, sample_rows) -> str:
         "combined in one formula (a blocklist; leave [] unless two roles are clearly unrelated, "
         "e.g. a temperature vs a packet count). "
         "The binder_enumerate object should look like {'cell':'per_measured_col','node':'per_node',"
-        "'network':'singleton','link':'per_directed_link'} when link exists."
+        "'network':'singleton','link':'per_directed_link'} when link exists. Temporal, conditional, "
+        "related-grain, Boolean-definition, and categorical capabilities are bounded optional schema "
+        "features; declare them only when the column names expose the needed time, group, condition, "
+        "related-frame, and Boolean roles."
     )
 
 
@@ -342,6 +383,26 @@ def _spec_to_json(spec: GrammarSpec) -> dict:
         "max_degree": spec.max_degree,
         "role_exclusions": [sorted(p) for p in spec.role_exclusions],
         "notes": spec.notes,
+        "time_index": spec.time_index,
+        "group_keys": list(spec.group_keys),
+        "condition_columns": {k: list(v) for k, v in spec.condition_columns.items()},
+        "temporal_enabled": spec.temporal_enabled,
+        "max_lag": spec.max_lag,
+        "windows": list(spec.windows),
+        "conditional_enabled": spec.conditional_enabled,
+        "max_condition_values": spec.max_condition_values,
+        "related_templates": [template.__dict__ for template in spec.related_templates],
+        "boolean_roles": {k: list(v) for k, v in spec.boolean_roles.items()},
+        "advanced_enabled": spec.advanced_enabled,
+        "run_lengths": list(spec.run_lengths),
+        "max_conjunction_terms": spec.max_conjunction_terms,
+        "metadata_columns": list(spec.metadata_columns),
+        "band_enabled": spec.band_enabled,
+        "aggregations_widened": spec.aggregations_widened,
+        "temporal_bounds_widened": spec.temporal_bounds_widened,
+        "advanced_bounds_widened": spec.advanced_bounds_widened,
+        "degree_widened": spec.degree_widened,
+        "proportional_widened": spec.proportional_widened,
     }
 
 
@@ -359,7 +420,11 @@ def _repair_directed_link_peer_groups(payload: dict) -> tuple[dict, list[str]]:
     noisy_kind = repaired.get("noisy_kind", "measurement")
     notes: list[str] = []
     for p in repaired.get("patterns", []):
-        if p.get("kind") != noisy_kind:
+        pattern_text = " ".join(
+            str(p.get(key) or "")
+            for key in ("name", "regex", "prefix")
+        )
+        if p.get("kind") != noisy_kind and noisy_kind not in pattern_text:
             continue
         nodes = _payload_node_groups(p)
         if len(nodes) < 2:
@@ -380,12 +445,344 @@ def _repair_directed_link_peer_groups(payload: dict) -> tuple[dict, list[str]]:
 
 
 def _repair_schema_completeness(payload: dict, columns: Sequence[str]) -> tuple[dict, list[str]]:
-    repaired, notes = _repair_directed_link_peer_groups(payload)
+    repaired, canonical_notes = _canonicalize_matrix_payload(
+        payload,
+        columns,
+    )
+    repaired, notes = _repair_directed_link_peer_groups(repaired)
     repaired, demand_notes = _repair_demand_matrix_pattern(repaired, columns)
     demand_kind = str(repaired.get("demand_kind", "demand"))
     demand_entities = _demand_entities_from_pairs(_derive_demand_pairs(columns, demand_kind))
-    repaired, measured_notes = _repair_measured_pair_patterns_from_entities(repaired, demand_entities)
-    return repaired, notes + demand_notes + measured_notes
+    repaired, kind_notes = _repair_noisy_kind(
+        repaired,
+        demand_entities,
+        columns,
+    )
+    repaired, inferred_notes = _infer_measured_patterns(
+        repaired,
+        demand_entities,
+        columns,
+    )
+    repaired, measured_notes = _repair_measured_pair_patterns_from_entities(
+        repaired,
+        demand_entities,
+        columns,
+    )
+    repaired, ordering_notes = _prioritize_structural_patterns(repaired)
+    return (
+        repaired,
+        canonical_notes
+        + notes
+        + demand_notes
+        + kind_notes
+        + inferred_notes
+        + measured_notes
+        + ordering_notes,
+    )
+
+
+def _canonicalize_matrix_payload(
+    payload: dict,
+    columns: Sequence[str],
+) -> tuple[dict, list[str]]:
+    prefixes = {
+        str(column).split("_", 1)[0]
+        for column in columns
+        if "_" in str(column)
+    }
+    best = None
+    for prefix in prefixes:
+        pairs = _derive_demand_pairs(columns, prefix)
+        entities = _demand_entities_from_pairs(pairs)
+        pair_set = {
+            (source, destination)
+            for _column, source, destination in pairs
+        }
+        if (
+            entities
+            and len(pair_set) == len(entities) ** 2
+            and len(pairs) == len(pair_set)
+        ):
+            candidate = (len(pairs), prefix, pairs, entities)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+    if best is None:
+        return json.loads(json.dumps(payload)), []
+
+    _count, demand_kind, pairs, entities = best
+    repaired = json.loads(json.dumps(payload))
+    ordered_entities = sorted(
+        entities,
+        key=lambda value: (-len(value), value),
+    )
+    noisy_counts: dict[str, int] = {}
+    for column in map(str, columns):
+        if column.startswith(f"{demand_kind}_"):
+            continue
+        for entity in ordered_entities:
+            marker = f"_{entity}_"
+            marker_at = column.find(marker)
+            if marker_at > 0:
+                prefix = column[:marker_at]
+                noisy_counts[prefix] = noisy_counts.get(prefix, 0) + 1
+                break
+    if not noisy_counts:
+        return repaired, []
+    noisy_kind = max(
+        noisy_counts,
+        key=lambda value: (noisy_counts[value], value),
+    )
+    alt = "|".join(re.escape(entity) for entity in ordered_entities)
+    demand_regex = (
+        rf"^{re.escape(demand_kind)}_"
+        rf"(?P<source>(?:{alt}))_"
+        rf"(?P<destination>(?:{alt}))$"
+    )
+    repaired["demand_kind"] = demand_kind
+    repaired["noisy_kind"] = noisy_kind
+    repaired["patterns"] = [{
+        "name": f"{demand_kind}_demand",
+        "matcher": "regex",
+        "kind": demand_kind,
+        "direction": "demand",
+        "regex": demand_regex,
+        "node_groups": ["source", "destination"],
+        "source_group": "source",
+        "destination_group": "destination",
+        "peer_group": "",
+        "token_groups": ["source", "destination"],
+        "prefix": "",
+        "sep": "_",
+        "split_slots": ["source", "destination"],
+    }]
+    repaired, inferred_notes = _infer_measured_patterns(
+        repaired,
+        entities,
+        columns,
+    )
+    directed = sorted(
+        str(pattern.get("direction"))
+        for pattern in repaired["patterns"]
+        if len(_payload_node_groups(pattern)) >= 2
+        and pattern.get("kind") == noisy_kind
+    )
+    repaired["link_marker_direction"] = (
+        directed[0] if directed else "demand"
+    )
+    repaired["ref_templates"] = []
+    repaired["family_selectors"] = []
+    ontology = repaired.setdefault("ontology", {})
+    ontology["binders"] = ["cell", "node", "network", "link"]
+    ontology["ref_roles"] = {
+        "cell": [],
+        "node": [],
+        "network": [],
+        "link": [],
+    }
+    ontology["fam_roles"] = {
+        "cell": [],
+        "node": [],
+        "network": [],
+        "link": [],
+    }
+    ontology["ops"] = list(dict.fromkeys((
+        *ontology.get("ops", ()),
+        "~=",
+        "==",
+        "!=",
+        "<=",
+        ">=",
+        "<|>",
+    )))
+    ontology["agg_kinds"] = ["SUM", "AVG", "MIN", "MAX"]
+    repaired["binder_enumerate"] = {
+        "cell": "per_measured_col",
+        "node": "per_node",
+        "network": "singleton",
+        "link": "per_directed_link",
+    }
+    return repaired, [
+        f"canonicalized matrix schema {demand_kind}/{noisy_kind}",
+        *inferred_notes,
+    ]
+
+
+def _repair_noisy_kind(
+    payload: dict,
+    entities: set[str],
+    columns: Sequence[str],
+) -> tuple[dict, list[str]]:
+    if not entities:
+        return payload, []
+    repaired = json.loads(json.dumps(payload))
+    demand_kind = str(repaired.get("demand_kind") or "demand")
+    declared = str(repaired.get("noisy_kind") or "")
+    current = declared or "measurement"
+    ordered_entities = sorted(entities, key=lambda value: (-len(value), value))
+    counts: dict[str, int] = {}
+    for column in map(str, columns):
+        if column.startswith(f"{demand_kind}_"):
+            continue
+        for entity in ordered_entities:
+            marker = f"_{entity}_"
+            marker_at = column.find(marker)
+            if marker_at > 0:
+                prefix = column[:marker_at]
+                counts[prefix] = counts.get(prefix, 0) + 1
+                break
+    if not counts:
+        return repaired, []
+    inferred = max(counts, key=lambda value: (counts[value], value))
+    if any(str(column).startswith(f"{current}_") for column in columns):
+        if declared:
+            return repaired, []
+        repaired["noisy_kind"] = current
+        for pattern in repaired.get("patterns", []):
+            if (
+                pattern.get("direction") != "demand"
+                and not pattern.get("kind")
+            ):
+                pattern["kind"] = current
+        return repaired, [
+            f"noisy_kind={current} restored from measured columns"
+        ]
+    repaired["noisy_kind"] = inferred
+    for pattern in repaired.get("patterns", []):
+        if pattern.get("direction") == "demand":
+            continue
+        text = " ".join(
+            str(pattern.get(key) or "")
+            for key in ("name", "regex", "prefix", "kind")
+        )
+        if current in text or inferred in text:
+            pattern["kind"] = inferred
+    return repaired, [f"noisy_kind={inferred} inferred from measured columns"]
+
+
+def _prioritize_structural_patterns(payload: dict) -> tuple[dict, list[str]]:
+    repaired = json.loads(json.dumps(payload))
+    patterns = list(repaired.get("patterns", []))
+    noisy_kind = str(repaired.get("noisy_kind") or "measurement")
+    demand_kind = str(repaired.get("demand_kind") or "demand")
+
+    def priority(pattern):
+        kind = str(pattern.get("kind") or "")
+        direction = str(pattern.get("direction") or "")
+        if kind == demand_kind and direction == "demand":
+            return (0, -len(str(pattern.get("regex") or "")))
+        if (
+            kind == noisy_kind
+            and direction
+            and direction not in {"demand", "directed", "link"}
+        ):
+            return (1, -len(str(pattern.get("regex") or "")))
+        return (2, -len(str(pattern.get("regex") or "")))
+
+    ordered = sorted(patterns, key=priority)
+    if ordered == patterns:
+        return repaired, []
+    repaired["patterns"] = ordered
+    return repaired, ["structural patterns ordered before generic catch-alls"]
+
+
+def _infer_measured_patterns(
+    payload: dict,
+    entities: set[str],
+    columns: Sequence[str],
+) -> tuple[dict, list[str]]:
+    if not entities:
+        return payload, []
+    repaired = json.loads(json.dumps(payload))
+    noisy_kind = str(repaired.get("noisy_kind") or "measurement")
+    prefix = f"{noisy_kind}_"
+    ordered_entities = sorted(entities, key=lambda value: (-len(value), value))
+    discovered: set[tuple[str, bool]] = set()
+    for column in map(str, columns):
+        if not column.startswith(prefix):
+            continue
+        body = column[len(prefix):]
+        source = next(
+            (
+                entity
+                for entity in ordered_entities
+                if body.startswith(entity + "_")
+            ),
+            None,
+        )
+        if source is None:
+            continue
+        remainder = body[len(source) + 1:]
+        peer = next(
+            (
+                entity
+                for entity in ordered_entities
+                if remainder.endswith("_" + entity)
+                and len(remainder) > len(entity) + 1
+            ),
+            None,
+        )
+        if peer is None:
+            direction = remainder
+            is_directed = False
+        else:
+            direction = remainder[:-(len(peer) + 1)]
+            is_directed = True
+        if direction:
+            discovered.add((direction, is_directed))
+    existing = {
+        (
+            str(pattern.get("direction") or ""),
+            len(_payload_node_groups(pattern)) >= 2
+            or bool(pattern.get("peer_group")),
+        )
+        for pattern in repaired.get("patterns", [])
+        if pattern.get("kind") == noisy_kind
+    }
+    alt = "|".join(
+        re.escape(entity)
+        for entity in ordered_entities
+    )
+    notes = []
+    for direction, is_directed in sorted(discovered):
+        if (direction, is_directed) in existing:
+            continue
+        if is_directed:
+            regex = (
+                rf"^{re.escape(noisy_kind)}_(?P<source>(?:{alt}))_"
+                rf"{re.escape(direction)}_(?P<peer>(?:{alt}))$"
+            )
+            groups = ["source", "peer"]
+            peer_group = "peer"
+            split_slots = ["source", "peer"]
+        else:
+            regex = (
+                rf"^{re.escape(noisy_kind)}_(?P<source>(?:{alt}))_"
+                rf"{re.escape(direction)}$"
+            )
+            groups = ["source"]
+            peer_group = ""
+            split_slots = ["source"]
+        repaired.setdefault("patterns", []).append({
+            "name": f"{noisy_kind}_{direction}",
+            "matcher": "regex",
+            "kind": noisy_kind,
+            "direction": direction,
+            "regex": regex,
+            "node_groups": groups,
+            "source_group": "source",
+            "destination_group": "",
+            "peer_group": peer_group,
+            "token_groups": groups,
+            "prefix": "",
+            "sep": "_",
+            "split_slots": split_slots,
+        })
+        notes.append(
+            f"{noisy_kind}_{direction}: inferred "
+            + ("directed" if is_directed else "single-node")
+            + " measured pattern"
+        )
+    return repaired, notes
 
 
 def _demand_column_bodies(columns: Sequence[str], demand_kind: str) -> list[tuple[str, str]]:
@@ -543,7 +940,11 @@ def _repair_demand_matrix_pattern(payload: dict, columns: Sequence[str]) -> tupl
     return repaired, notes
 
 
-def _repair_measured_pair_patterns_from_entities(payload: dict, entities: set[str]) -> tuple[dict, list[str]]:
+def _repair_measured_pair_patterns_from_entities(
+    payload: dict,
+    entities: set[str],
+    columns: Sequence[str],
+) -> tuple[dict, list[str]]:
     if not entities:
         return payload, []
     repaired = json.loads(json.dumps(payload))
@@ -551,13 +952,42 @@ def _repair_measured_pair_patterns_from_entities(payload: dict, entities: set[st
     alt = "|".join(re.escape(entity) for entity in sorted(entities, key=lambda x: (-len(x), x)))
     notes: list[str] = []
     for p in repaired.get("patterns", []):
-        if p.get("kind") != noisy_kind:
+        pattern_text = " ".join(
+            str(p.get(key) or "")
+            for key in ("name", "regex", "prefix")
+        )
+        if p.get("kind") != noisy_kind and noisy_kind not in pattern_text:
             continue
         direction = str(p.get("direction") or "")
         if not direction or direction in ("demand", "directed", "link"):
             continue
         nodes = _payload_node_groups(p)
-        is_directed = len(nodes) >= 2 or bool(p.get("peer_group"))
+        kind_prefix = f"{noisy_kind}_"
+        pair_marker = f"_{direction}_"
+        single_suffix = f"_{direction}"
+        has_directed_columns = False
+        has_single_columns = False
+        for column in map(str, columns):
+            if not column.startswith(kind_prefix):
+                continue
+            body = column[len(kind_prefix):]
+            if body.endswith(single_suffix) and body[:-len(single_suffix)] in entities:
+                has_single_columns = True
+            marker_at = body.find(pair_marker)
+            while marker_at >= 0:
+                source = body[:marker_at]
+                peer = body[marker_at + len(pair_marker):]
+                if source in entities and peer in entities:
+                    has_directed_columns = True
+                    break
+                marker_at = body.find(pair_marker, marker_at + 1)
+            if has_directed_columns and has_single_columns:
+                break
+        is_directed = (
+            has_directed_columns
+            if has_directed_columns != has_single_columns
+            else len(nodes) >= 2 or bool(p.get("peer_group"))
+        )
         if is_directed:
             # directed measured column: <kind>_<source>_<direction>_<peer>
             regex = rf"^{re.escape(noisy_kind)}_(?P<source>(?:{alt}))_{re.escape(direction)}_(?P<peer>(?:{alt}))$"
@@ -628,6 +1058,205 @@ def _nondegenerate_bindings(bindings: Sequence[dict]) -> list[dict]:
     ]
 
 
+def _prune_undeclared_boolean_roles(
+    spec: GrammarSpec,
+) -> tuple[GrammarSpec, list[str]]:
+    boolean_roles = {}
+    removed = []
+    declared_binders = set(spec.ontology.binders)
+    for binder, roles in spec.boolean_roles.items():
+        if binder not in declared_binders:
+            removed.extend(
+                (binder, role)
+                for role in roles
+            )
+            continue
+        declared_refs = set(
+            spec.ontology.ref_roles.get(binder, ())
+        )
+        kept = tuple(
+            role
+            for role in roles
+            if role in declared_refs
+        )
+        boolean_roles[binder] = kept
+        removed.extend(
+            (binder, role)
+            for role in roles
+            if role not in declared_refs
+        )
+    if not removed:
+        return spec, []
+    return (
+        replace(spec, boolean_roles=boolean_roles),
+        [
+            f"pruned undeclared Boolean role {binder}/{role}"
+            for binder, role in sorted(removed)
+        ],
+    )
+
+
+def _prune_dead_roles(
+    spec: GrammarSpec,
+    columns: Sequence[str],
+) -> tuple[GrammarSpec, list[str]]:
+    spec, boolean_notes = _prune_undeclared_boolean_roles(
+        spec
+    )
+    adapter = compile_spec(spec)
+    nm = NameModel.from_columns_with_adapter(columns, adapter)
+    demand_pairs = _derive_demand_pairs(
+        columns,
+        spec.demand_kind,
+        nm.node_list(),
+    )
+    has_offdiagonal_demand = any(
+        source != destination
+        for _column, source, destination in demand_pairs
+    )
+    dead_refs = set()
+    dead_families = set()
+    dead_binders = set()
+    for binder in adapter.binders:
+        bindings = _nondegenerate_bindings(
+            adapter.enumerate_bindings(binder, nm)
+        )
+        if binder == "network" and not bindings:
+            bindings = [{}]
+        if not bindings:
+            dead_binders.add(binder)
+            continue
+        for role in adapter.ref_roles.get(binder, ()):
+            if not any(
+                adapter.resolve_ref(role, binder, binding, nm)
+                is not None
+                for binding in bindings
+            ):
+                dead_refs.add((binder, role))
+        for role in adapter.fam_roles.get(binder, ()):
+            if any(
+                adapter.resolve_family(role, binder, binding, nm)
+                for binding in bindings
+            ):
+                continue
+            selector = adapter.family_selectors.get((binder, role))
+            structurally_empty_demand = (
+                not has_offdiagonal_demand
+                and selector is not None
+                and selector.match_kind == adapter.demand_kind
+                and any(
+                    predicate[1] == "!="
+                    for predicate in selector.predicates
+                )
+            )
+            if not structurally_empty_demand:
+                dead_families.add((binder, role))
+    if not dead_binders and not dead_refs and not dead_families:
+        return spec, boolean_notes
+
+    ref_roles = {
+        binder: tuple(
+            role
+            for role in roles
+            if (binder, role) not in dead_refs
+        )
+        for binder, roles in spec.ontology.ref_roles.items()
+        if binder not in dead_binders
+    }
+    fam_roles = {
+        binder: tuple(
+            role
+            for role in roles
+            if (binder, role) not in dead_families
+        )
+        for binder, roles in spec.ontology.fam_roles.items()
+        if binder not in dead_binders
+    }
+    boolean_roles = {
+        binder: tuple(
+            role
+            for role in roles
+            if (binder, role) not in dead_refs
+        )
+        for binder, roles in spec.boolean_roles.items()
+        if binder not in dead_binders
+    }
+    pruned = replace(
+        spec,
+        ontology=replace(
+            spec.ontology,
+            binders=tuple(
+                binder
+                for binder in spec.ontology.binders
+                if binder not in dead_binders
+            ),
+            ref_roles=ref_roles,
+            fam_roles=fam_roles,
+        ),
+        ref_templates=tuple(
+            template
+            for template in spec.ref_templates
+            if template.binder not in dead_binders
+            if (template.binder, template.role) not in dead_refs
+        ),
+        family_selectors=tuple(
+            selector
+            for selector in spec.family_selectors
+            if selector.binder not in dead_binders
+            if (selector.binder, selector.family_role)
+            not in dead_families
+        ),
+        binder_enumerate={
+            binder: strategy
+            for binder, strategy in spec.binder_enumerate.items()
+            if binder not in dead_binders
+        },
+        related_templates=tuple(
+            template
+            for template in spec.related_templates
+            if template.binder not in dead_binders
+        ),
+        boolean_roles=boolean_roles,
+        role_exclusions=tuple(
+            exclusion
+            for exclusion in spec.role_exclusions
+            if not any(
+                role in exclusion
+                for _binder, role in (*dead_refs, *dead_families)
+            )
+        ),
+    )
+    notes = [
+        *boolean_notes,
+        *(
+            f"pruned dead binder {binder}"
+            for binder in sorted(dead_binders)
+        ),
+        *(
+            f"pruned dead reference role {binder}/{role}"
+            for binder, role in sorted(dead_refs)
+        ),
+        *(
+            f"pruned dead family role {binder}/{role}"
+            for binder, role in sorted(dead_families)
+        ),
+    ]
+    return pruned, notes
+
+
+def _normalize_prune_schema(
+    raw: dict,
+    columns: Sequence[str],
+) -> tuple[dict, GrammarSpec, list[str]]:
+    normalized, normalize_notes = _repair_schema_completeness(
+        raw,
+        columns,
+    )
+    spec = _spec_from_json(normalized)
+    spec, prune_notes = _prune_dead_roles(spec, columns)
+    return normalized, spec, [*normalize_notes, *prune_notes]
+
+
 def _validate_schema_completeness(spec: GrammarSpec, columns: Sequence[str]) -> None:
     adapter = compile_spec(spec)
     nm = NameModel.from_columns_with_adapter(columns, adapter)
@@ -635,6 +1264,10 @@ def _validate_schema_completeness(spec: GrammarSpec, columns: Sequence[str]) -> 
     demand_pairs = _derive_demand_pairs(columns, spec.demand_kind, nm.node_list())
     raw_demand_count = len(_demand_column_bodies(columns, spec.demand_kind))
     demand_entities = _demand_entities_from_pairs(demand_pairs)
+    has_offdiagonal_demand = any(
+        source != destination
+        for _column, source, destination in demand_pairs
+    )
 
     for p in spec.patterns:
         if p.kind == spec.noisy_kind and len(p.node_groups) >= 2 and not p.peer_group:
@@ -707,6 +1340,34 @@ def _validate_schema_completeness(spec: GrammarSpec, columns: Sequence[str]) -> 
                 f"binder {binder!r} yielded 0 non-degenerate bindings on real columns"
             )
             continue
+        for role in adapter.ref_roles.get(binder, ()):
+            if not any(
+                adapter.resolve_ref(role, binder, binding, nm) is not None
+                for binding in nondegenerate
+            ):
+                errors.append(
+                    f"reference role {binder!r}/{role!r} grounded 0 columns"
+                )
+        for role in adapter.fam_roles.get(binder, ()):
+            if not any(
+                adapter.resolve_family(role, binder, binding, nm)
+                for binding in nondegenerate
+            ):
+                selector = adapter.family_selectors.get((binder, role))
+                structurally_empty_demand = (
+                    not has_offdiagonal_demand
+                    and selector is not None
+                    and selector.match_kind == adapter.demand_kind
+                    and any(
+                        predicate[1] == "!="
+                        for predicate in selector.predicates
+                    )
+                )
+                if structurally_empty_demand:
+                    continue
+                errors.append(
+                    f"family role {binder!r}/{role!r} grounded 0 columns"
+                )
 
     if errors:
         shown = "; ".join(errors[:8])
@@ -727,8 +1388,8 @@ def _log_schema_event(event: str, payload: dict) -> None:
 
 def _spec_from_json(payload) -> GrammarSpec:
     onto = payload["ontology"]
-    noisy_kind = payload.get("noisy_kind", "measurement")
-    demand_kind = payload.get("demand_kind", "demand")
+    noisy_kind = str(payload.get("noisy_kind") or "measurement")
+    demand_kind = str(payload.get("demand_kind") or "demand")
     patterns = tuple(_column_pattern(p) for p in payload["patterns"])
     link_directions = _link_directions(patterns, noisy_kind)
     single_directions = _single_node_directions(patterns, noisy_kind)
@@ -746,6 +1407,21 @@ def _spec_from_json(payload) -> GrammarSpec:
                                  ((t.binder, t.role) for t in ref_templates))
     fam_roles = _canonical_roles(_role_map(onto["fam_roles"], "fam_roles"), binders,
                                  ((s.binder, s.family_role) for s in family_selectors))
+    temporal_enabled = bool(payload.get("temporal_enabled", False))
+    agg_kinds = tuple(onto.get("agg_kinds", ("SUM",)))
+    if has_demand:
+        agg_kinds = tuple(dict.fromkeys((
+            *agg_kinds,
+            "SUM",
+            "AVG",
+            "MIN",
+            "MAX",
+        )))
+    ops = tuple(
+        op
+        for op in onto.get("ops", ("~=", "==", "!=", "<=", ">=", "<|>"))
+        if temporal_enabled or op not in ("<", ">")
+    )
     return GrammarSpec(
         name=payload.get("name", "induced"),
         patterns=patterns,
@@ -753,8 +1429,8 @@ def _spec_from_json(payload) -> GrammarSpec:
             binders=binders,
             ref_roles=ref_roles,
             fam_roles=fam_roles,
-            ops=tuple(onto.get("ops", ("~=", "==", "!=", "<=", ">=", "<|>"))),
-            agg_kinds=tuple(onto.get("agg_kinds", ("SUM",))),
+            ops=ops,
+            agg_kinds=agg_kinds,
             ref_glyphs=dict(onto.get("ref_glyphs", {})),
             fam_glyphs=dict(onto.get("fam_glyphs", {})),
         ),
@@ -772,6 +1448,62 @@ def _spec_from_json(payload) -> GrammarSpec:
             if isinstance(pair, (list, tuple)) and len(pair) == 2
         ),
         notes=payload.get("notes", ""),
+        time_index=str(payload.get("time_index", "")),
+        group_keys=tuple(str(c) for c in payload.get("group_keys", ())),
+        condition_columns=_condition_columns(payload.get("condition_columns", {})),
+        temporal_enabled=temporal_enabled,
+        max_lag=int(payload.get("max_lag", 0) or 0),
+        windows=tuple(int(window) for window in payload.get("windows", ())),
+        conditional_enabled=bool(payload.get("conditional_enabled", False)),
+        max_condition_values=int(payload.get("max_condition_values", 4) or 4),
+        related_templates=tuple(
+            RelatedTemplate(
+                binder=str(template["binder"]),
+                role=str(template["role"]),
+                relation=str(template["relation"]),
+                column=str(template["column"]),
+                mode=str(template["mode"]),
+                parent_keys=tuple(str(value) for value in template.get("parent_keys", ())),
+                child_keys=tuple(str(value) for value in template.get("child_keys", ())),
+                partition_keys=tuple(str(value) for value in template.get("partition_keys", ())),
+                parent_time=str(template["parent_time"]),
+                child_time=str(template["child_time"]),
+                window_seconds=int(template["window_seconds"]),
+                reset_column=str(template.get("reset_column", "")),
+                validity_columns=tuple(
+                    str(value) for value in template.get("validity_columns", ())
+                ),
+                span_start=str(template.get("span_start", "")),
+                span_end=str(template.get("span_end", "")),
+                filter_column=str(template.get("filter_column", "")),
+                filter_values=tuple(template.get("filter_values", ())),
+            )
+            for template in (payload.get("related_templates", ()) or ())
+        ),
+        boolean_roles=_role_map(payload.get("boolean_roles", {}), "boolean_roles"),
+        advanced_enabled=bool(payload.get("advanced_enabled", False)),
+        run_lengths=tuple(int(window) for window in (payload.get("run_lengths", ()) or ())),
+        max_conjunction_terms=max(
+            2,
+            int(payload.get("max_conjunction_terms", 3) or 3),
+        ),
+        metadata_columns=tuple(
+            str(column) for column in (payload.get("metadata_columns", ()) or ())
+        ),
+        band_enabled=bool(payload.get("band_enabled", False)),
+        aggregations_widened=bool(
+            payload.get("aggregations_widened", False)
+        ),
+        temporal_bounds_widened=bool(
+            payload.get("temporal_bounds_widened", False)
+        ),
+        advanced_bounds_widened=bool(
+            payload.get("advanced_bounds_widened", False)
+        ),
+        degree_widened=bool(payload.get("degree_widened", False)),
+        proportional_widened=bool(
+            payload.get("proportional_widened", False)
+        ),
     )
 
 
@@ -816,11 +1548,29 @@ def _augment_ref_templates(
     link_directions: tuple[str, ...],
     has_demand: bool,
 ) -> tuple[RefTemplate, ...]:
-    out = list(templates)
+    structural_binders = {"cell", "node", "network", "link"}
+    link_demand_self_declared = any(
+        template.binder == "link"
+        and template.role == "demand_self"
+        for template in templates
+    )
+    out = (
+        [
+            template
+            for template in templates
+            if template.binder not in structural_binders
+        ]
+        if has_demand
+        else list(templates)
+    )
 
     def add(t: RefTemplate) -> None:
-        if (t.binder, t.role) not in {(x.binder, x.role) for x in out}:
-            out.append(t)
+        out[:] = [
+            existing
+            for existing in out
+            if (existing.binder, existing.role) != (t.binder, t.role)
+        ]
+        out.append(t)
 
     add(RefTemplate("cell", "self", "{col}"))
     for direction in single_directions:
@@ -833,6 +1583,8 @@ def _augment_ref_templates(
     if has_demand and link_directions:
         add(RefTemplate("link", "demand", f"{demand_kind}_{{X}}_{{Y}}"))
         add(RefTemplate("link", "demand_rev", f"{demand_kind}_{{Y}}_{{X}}"))
+        if link_demand_self_declared:
+            add(RefTemplate("link", "demand_self", f"{demand_kind}_{{X}}_{{X}}"))
     return tuple(out)
 
 
@@ -844,16 +1596,41 @@ def _augment_family_selectors(
     link_directions: tuple[str, ...],
     has_demand: bool,
 ) -> tuple[FamilySelector, ...]:
-    out = list(selectors)
+    structural_binders = {"cell", "node", "network", "link"}
+    link_demand_families = {
+        selector.family_role
+        for selector in selectors
+        if selector.binder == "link"
+        and selector.match_kind == demand_kind
+        and selector.family_role in {"demand_row", "demand_col"}
+    }
+    out = [
+        selector
+        for selector in selectors
+        if (
+            selector.binder not in structural_binders
+            if has_demand
+            else selector.binder not in ("cell", "link")
+        )
+    ]
 
     def add(s: FamilySelector) -> None:
-        if (s.binder, s.family_role) not in {(x.binder, x.family_role) for x in out}:
-            out.append(s)
+        out[:] = [
+            existing
+            for existing in out
+            if (existing.binder, existing.family_role)
+            != (s.binder, s.family_role)
+        ]
+        out.append(s)
 
     if has_demand:
         add(FamilySelector("node", "demand_row", demand_kind, "demand", (("source", "==", "X"), ("destination", "!=", "X"))))
         add(FamilySelector("node", "demand_col", demand_kind, "demand", (("destination", "==", "X"), ("source", "!=", "X"))))
         add(FamilySelector("network", "all_demand", demand_kind, "demand", (("source", "!=", "@destination"),)))
+        if link_directions and "demand_row" in link_demand_families:
+            add(FamilySelector("link", "demand_row", demand_kind, "demand", (("source", "==", "X"), ("destination", "!=", "X"))))
+        if link_directions and "demand_col" in link_demand_families:
+            add(FamilySelector("link", "demand_col", demand_kind, "demand", (("destination", "==", "X"), ("source", "!=", "X"))))
     for direction in link_directions:
         add(FamilySelector("node", f"fam_{direction}", noisy_kind, direction, (("source", "==", "X"),)))
     for direction in single_directions:
@@ -895,18 +1672,61 @@ def _role_map(value, field_name: str) -> dict[str, tuple[str, ...]]:
     return out
 
 
+def _condition_columns(value) -> dict[str, tuple[object, ...]]:
+    if isinstance(value, dict):
+        return {
+            str(column): tuple(values if isinstance(values, (list, tuple)) else (values,))
+            for column, values in value.items()
+        }
+    out: dict[str, tuple[object, ...]] = {}
+    for item in value or ():
+        if isinstance(item, str):
+            out[item] = ()
+        elif isinstance(item, dict):
+            column = item.get("column") or item.get("name")
+            if column:
+                values = item.get("values", ())
+                out[str(column)] = tuple(
+                    values if isinstance(values, (list, tuple)) else (values,)
+                )
+    return out
+
+
 def _predicates(value) -> tuple[tuple[str, str, str], ...]:
     out = []
+
+    def normalize_rhs(raw) -> str:
+        text = str(raw)
+        if text in {"@X", "@Y"}:
+            return text[1:]
+        return text
+
     for pred in value or ():
         if isinstance(pred, str):
             if "!=" in pred:
                 left, right = pred.split("!=", 1)
-                out.append((left.strip(), "!=", right.strip()))
+                out.append((
+                    left.strip(),
+                    "!=",
+                    normalize_rhs(right.strip()),
+                ))
             elif "==" in pred:
                 left, right = pred.split("==", 1)
-                out.append((left.strip(), "==", right.strip()))
+                out.append((
+                    left.strip(),
+                    "==",
+                    normalize_rhs(right.strip()),
+                ))
         elif isinstance(pred, dict):
-            out.append((str(pred.get("slot", pred.get("lhs"))), str(pred["op"]), str(pred["rhs"])))
+            slot = pred.get("slot", pred.get("lhs", pred.get("field")))
+            rhs = pred.get("rhs", pred.get("value"))
+            if slot is None or rhs is None or "op" not in pred:
+                continue
+            out.append((
+                str(slot),
+                str(pred["op"]),
+                normalize_rhs(rhs),
+            ))
         else:
             out.append(tuple(str(x) for x in pred))
     return tuple(out)
@@ -955,6 +1775,7 @@ def _family_selector(payload: dict) -> FamilySelector:
         match_kind=payload["match_kind"],
         match_direction=payload.get("match_direction"),
         predicates=predicates,
+        columns=tuple(str(c) for c in payload.get("columns", ())),
     )
 
 

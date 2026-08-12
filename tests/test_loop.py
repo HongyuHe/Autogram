@@ -35,7 +35,7 @@ def test_discovery_is_deterministic():
 def test_null_dataset_yields_only_structural_nonnegativity_not_equalities():
     d = synth.make_null(n_entities=4, n_snapshots=120, seed=0)
     res = _run(d)
-    assert not [e for e in res.portfolio if e.rule.atom.op in ("~=", "==")]
+    assert not [e for e in res.portfolio if e.rule.atom.op in ("~=", "==", "~∝")]
 
 
 class _FakeProposer:

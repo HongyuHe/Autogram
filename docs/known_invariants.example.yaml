@@ -8,6 +8,13 @@
 #   ~= or ==  with 0                -> zero
 #   <|>       with a variable name  -> presence pairing (present together / absent together)
 #   >= or <=  with 0                -> one-sided non-negativity / non-positivity
+#   == with {ratio: [num, den]}      -> ratio identity
+#   ~∝ with a variable name          -> robustly fitted proportional equality
+#   temporal terms                   -> {delta: col}, {lag: [col, k]}, {roll_sum: [col, window]}
+#   where                            -> {label: value} or {label_in: [value, ...]}
+#   == with {related: role}          -> declared related-grain aggregate
+#   := with sustained/and/priority   -> Boolean or categorical definition
+#   ~band with {center: value}       -> learned operating band around a declared center
 #
 # The names below use generic entities A/B/C and a directed quantity `flow`;
 # substitute your own variable names (whatever structure they carry).
@@ -36,4 +43,25 @@ invariants:
   - name: nonnegative_flow
     op: ">="
     lhs: "flow_A_to_B"
+    rhs: 0
+
+  - name: quotient_definition
+    op: "=="
+    lhs: "ratio_A"
+    rhs: {ratio: ["output_A", "input_A"]}
+
+  - name: fitted_metering_factor
+    op: "~∝"
+    lhs: "observed_output_A"
+    rhs: "physical_output_A"
+
+  - name: cumulative_counter_monotone
+    op: ">="
+    lhs: {delta: "counter_A"}
+    rhs: 0
+
+  - name: conditioned_accumulation
+    where: {label: "active"}
+    op: ">"
+    lhs: {delta: "counter_A"}
     rhs: 0

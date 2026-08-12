@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
 import pytest
@@ -10,9 +11,11 @@ from autogram.config import DiscoveryConfig, SearchConfig
 from autogram.discovery import synth
 from autogram.discovery.evaluate import DataOnlyEvaluator
 from autogram.discovery.induce import (
+    OpenAISchemaInducer,
     SchemaCompletenessError,
     SubagentSchemaInducer,
     _spec_from_json,
+    _predicates,
     _validate_schema_completeness,
     induce_spec,
 )
@@ -22,6 +25,7 @@ from autogram.dsl import ast as A
 from autogram.loader.loader import build_dataset
 from autogram.loader.names import NameModel
 from autogram.schema.compiler import compile_spec
+from autogram.schema.spec import FamilySelector, RefTemplate
 
 
 def _broken_peer_payload(peer_group: str = "") -> dict:
@@ -79,6 +83,16 @@ def _broken_peer_payload(peer_group: str = "") -> dict:
     }
 
 
+def test_predicate_parser_accepts_model_field_value_aliases():
+    assert _predicates([
+        {"field": "source", "op": "==", "value": "@X"},
+        {"lhs": "destination", "op": "!=", "rhs": "X"},
+    ]) == (
+        ("source", "==", "X"),
+        ("destination", "!=", "X"),
+    )
+
+
 class _DottedVocab(synth.Vocab):
     def entity(self, i: int) -> str:
         return f"pop{i}.site-{i}"
@@ -111,6 +125,69 @@ def test_subagent_repairs_second_directed_endpoint_to_peer_before_use():
     assert {p.direction: p.peer_group for p in spec.patterns if p.direction in {"from", "to"}} == {"from": "peer", "to": "peer"}
     assert bindings
     assert all(b["Y"] for b in bindings)
+
+
+def test_empty_optional_kind_and_list_condition_fields_use_safe_defaults():
+    data = synth.make_synthetic(n_entities=3, n_snapshots=8, noise=0.0, seed=0)
+    payload = _broken_peer_payload(peer_group="destination")
+    payload["noisy_kind"] = ""
+    payload["condition_columns"] = []
+    payload["boolean_roles"] = []
+    payload["max_condition_values"] = 0
+    payload["max_conjunction_terms"] = 0
+    inducer = SubagentSchemaInducer(
+        responder=lambda _prompt: json.dumps(payload),
+        max_attempts=1,
+    )
+
+    spec = induce_spec(data.columns, inducer)
+
+    assert spec.noisy_kind == "measurement"
+    assert spec.condition_columns == {}
+    assert spec.max_condition_values == 4
+    assert spec.max_conjunction_terms == 3
+
+
+def test_too_small_conjunction_bound_is_clamped():
+    data = synth.make_synthetic(
+        n_entities=3,
+        n_snapshots=8,
+        noise=0.0,
+        seed=0,
+    )
+    payload = _broken_peer_payload(peer_group="destination")
+    payload["max_conjunction_terms"] = 1
+
+    spec = induce_spec(
+        data.columns,
+        SubagentSchemaInducer(
+            responder=lambda _prompt: json.dumps(payload),
+            max_attempts=1,
+        ),
+    )
+
+    assert spec.max_conjunction_terms == 2
+
+
+def test_subagent_preserves_declared_proportional_operator():
+    data = synth.make_synthetic(
+        n_entities=3,
+        n_snapshots=8,
+        noise=0.0,
+        seed=0,
+    )
+    payload = _broken_peer_payload(peer_group="destination")
+    payload["ontology"]["ops"].append("~\u221d")
+
+    spec = induce_spec(
+        data.columns,
+        SubagentSchemaInducer(
+            responder=lambda _prompt: json.dumps(payload),
+            max_attempts=1,
+        ),
+    )
+
+    assert "~\u221d" in spec.ontology.ops
 
 
 def test_demand_completeness_reports_zero_grounding_for_dotted_entities():
@@ -204,6 +281,148 @@ def test_subagent_repairs_mislabeled_directed_pair_kind_for_link_binder():
     } == {"from", "to"}
 
 
+def test_subagent_repairs_directed_pair_mislabeled_as_single_node():
+    data = synth.make_synthetic(
+        n_entities=3,
+        n_snapshots=8,
+        noise=0.0,
+        seed=0,
+    )
+    payload = _broken_peer_payload(peer_group="")
+    for pattern in payload["patterns"]:
+        if pattern["direction"] in {"to", "from"}:
+            pattern["node_groups"] = ["source"]
+            pattern["destination_group"] = ""
+            pattern["peer_group"] = ""
+            pattern["token_groups"] = ["source"]
+            pattern["split_slots"] = ["source"]
+    inducer = SubagentSchemaInducer(
+        responder=lambda _prompt: json.dumps(payload),
+        max_attempts=1,
+    )
+
+    spec = induce_spec(data.columns, inducer)
+    adapter = compile_spec(spec)
+    nm = NameModel.from_columns_with_adapter(data.columns, adapter)
+
+    assert adapter.enumerate_bindings("link", nm)
+    assert {
+        pattern.direction: pattern.node_groups
+        for pattern in spec.patterns
+        if pattern.direction in {"from", "to"}
+    } == {
+        "from": ("source", "peer"),
+        "to": ("source", "peer"),
+    }
+
+
+def test_subagent_repairs_structural_patterns_shadowed_by_catch_all():
+    data = synth.make_synthetic(
+        n_entities=3,
+        n_snapshots=8,
+        noise=0.0,
+        seed=0,
+    )
+    payload = _broken_peer_payload(peer_group="")
+    demand_pattern = next(
+        pattern
+        for pattern in payload["patterns"]
+        if pattern["direction"] == "demand"
+    )
+    payload["patterns"] = [{
+        "name": "cell_any",
+        "matcher": "regex",
+        "kind": "",
+        "direction": "",
+        "regex": r"^.+$",
+        "node_groups": [],
+        "source_group": "",
+        "destination_group": "",
+        "peer_group": "",
+        "token_groups": [],
+        "prefix": "",
+        "sep": "_",
+        "split_slots": ["source", "destination"],
+    }, demand_pattern]
+    payload["noisy_kind"] = "wrong"
+    payload["link_marker_direction"] = "missing"
+    inducer = SubagentSchemaInducer(
+        responder=lambda _prompt: json.dumps(payload),
+        max_attempts=1,
+    )
+
+    spec = induce_spec(data.columns, inducer)
+    adapter = compile_spec(spec)
+    nm = NameModel.from_columns_with_adapter(data.columns, adapter)
+
+    assert len([
+        semantics
+        for semantics in nm.by_name.values()
+        if semantics.kind == "flow" and semantics.direction == "demand"
+    ]) == 9
+    assert adapter.enumerate_bindings("link", nm)
+
+
+def test_canonical_family_selectors_override_malformed_model_variants():
+    data = synth.make_synthetic(
+        n_entities=3,
+        n_snapshots=8,
+        noise=0.0,
+        seed=0,
+    )
+    payload = _broken_peer_payload(peer_group="destination")
+    payload["family_selectors"] = [
+        {
+            "binder": "node",
+            "family_role": "demand_row",
+            "match_kind": "flow",
+            "match_direction": "demand",
+            "predicates": [
+                ["destination", "==", "X"],
+                ["source", "!=", "X"],
+            ],
+        },
+        {
+            "binder": "node",
+            "family_role": "demand_col",
+            "match_kind": "flow",
+            "match_direction": "demand",
+            "predicates": [
+                ["source", "==", "X"],
+                ["destination", "!=", "X"],
+            ],
+        },
+    ]
+    payload["ontology"]["ref_roles"]["network"] = ["arbitrary"]
+    payload["ref_templates"].append({
+        "binder": "network",
+        "role": "arbitrary",
+        "template": "flow_n0_n0",
+    })
+
+    spec = induce_spec(
+        data.columns,
+        SubagentSchemaInducer(
+            responder=lambda _prompt: json.dumps(payload),
+            max_attempts=1,
+        ),
+    )
+    selectors = {
+        selector.family_role: selector
+        for selector in spec.family_selectors
+    }
+
+    assert selectors["demand_row"].predicates == (
+        ("source", "==", "X"),
+        ("destination", "!=", "X"),
+    )
+    assert selectors["demand_col"].predicates == (
+        ("destination", "==", "X"),
+        ("source", "!=", "X"),
+    )
+    assert spec.ontology.ref_roles["network"] == ()
+
+
 def test_dotted_demand_row_col_families_recover_across_repaired_inductions():
     for family, mode in (("row_sum", "zero"), ("col_sum", "truncated")):
         for seed in (0, 1, 2):
@@ -250,6 +469,190 @@ def test_zero_grounding_declared_binder_reports_diagnostic():
     assert not ev.accepted
     assert "grounded 0 points" in ev.reason
     assert "binder 'link'" in ev.reason
+
+
+def test_schema_completeness_rejects_dead_declared_roles():
+    data = synth.make_synthetic(
+        n_entities=3,
+        n_snapshots=8,
+        noise=0.0,
+        seed=0,
+    )
+    base = _spec_from_json(_broken_peer_payload(peer_group="destination"))
+    ref_roles = dict(base.ontology.ref_roles)
+    fam_roles = dict(base.ontology.fam_roles)
+    ref_roles["network"] = ("ghost_ref",)
+    fam_roles["network"] = (
+        *fam_roles.get("network", ()),
+        "ghost_family",
+    )
+    broken = replace(
+        base,
+        ontology=replace(
+            base.ontology,
+            ref_roles=ref_roles,
+            fam_roles=fam_roles,
+        ),
+        ref_templates=(
+            *base.ref_templates,
+            RefTemplate("network", "ghost_ref", "missing_column"),
+        ),
+        family_selectors=(
+            *base.family_selectors,
+            FamilySelector(
+                "network",
+                "ghost_family",
+                "missing_kind",
+            ),
+        ),
+    )
+
+    with pytest.raises(SchemaCompletenessError, match="ghost_ref|ghost_family"):
+        _validate_schema_completeness(broken, data.columns)
+
+
+def test_subagent_prunes_dead_declared_roles_before_use():
+    data = synth.make_synthetic(
+        n_entities=3,
+        n_snapshots=8,
+        noise=0.0,
+        seed=0,
+    )
+    payload = _broken_peer_payload(peer_group="destination")
+    payload["ontology"]["ref_roles"]["network"] = ["ghost_ref"]
+    payload["ref_templates"].append({
+        "binder": "network",
+        "role": "ghost_ref",
+        "template": "missing_column",
+    })
+
+    spec = induce_spec(
+        data.columns,
+        SubagentSchemaInducer(
+            responder=lambda _prompt: json.dumps(payload),
+            max_attempts=1,
+        ),
+    )
+
+    assert "ghost_ref" not in spec.ontology.ref_roles["network"]
+    _validate_schema_completeness(spec, data.columns)
+
+
+def test_subagent_prunes_boolean_roles_not_declared_as_refs():
+    data = synth.make_synthetic(
+        n_entities=3,
+        n_snapshots=8,
+        noise=0.0,
+        seed=0,
+    )
+    payload = _broken_peer_payload(peer_group="destination")
+    payload["boolean_roles"] = {
+        "network": ["all_measurement_flag"],
+    }
+
+    spec = induce_spec(
+        data.columns,
+        SubagentSchemaInducer(
+            responder=lambda _prompt: json.dumps(payload),
+            max_attempts=1,
+        ),
+    )
+
+    assert spec.boolean_roles.get("network", ()) == ()
+    _validate_schema_completeness(spec, data.columns)
+
+
+def test_subagent_prunes_declared_binder_with_no_live_bindings():
+    columns = [
+        "measurement_a_source",
+        "measurement_a_destination",
+        "flow_a_a",
+    ]
+    payload = _broken_peer_payload(peer_group="destination")
+
+    spec = induce_spec(
+        columns,
+        SubagentSchemaInducer(
+            responder=lambda _prompt: json.dumps(payload),
+            max_attempts=1,
+        ),
+    )
+
+    assert "link" not in spec.ontology.binders
+    assert "link" not in spec.ontology.ref_roles
+    assert "link" not in spec.ontology.fam_roles
+    assert "link" not in spec.binder_enumerate
+    assert "link" not in spec.boolean_roles
+    assert all(template.binder != "link" for template in spec.ref_templates)
+    assert all(selector.binder != "link" for selector in spec.family_selectors)
+    assert all(template.binder != "link" for template in spec.related_templates)
+    _validate_schema_completeness(spec, columns)
+
+
+def test_openai_applies_the_same_deterministic_schema_cleanup():
+    columns = [
+        "measurement_a_source",
+        "measurement_a_destination",
+        "flow_a_a",
+    ]
+    payload = json.dumps(_broken_peer_payload(peer_group="destination"))
+    expected = induce_spec(
+        columns,
+        SubagentSchemaInducer(
+            responder=lambda _prompt: payload,
+            max_attempts=1,
+        ),
+    )
+
+    actual = induce_spec(
+        columns,
+        OpenAISchemaInducer(responder=lambda _prompt: payload),
+    )
+
+    assert actual == expected
+
+
+def test_subagent_prunes_dead_canonicalized_single_node_role():
+    data = synth.make_synthetic(
+        n_entities=3,
+        n_snapshots=8,
+        noise=0.0,
+        seed=0,
+    )
+    columns = [
+        *data.columns,
+        *(
+            f"measurement_input_increment_{entity}"
+            for entity in data.entities
+        ),
+    ]
+    payload = _broken_peer_payload(peer_group="destination")
+    payload["patterns"].append({
+        "name": "measurement_input_increment",
+        "matcher": "regex",
+        "kind": "measurement",
+        "direction": "input_increment",
+        "regex": r"^measurement_input_increment_(?P<source>[^_]+)$",
+        "node_groups": ["source"],
+        "source_group": "source",
+        "destination_group": "",
+        "peer_group": "",
+        "token_groups": ["source"],
+        "prefix": "",
+        "sep": "_",
+        "split_slots": ["source", "destination"],
+    })
+
+    spec = induce_spec(
+        columns,
+        SubagentSchemaInducer(
+            responder=lambda _prompt: json.dumps(payload),
+            max_attempts=1,
+        ),
+    )
+
+    assert "measurement_input_increment" not in spec.ontology.ref_roles["node"]
+    _validate_schema_completeness(spec, columns)
 
 
 def test_directed_link_families_recover_across_repeated_repaired_inductions():

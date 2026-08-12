@@ -79,7 +79,7 @@ def run(cfg: EmulatorConfig) -> GenerateResult:
         records.append({"consumer": consumer, "phys": phys, "obs": obs, "frame": frame})
         derived_frames.append(frame)
         if cfg.output.write_raw:
-            raw_frames.append(_raw_frame(cfg, consumer, obs, raw_ts))
+            raw_frames.append(_raw_frame(cfg, consumer, obs, phys, raw_ts))
 
     derived = pd.concat(derived_frames, ignore_index=True)
     raw = pd.concat(raw_frames, ignore_index=True) if raw_frames else pd.DataFrame()
@@ -90,13 +90,13 @@ def run(cfg: EmulatorConfig) -> GenerateResult:
     return GenerateResult(cfg, raw, derived, events, records, manifest)
 
 
-def _raw_frame(cfg: EmulatorConfig, consumer, obs, raw_ts: np.ndarray) -> pd.DataFrame:
+def _raw_frame(cfg: EmulatorConfig, consumer, obs, phys, raw_ts: np.ndarray) -> pd.DataFrame:
     """Long per-shard raw counter table for one consumer."""
 
     n_shards, n = obs.input_counted.shape
     frames = []
     for sh in range(n_shards):
-        df = pd.DataFrame({
+        columns = {
             "timestamp": raw_ts,
             "consumer_id": consumer.consumer_id,
             "shard_id": consumer.shard_ids[sh],
@@ -104,7 +104,11 @@ def _raw_frame(cfg: EmulatorConfig, consumer, obs, raw_ts: np.ndarray) -> pd.Dat
             "presenter_output_counted": obs.output_counted[sh],
             "missing_flag": obs.missing_flag[sh],
             "reset_flag": obs.reset_flag[sh],
-        })
+        }
+        if cfg.output.include_hidden_state:
+            columns["backlog_bytes"] = phys.backlog[sh]
+            columns["cum_lost_bytes"] = phys.cum_true_loss[sh]
+        df = pd.DataFrame(columns)
         frames.append(df)
     return pd.concat(frames, ignore_index=True)
 

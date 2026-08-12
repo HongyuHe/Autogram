@@ -63,12 +63,12 @@ All files are written to `output/` (configurable). They are exactly the two data
 
 | File | Grain | Contents |
 | --- | --- | --- |
-| `timeseries_raw.csv` | per shard, per 10 s | `collector_input_counted`, `presenter_output_counted` (observed, monotonic, with NaN gaps), `missing_flag`, `reset_flag` |
-| `timeseries_derived.csv` | per consumer, per 1 min | `input_rate_bytes_per_min`, `output_rate_bytes_per_min`, `completeness_ratio`, `completeness_ratio_1h`, `static_alert`, `traj_alert`, label masks (`is_true_loss`, `is_benign_burst`, `is_artifact`, `label`, `oracle_alert`), and hidden ground truth (`backlog_bytes`, `cum_lost_bytes`) |
+| `timeseries_raw.csv` | per shard, per 10 s | observed cumulative counters, quality flags, and per-shard `backlog_bytes`/`cum_lost_bytes` hidden state when `include_hidden_state` is enabled |
+| `timeseries_derived.csv` | per consumer, per 1 min | workload `archetype`, rates, ratios, static/trajectory alerts, label masks, oracle, and consumer-level hidden ground truth |
 | `events.csv` | per injected event | `event_id`, `consumer_id`, `type`, `shard_scope`, `span_start/end`, `duration_minutes`, `severity_pct`, `recovering`, `mechanism`, `detection_sla_minutes`, `expected_alert` |
 | `manifest.json` | per run | seed, versions, full effective config, scale, event counts, summary stats, and the static-vs-oracle evaluation |
 
-`backlog_bytes` and `cum_lost_bytes` are **hidden ground truth** (never observable in production); they are included so a detector can be scored against what *actually* happened. Set `output.include_hidden_state: false` to emulate metrics-only visibility. Internal gRPC/Channelz queue metrics are intentionally **not emitted** (`measurement.emit_channel_metrics: false`, open question Q-J).
+`backlog_bytes` and `cum_lost_bytes` are **hidden ground truth** (never observable in production); when `output.include_hidden_state` is enabled they appear both per shard in the raw table and summed per consumer in the derived table, which makes the cross-grain boundary identities directly testable. Set `output.include_hidden_state: false` to emit metrics-only tables. Internal gRPC/Channelz queue metrics remain hidden (`measurement.emit_channel_metrics: false`, open question Q-J).
 
 ---
 
@@ -79,7 +79,7 @@ Six components run per consumer (see the module of the same name):
 1. **`workload`** — byte arrivals. Diurnal seasonality × heavy-tailed per-consumer scale (log-normal, per data-center flow-size fits) × archetype. `steady` tenants have mild log-normal jitter; `bursty_ml` tenants add ON/OFF bursts and periodic all-reduce spikes. Intrinsic burstiness is kept mild; the large threshold-crossing spikes are injected as *labelled* `benign_burst` events so the ground truth stays clean.
 2. **`pipeline`** — a byte-conserving fluid queue. Service capacity is provisioned against the slow **baseline** demand, so a burst builds real backlog (a dip) that drains gradually with an overshoot up to `catch_up_max_ratio` (the reported "shoot up to 20"). This is where the core invariant `input = output + backlog + true_loss` is enforced exactly.
 3. **`measurement`** — physical state → observed counters: the healthy accounting offset, scrape noise, an alignment artifact (deferring a fraction of an output increment during rapid change; byte-conserving, so it dips-then-recovers), missing scrapes, counter resets, and optional shard churn.
-4. **`anomalies`** — schedules labelled events and renders the control signals (benign burst multipliers, true-loss fractions, artifact spans). Writes the event catalogue.
+4. **`anomalies`** — schedules labelled events and renders the control signals (benign burst multipliers, true-loss fractions, artifact spans). The first benign burst overlaps a true-loss span when both exist so categorical label precedence is identifiable. Writes the event catalogue.
 5. **`deriver`** — reproduces the alerting math exactly (1 min rate → SUM over shards → ratio → 1 h smoothing → static alert), plus an illustrative trajectory-aware rule.
 6. **`labeling`** — expands events into per-minute masks and the oracle.
 
@@ -120,7 +120,7 @@ These follow directly from the generation process and are the executable contrac
 **Soft invariants (statistical expectations of normal operation — checked with tolerances):**
 
 6. **Healthy band.** For steady (non-bursty) consumers during `normal` minutes, the instantaneous 1-minute completeness ratio sits in a tight band around `healthy_ratio_mean` (~0.998) and is **rarely below the alert threshold** (< ~0.1% of the time). Calm, healthy operation looks healthy.
-7. **Benign events lose no bytes.** Over a `benign_burst` or `artifact` span, cumulative true loss does not increase — the dip is a queueing/measurement effect that fully recovers.
+7. **Benign mechanisms lose no bytes.** Over a `benign_burst` or `artifact` span that does not overlap a true-loss event, cumulative true loss does not increase — the dip is a queueing/measurement effect that fully recovers. Deliberate precedence-probe overlaps are excluded from this attribution check because simultaneous true loss legitimately increases the shared counter.
 8. **True-loss events accumulate a deficit.** Over any true-loss span, cumulative true loss strictly increases — the deficit is real and (because loss is monotone) never recovers.
 
 **Behavioural expectations that make the dataset useful (demonstrated, not asserted as invariants):**

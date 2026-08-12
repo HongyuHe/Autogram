@@ -26,6 +26,9 @@ def portfolio_to_dl(result, name: str, *, seed: int = 0, proposer: str = "enumer
         meta = (f"# {ev.strictness.upper():<10s} eps={ev.eps:.4g} "
                 f"hold={ev.hold_rate:.3f}[{ev.hold_rate_lo:.2f},{ev.hold_rate_hi:.2f}] "
                 f"supp={ev.support:.2f} mdl={ev.mdl_gain:+.3f}")
+        parameters = dict(getattr(ev, "parameters", {}))
+        if parameters:
+            meta += f" params={parameters}"
         lines.append(f"{rule:<{width}s} {meta}")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     footer = [

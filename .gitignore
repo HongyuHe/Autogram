@@ -33,6 +33,7 @@ Thumbs.db
 
 # --- Autogram run artifacts ---
 artifacts/
+rules/
 # # Prompts are regenerated on every run/dump-prompt and are disposable.
 # # The committed subagent_response_*.json replies are reproducibility inputs and stay tracked.
 # artifacts/subagent_prompt_*.txt
@@ -60,3 +61,7 @@ docs/**
 # User-facing calibration docs (needed to use the published framework)
 !docs/calibration_protocol.md
 !docs/known_invariants.example.yaml
+!docs/autogram_guarantees.md
+# Technical docs 
+!docs/gtib_handoff_status.md
+!docs/gtib_autogram_plan.html

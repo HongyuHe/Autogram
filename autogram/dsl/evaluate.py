@@ -12,9 +12,11 @@ tolerance band, reads the operating coverage, and runs the acceptance tests.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 
 from ..loader.loader import Frame
 from ..loader.names import NameModel
@@ -32,6 +34,19 @@ class Grounded:
     n_bindings: int          # bindings that grounded successfully (in scope)
     n_candidates: int        # bindings attempted (for support denominator)
     degenerate: bool         # True if no in-scope bindings
+    row_indices: np.ndarray  # source row for each pooled point
+    condition_support: float = 1.0
+    # Rows the rule can actually GRADE under its condition, and that count as a fraction of the
+    # attempted population. ``condition_support`` above measures only the rows the condition
+    # SELECTS, which overstates the evidence whenever operands are non-finite. Both are recorded
+    # before subsampling so the coreset lever -- a statistical estimator for the hold rate -- can
+    # never decide a support question.
+    graded_points: int = 0
+    graded_condition_support: float = 0.0
+    # True only for an atomic sign bound ``x OP 0`` that holds tolerance-free on every grounded row,
+    # computed on the FULL population BEFORE any subsampling so a sampled-out violation can never
+    # spuriously mark the bound exact.
+    raw_exact_sign: bool = False
 
     @property
     def n_points(self) -> int:
@@ -42,12 +57,32 @@ class Grounded:
         """Fraction of attempted bindings that grounded in scope (Sec. 10.1)."""
         if self.n_candidates == 0:
             return 0.0
-        return self.n_bindings / self.n_candidates
+        return (self.n_bindings / self.n_candidates) * self.condition_support
 
 
 def eval_term(term: A.Term, binder: str, binding: dict, frame: Frame,
               nm: NameModel):
     """Evaluate a term for one binding -> (N,) array, or ``None`` if out of scope."""
+    key = (
+        binder,
+        tuple(sorted(binding.items())),
+        term,
+    )
+    if key not in frame.term_cache:
+        value = _eval_term_uncached(
+            term,
+            binder,
+            binding,
+            frame,
+            nm,
+        )
+        frame.term_cache[key] = value
+        return value
+    return frame.term_cache[key]
+
+
+def _eval_term_uncached(term: A.Term, binder: str, binding: dict, frame: Frame,
+                        nm: NameModel):
     if isinstance(term, A.Const):
         return np.full(frame.n_rows, float(term.value))
     if isinstance(term, A.Ref):
@@ -90,7 +125,221 @@ def eval_term(term: A.Term, binder: str, binding: dict, frame: Frame,
             return None
         with np.errstate(divide="ignore", invalid="ignore"):
             return np.where(den == 0.0, np.nan, num / den)
+    if isinstance(term, A.Lag):
+        inner = eval_term(term.term, binder, binding, frame, nm)
+        return None if inner is None else _lag(inner, term.steps, frame, nm)
+    if isinstance(term, A.Diff):
+        inner = eval_term(term.term, binder, binding, frame, nm)
+        if inner is None:
+            return None
+        lagged = _lag(inner, term.steps, frame, nm)
+        return None if lagged is None else inner - lagged
+    if isinstance(term, A.Rolling):
+        inner = eval_term(term.term, binder, binding, frame, nm)
+        return None if inner is None else _rolling(inner, term.window, term.kind, frame, nm)
+    if isinstance(term, A.RelatedAgg):
+        template = getattr(nm.adapter, "resolve_related", lambda *_: None)(term.role, binder)
+        return None if template is None else _related_aggregate(template, frame)
     raise TypeError(f"unknown term {term!r}")
+
+
+def _time_vector(frame: Frame, time_index: str) -> np.ndarray:
+    """Return the time column as a sortable vector, parsing string dates to datetimes.
+
+    Generic string timestamps (e.g. non-ISO ``MM/DD/YYYY``) would otherwise sort lexicographically
+    and corrupt lag/rolling order; coercing to datetime restores chronological order, and a value
+    that cannot be parsed falls back to its raw form so nothing is worse than before.
+    """
+    times = np.asarray(frame.row_context[time_index])
+    if times.dtype == object or times.dtype.kind in ("U", "S"):
+        try:
+            times = pd.to_datetime(times).to_numpy()
+        except (ValueError, TypeError):
+            pass
+    return times
+
+
+def _ordered_groups(frame: Frame, nm: NameModel):
+    adapter = getattr(nm, "adapter", None)
+    time_index = getattr(adapter, "time_index", "")
+    if not time_index or time_index not in frame.row_context:
+        return None
+    times = _time_vector(frame, time_index)
+    group_keys = tuple(getattr(adapter, "group_keys", ()))
+    if group_keys and not all(key in frame.row_context for key in group_keys):
+        return None
+    groups: dict[object, list[int]] = {}
+    for row in range(frame.n_rows):
+        if not group_keys:
+            key = "__all__"
+        elif len(group_keys) == 1:
+            key = np.asarray(frame.row_context[group_keys[0]], dtype=object)[row]
+        else:
+            key = tuple(np.asarray(frame.row_context[name], dtype=object)[row] for name in group_keys)
+        groups.setdefault(key, []).append(row)
+    ordered = []
+    for rows in groups.values():
+        index = np.asarray(rows, dtype=int)
+        order = np.argsort(times[index], kind="stable")
+        ordered.append(index[order])
+    return ordered
+
+
+def _consecutive_window_ends(
+    frame: Frame,
+    nm: NameModel,
+    rows: np.ndarray,
+    window: int,
+) -> np.ndarray:
+    valid = np.zeros(rows.size, dtype=bool)
+    if window <= 1:
+        valid[:] = True
+        return valid
+    adapter = getattr(nm, "adapter", None)
+    time_index = getattr(adapter, "time_index", "")
+    times = pd.to_datetime(
+        np.asarray(frame.row_context[time_index])[rows],
+        errors="coerce",
+    ).to_numpy(dtype="datetime64[ns]").astype(np.int64)
+    diffs = np.diff(times)
+    positive = diffs[diffs > 0]
+    if not positive.size:
+        return valid
+    cadence = int(np.min(positive))
+    consecutive = diffs == cadence
+    for end in range(window - 1, rows.size):
+        valid[end] = bool(np.all(
+            consecutive[end - window + 1:end]
+        ))
+    return valid
+
+
+def _lag(values: np.ndarray, steps: int, frame: Frame, nm: NameModel):
+    groups = _ordered_groups(frame, nm)
+    if groups is None:
+        return None
+    out = np.full(frame.n_rows, np.nan, dtype=float)
+    for rows in groups:
+        if rows.size > steps:
+            valid = _consecutive_window_ends(
+                frame,
+                nm,
+                rows,
+                steps + 1,
+            )
+            ends = np.flatnonzero(valid)
+            out[rows[ends]] = values[rows[ends - steps]]
+    return out
+
+
+def _rolling(values: np.ndarray, window: int, kind: str, frame: Frame, nm: NameModel):
+    groups = _ordered_groups(frame, nm)
+    if groups is None:
+        return None
+    out = np.full(frame.n_rows, np.nan, dtype=float)
+    for rows in groups:
+        ordered = np.asarray(values[rows], dtype=float)
+        consecutive = _consecutive_window_ends(
+            frame,
+            nm,
+            rows,
+            window,
+        )
+        for end in range(window - 1, rows.size):
+            if not consecutive[end]:
+                continue
+            chunk = ordered[end - window + 1:end + 1]
+            if not np.all(np.isfinite(chunk)):
+                continue
+            if kind == "SUM":
+                value = float(np.sum(chunk))
+            elif kind == "AVG":
+                value = float(np.mean(chunk))
+            elif kind == "MIN":
+                value = float(np.min(chunk))
+            elif kind == "MAX":
+                value = float(np.max(chunk))
+            else:
+                raise ValueError(f"unknown rolling aggregation {kind!r}")
+            out[rows[end]] = value
+    return out
+
+
+def _sign_bound_raw_exact(atom, rho: np.ndarray) -> bool:
+    """True iff ``atom`` is an atomic sign bound ``x OP 0`` that holds tolerance-free on every row.
+
+    ``rho`` is the grounded residual ``left - right``; for a sign bound this is the column value
+    (negated when the zero constant is on the left), so the recorded operator applied directly to
+    rho reproduces the bound in either orientation.
+    """
+    if not isinstance(atom, A.Compare) or atom.op not in ("<", "<=", ">", ">="):
+        return False
+    left_zero = isinstance(atom.left, A.Const) and float(atom.left.value) == 0.0
+    right_zero = isinstance(atom.right, A.Const) and float(atom.right.value) == 0.0
+    if not (left_zero or right_zero):
+        return False
+    measured = atom.right if left_zero else atom.left
+    if not isinstance(measured, A.Ref) or rho.size == 0:
+        return False
+    if atom.op == ">":
+        return bool(np.all(rho > 0.0))
+    if atom.op == ">=":
+        return bool(np.all(rho >= 0.0))
+    if atom.op == "<":
+        return bool(np.all(rho < 0.0))
+    return bool(np.all(rho <= 0.0))
+
+
+def _row_group_keys(frame: Frame, nm: NameModel, rows: np.ndarray) -> np.ndarray | None:
+    """Group label (as an object array) for each grounded row, or ``None`` when the data is not
+    grouped. Used to keep subsampling from silently dropping an entire group."""
+    adapter = getattr(nm, "adapter", None)
+    group_keys = tuple(getattr(adapter, "group_keys", ()))
+    if not group_keys or not all(key in frame.row_context for key in group_keys):
+        return None
+    columns = [np.asarray(frame.row_context[key], dtype=object) for key in group_keys]
+    if len(columns) == 1:
+        return columns[0][rows]
+    # A composite key must stay a ONE-dimensional object array whose elements are tuples. Passing a
+    # list of tuples to ``np.array(..., dtype=object)`` builds a 2-D array instead, whose ``tolist()``
+    # yields unhashable lists and breaks group bucketing, so fill an empty 1-D array element-wise.
+    labels = np.empty(rows.size, dtype=object)
+    for position, row in enumerate(rows):
+        labels[position] = tuple(col[row] for col in columns)
+    return labels
+
+
+def _stratified_subsample(rows: np.ndarray, frame: Frame, nm: NameModel,
+                          subsample: int, seed: int) -> np.ndarray | None:
+    """Indices to keep for a group-stratified subsample of ``rows``.
+
+    Pooled random subsampling can drop an entire failing group and wrongly accept a grouped
+    universal law, so we sample WITHIN each group and always keep every group represented. If the
+    cap is smaller than the number of grounded groups it cannot represent them all, so we keep the
+    full population rather than risk hiding a group (``None`` means "no subsample"). Ungrouped data
+    falls back to a plain reproducible draw.
+    """
+    rng = np.random.default_rng(seed)
+    labels = _row_group_keys(frame, nm, rows)
+    if labels is None:
+        return rng.choice(rows.size, size=subsample, replace=False)
+    unique = list(dict.fromkeys(labels.tolist()))
+    n_groups = len(unique)
+    if subsample < n_groups:
+        return None
+    index_by_group: dict = {}
+    for idx, label in enumerate(labels.tolist()):
+        index_by_group.setdefault(label, []).append(idx)
+    per_group = max(1, subsample // n_groups)
+    keep: list = []
+    for label in unique:
+        members = np.asarray(index_by_group[label], dtype=int)
+        if members.size <= per_group:
+            keep.extend(members.tolist())
+        else:
+            picked = rng.choice(members.size, size=per_group, replace=False)
+            keep.extend(members[picked].tolist())
+    return np.asarray(sorted(keep), dtype=int)
 
 
 def ground(rule: A.Rule, frame: Frame, nm: NameModel,
@@ -101,7 +350,14 @@ def ground(rule: A.Rule, frame: Frame, nm: NameModel,
     coreset lever of Sec. 10.2 for scaling to millions of points.
     """
     bindings = B.enumerate_bindings(rule.binder, nm)
-    lefts, rights, rhos, scales = [], [], [], []
+    condition_mask = _condition_mask(rule.condition, frame)
+    if condition_mask is None:
+        condition_mask = np.zeros(frame.n_rows, dtype=bool)
+    condition_support = (
+        float(np.count_nonzero(condition_mask)) / frame.n_rows
+        if frame.n_rows else 0.0
+    )
+    lefts, rights, rhos, scales, row_indices = [], [], [], [], []
     n_ok = 0
     for b in bindings:
         L = eval_term(rule.atom.left, rule.binder, b, frame, nm)
@@ -109,33 +365,515 @@ def ground(rule: A.Rule, frame: Frame, nm: NameModel,
         if L is None or R is None:
             continue
         n_ok += 1
+        L = L[condition_mask]
+        R = R[condition_mask]
         rho = L - R
         s = np.maximum(np.abs(L), np.abs(R))
         lefts.append(L)
         rights.append(R)
         rhos.append(rho)
         scales.append(s)
+        row_indices.append(np.flatnonzero(condition_mask))
     if n_ok == 0:
         empty = np.empty(0)
-        return Grounded(empty, empty, empty, empty, 0, len(bindings), True)
+        return Grounded(
+            empty,
+            empty,
+            empty,
+            empty,
+            0,
+            len(bindings),
+            True,
+            empty.astype(int),
+            condition_support,
+        )
     left = np.concatenate(lefts)
     right = np.concatenate(rights)
     rho = np.concatenate(rhos)
     scale = np.concatenate(scales)
+    rows = np.concatenate(row_indices)
     mask = np.isfinite(rho) & np.isfinite(scale)
-    left, right, rho, scale = left[mask], right[mask], rho[mask], scale[mask]
+    left, right, rho, scale, rows = (
+        left[mask],
+        right[mask],
+        rho[mask],
+        scale[mask],
+        rows[mask],
+    )
+    # Exactness and group coverage are UNIVERSAL properties, so they must be read off the full
+    # grounded population -- before subsampling, which is only a statistical estimator for the
+    # aggregate hold rate and must never decide a universal claim.
+    raw_exact_sign = _sign_bound_raw_exact(rule.atom, rho)
+    graded_points = int(rho.size)
+    graded_condition_support = (
+        float(graded_points) / float(n_ok * frame.n_rows)
+        if n_ok and frame.n_rows
+        else 0.0
+    )
     if subsample and rho.size > subsample:
-        rng = np.random.default_rng(seed)
-        keep = rng.choice(rho.size, size=subsample, replace=False)
-        left, right, rho, scale = left[keep], right[keep], rho[keep], scale[keep]
+        keep = _stratified_subsample(
+            rows, frame, nm, subsample, seed,
+        )
+        if keep is not None:
+            left, right, rho, scale, rows = (
+                left[keep],
+                right[keep],
+                rho[keep],
+                scale[keep],
+                rows[keep],
+            )
     # global floor keeps near-zero-scale points from exploding the relative residual
     med = np.median(scale[scale > 0]) if np.any(scale > 0) else 1.0
     floor = scale_floor_frac * med
     scale = np.maximum(scale, floor)
     return Grounded(rho=rho, scale=scale, left=left, right=right, n_bindings=n_ok,
-                    n_candidates=len(bindings), degenerate=False)
+                    n_candidates=len(bindings), degenerate=False, row_indices=rows,
+                    condition_support=condition_support, raw_exact_sign=raw_exact_sign,
+                    graded_points=graded_points,
+                    graded_condition_support=graded_condition_support)
 
 
 def rel_residual(g: Grounded) -> np.ndarray:
     """``|rho| / s`` -- the dimensionless residual used for band fitting."""
     return np.abs(g.rho) / g.scale
+
+
+def _condition_mask(condition: A.Condition | None, frame: Frame):
+    if condition is None:
+        return np.ones(frame.n_rows, dtype=bool)
+    if condition.op == "all":
+        mask = np.ones(frame.n_rows, dtype=bool)
+        for child in condition.values:
+            if not isinstance(child, A.Condition):
+                return None
+            child_mask = _condition_mask(child, frame)
+            if child_mask is None:
+                return None
+            mask &= child_mask
+        return mask
+    if condition.column not in frame.row_context:
+        return None
+    values = np.asarray(frame.row_context[condition.column], dtype=object)
+    present = ~pd.isna(values)
+    mask = np.zeros(frame.n_rows, dtype=bool)
+    if condition.op == "==":
+        target = condition.values[0]
+        if not bool(pd.isna(target)):
+            mask[present] = values[present] == target
+        return mask
+    if condition.op == "!=":
+        target = condition.values[0]
+        if not bool(pd.isna(target)):
+            mask[present] = values[present] != target
+        return mask
+    allowed = np.asarray([
+        value for value in condition.values
+        if not bool(pd.isna(value))
+    ], dtype=object)
+    if condition.op == "in":
+        mask[present] = np.isin(values[present], allowed)
+        return mask
+    if condition.op == "not in":
+        mask[present] = ~np.isin(values[present], allowed)
+        return mask
+    return None
+
+
+_NAT_NS = np.iinfo(np.int64).min
+_RELATED_MISSING_KEY = object()
+
+
+def _datetime_ns(values) -> np.ndarray:
+    return (
+        pd.to_datetime(values, errors="raise")
+        .to_numpy(dtype="datetime64[ns]")
+        .astype(np.int64)
+    )
+
+
+def _related_key_part(value):
+    return _RELATED_MISSING_KEY if bool(pd.isna(value)) else value
+
+
+def _parent_time_index(template, frame: Frame):
+    cache_key = (
+        "parents",
+        template.parent_time,
+        tuple(template.parent_keys),
+    )
+    if cache_key in frame.related_index_cache:
+        return frame.related_index_cache[cache_key]
+    parent_times = _datetime_ns(
+        np.asarray(frame.row_context[template.parent_time])
+    )
+    key_arrays = [
+        np.asarray(frame.row_context[column], dtype=object)
+        for column in template.parent_keys
+    ]
+    groups: dict[tuple, list[int]] = {}
+    for row in range(frame.n_rows):
+        key = tuple(_related_key_part(array[row]) for array in key_arrays)
+        groups.setdefault(key, []).append(row)
+    indexed = (parent_times, groups)
+    frame.related_index_cache[cache_key] = indexed
+    return indexed
+
+
+def _child_partition_index(template, frame: Frame, child):
+    cache_key = (
+        "partitions",
+        template.relation,
+        template.child_time,
+        tuple(template.child_keys),
+        tuple(template.partition_keys),
+    )
+    if cache_key in frame.related_index_cache:
+        return frame.related_index_cache[cache_key]
+    child_times = _datetime_ns(child[template.child_time])
+    group_columns = tuple(dict.fromkeys(
+        (*template.child_keys, *template.partition_keys)
+    ))
+    if group_columns:
+        grouped = child.groupby(
+            list(group_columns),
+            sort=True,
+            observed=True,
+            dropna=False,
+        ).indices.items()
+    else:
+        grouped = [((), np.arange(len(child), dtype=int))]
+    by_parent: dict[tuple, list[dict]] = {}
+    for raw_key, raw_positions in grouped:
+        values = (
+            (raw_key,)
+            if len(group_columns) == 1
+            else tuple(raw_key)
+        )
+        parent_key = tuple(
+            _related_key_part(value)
+            for value in values[:len(template.child_keys)]
+        )
+        positions = np.asarray(raw_positions, dtype=int)
+        times = child_times[positions]
+        present = times != _NAT_NS
+        positions = positions[present]
+        times = times[present]
+        order = np.argsort(times, kind="stable")
+        by_parent.setdefault(parent_key, []).append({
+            "positions": positions[order],
+            "times": times[order],
+            "values": {},
+            "reset_prefix": {},
+        })
+    frame.related_index_cache[cache_key] = by_parent
+    return by_parent
+
+
+def _partition_values(partition: dict, child, column: str, forward_fill: bool = True) -> np.ndarray:
+    """Child values for one partition, optionally carrying the last reading forward.
+
+    Forward filling is correct for monotone counters, where a skipped report genuinely means "the
+    counter has not moved since the last reading", and it is what the materialised fast path does
+    for those columns. It is NOT correct for a boundary *level* column: carrying a stale level
+    forward invents a reading the child never emitted, and the materialised path does not do it
+    there. The two implementations of the same cross-grain law must agree on missing data, so the
+    caller states which convention this column follows.
+    """
+    key = (column, bool(forward_fill))
+    if key not in partition["values"]:
+        values = pd.to_numeric(
+            child.iloc[partition["positions"]][column],
+            errors="coerce",
+        )
+        if forward_fill:
+            values = values.ffill()
+        partition["values"][key] = values.to_numpy(dtype=float)
+    return partition["values"][key]
+
+
+def _is_reset(value) -> bool:
+    """A reset marker is any binary-truthy flag, regardless of how the frame stored it.
+
+    Real GTIB data carries ``reset_flag`` as a native bool, but a CSV round-trip, a parquet
+    load, or the runtime null control (which regenerates the column as balanced ``{0.0, 1.0}``
+    floats) can present the same flag as an integer, a float, or a string. Recognising only the
+    Python ``True`` singleton silently dropped every non-bool reset, so counters were treated as
+    monotone across genuine resets. Treat any finite non-zero numeric, ``True``, or an explicit
+    truthy string as a reset; ``NaN``/missing is not a reset.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        numeric = float(value)
+        return math.isfinite(numeric) and abs(numeric) > 1e-9
+    text = str(value).strip().lower()
+    return text in ("true", "1", "1.0", "yes", "t")
+
+
+def _partition_reset_prefix(partition: dict, child, column: str) -> np.ndarray:
+    if column not in partition["reset_prefix"]:
+        resets = np.fromiter(
+            (
+                _is_reset(value)
+                for value in child.iloc[partition["positions"]][column].tolist()
+            ),
+            dtype=bool,
+            count=len(partition["positions"]),
+        )
+        partition["reset_prefix"][column] = np.concatenate((
+            np.zeros(1, dtype=np.int64),
+            np.cumsum(resets, dtype=np.int64),
+        ))
+    return partition["reset_prefix"][column]
+
+
+def _related_aggregate(template, frame: Frame):
+    cache_key = (template.binder, template.role)
+    if cache_key in frame.related_cache:
+        return frame.related_cache[cache_key].copy()
+    child = frame.relations.get(template.relation)
+    if child is None:
+        return None
+    if template.mode == "span_any":
+        output = _span_any(template, frame, child)
+        if output is not None:
+            frame.related_cache[cache_key] = output
+            return output.copy()
+        return None
+    required_parent = {*template.parent_keys, template.parent_time}
+    if any(column not in frame.row_context for column in required_parent):
+        return None
+    required_child = {
+        *template.child_keys,
+        *template.partition_keys,
+        template.child_time,
+        template.column,
+        *template.validity_columns,
+    }
+    if template.reset_column:
+        required_child.add(template.reset_column)
+    if any(column not in child.columns for column in required_child):
+        return None
+
+    parent_times, parent_groups = _parent_time_index(template, frame)
+    child_partitions = _child_partition_index(template, frame, child)
+    output = np.full(frame.n_rows, np.nan, dtype=float)
+    window_ns = int(pd.Timedelta(seconds=int(template.window_seconds)).value)
+    fill_columns = tuple(dict.fromkeys(
+        (template.column, *template.validity_columns)
+    ))
+    for parent_key, parent_rows in parent_groups.items():
+        partitions = child_partitions.get(parent_key, ())
+        if not partitions:
+            continue
+        ordered_parent = np.asarray(sorted(
+            (
+                row for row in parent_rows
+                if parent_times[row] != _NAT_NS
+            ),
+            key=lambda row: parent_times[row],
+        ), dtype=int)
+        if not ordered_parent.size:
+            continue
+        starts = parent_times[ordered_parent]
+        ends = starts + window_ns
+        totals = np.zeros(len(ordered_parent), dtype=float)
+        complete = np.ones(len(ordered_parent), dtype=bool)
+        any_valid = np.zeros(len(ordered_parent), dtype=bool)
+        for partition in partitions:
+            times = partition["times"]
+            interval_starts = np.searchsorted(times, starts, side="left")
+            interval_ends = np.searchsorted(times, ends, side="left")
+            has_interval = interval_starts < interval_ends
+            boundaries = interval_ends - 1
+            # A boundary *level* is read as emitted; a counter is carried forward. See
+            # `_partition_values`.
+            forward_fill = template.mode != "sum_last"
+            values = {
+                column: _partition_values(partition, child, column, forward_fill)
+                for column in fill_columns
+            }
+            partition_valid = np.zeros(len(ordered_parent), dtype=bool)
+            contribution = np.zeros(len(ordered_parent), dtype=float)
+            if template.mode == "sum_last":
+                active = np.flatnonzero(has_interval)
+                current = values[template.column][boundaries[active]]
+                valid = np.isfinite(current)
+                rows = active[valid]
+                partition_valid[rows] = True
+                contribution[rows] = current[valid]
+                # A cross-grain total is only defined when EVERY required partition contributes.
+                # Requiring mere structural coverage here let a partition whose reading was
+                # missing or unusable drop out silently, contributing zero to the sum -- the total
+                # then looked complete while quietly under-counting.
+                complete &= partition_valid
+                any_valid |= partition_valid
+                totals += contribution
+                continue
+            prior_boundaries = (
+                np.searchsorted(times, starts, side="left") - 1
+            )
+            has_prior = prior_boundaries >= 0
+            prior_is_adjacent = np.zeros(len(ordered_parent), dtype=bool)
+            prior_rows = np.flatnonzero(has_prior)
+            prior_is_adjacent[prior_rows] = (
+                times[prior_boundaries[prior_rows]]
+                >= starts[prior_rows] - window_ns
+            )
+            coverage = has_interval & has_prior & prior_is_adjacent
+            active = np.flatnonzero(coverage)
+            valid = np.ones(len(active), dtype=bool)
+            if template.reset_column:
+                prefix = _partition_reset_prefix(
+                    partition,
+                    child,
+                    template.reset_column,
+                )
+                valid &= (
+                    prefix[interval_ends[active]]
+                    - prefix[interval_starts[active]]
+                ) == 0
+            for column in template.validity_columns:
+                delta = (
+                    values[column][boundaries[active]]
+                    - values[column][prior_boundaries[active]]
+                )
+                valid &= np.isfinite(delta) & (delta >= 0.0)
+            delta = (
+                values[template.column][boundaries[active]]
+                - values[template.column][prior_boundaries[active]]
+            )
+            valid &= np.isfinite(delta) & (delta >= 0.0)
+            rows = active[valid]
+            partition_valid[rows] = True
+            contribution[rows] = delta[valid]
+            # Deliberately `coverage`, not `partition_valid`, and deliberately different from the
+            # `sum_last` branch above. This mode sums *increments*: a shard that reset inside the
+            # interval has no measurable increment, and the emitted per-minute value likewise
+            # excludes it, so skipping that shard is what matches the data (see
+            # test_related_delta_sums_valid_shards_across_reset). A *level* sum has no such escape
+            # -- every shard's backlog exists whether or not it was reported -- which is why that
+            # branch is all-or-nothing.
+            complete &= coverage
+            any_valid |= partition_valid
+            totals += contribution
+        accepted = complete & any_valid
+        output[ordered_parent[accepted]] = totals[accepted]
+
+    frame.related_cache[cache_key] = output
+    return output.copy()
+
+
+def _span_child_index(template, frame: Frame, child):
+    cache_key = (
+        "spans",
+        template.relation,
+        template.span_start,
+        template.span_end,
+        tuple(template.child_keys),
+    )
+    if cache_key in frame.related_index_cache:
+        return frame.related_index_cache[cache_key]
+    starts = _datetime_ns(child[template.span_start])
+    ends = _datetime_ns(child[template.span_end])
+    if template.child_keys:
+        grouped = child.groupby(
+            list(template.child_keys),
+            sort=True,
+            observed=True,
+            dropna=False,
+        ).indices.items()
+    else:
+        grouped = [((), np.arange(len(child), dtype=int))]
+    groups = {}
+    for raw_key, raw_positions in grouped:
+        values = (
+            (raw_key,)
+            if len(template.child_keys) == 1
+            else tuple(raw_key)
+        )
+        parent_key = tuple(_related_key_part(value) for value in values)
+        positions = np.asarray(raw_positions, dtype=int)
+        group_starts = starts[positions]
+        group_ends = ends[positions]
+        present = (group_starts != _NAT_NS) & (group_ends != _NAT_NS)
+        positions = positions[present]
+        group_starts = group_starts[present]
+        group_ends = group_ends[present]
+        order = np.argsort(group_starts, kind="stable")
+        groups[parent_key] = {
+            "positions": positions[order],
+            "starts": group_starts[order],
+            "ends": group_ends[order],
+            "prefix_max_end": {},
+        }
+    frame.related_index_cache[cache_key] = groups
+    return groups
+
+
+def _span_prefix_max_end(group: dict, template, child) -> np.ndarray:
+    cache_key = (
+        template.filter_column,
+        tuple(template.filter_values),
+    )
+    if cache_key not in group["prefix_max_end"]:
+        if template.filter_column:
+            eligible = child.iloc[group["positions"]][
+                template.filter_column
+            ].isin(template.filter_values).to_numpy(dtype=bool)
+        else:
+            eligible = np.ones(len(group["positions"]), dtype=bool)
+        filtered_ends = np.where(eligible, group["ends"], _NAT_NS)
+        group["prefix_max_end"][cache_key] = np.maximum.accumulate(
+            filtered_ends
+        )
+    return group["prefix_max_end"][cache_key]
+
+
+def _span_any(template, frame: Frame, child):
+    required_parent = {*template.parent_keys, template.parent_time}
+    required_child = {
+        *template.child_keys,
+        template.span_start,
+        template.span_end,
+    }
+    if template.filter_column:
+        required_child.add(template.filter_column)
+    if any(column not in frame.row_context for column in required_parent):
+        return None
+    if any(not column or column not in child.columns for column in required_child):
+        return None
+
+    parent_times, parent_groups = _parent_time_index(template, frame)
+    child_groups = _span_child_index(template, frame, child)
+    output = np.zeros(frame.n_rows, dtype=float)
+    interval_ns = int(
+        pd.Timedelta(seconds=int(template.window_seconds)).value
+    )
+    for parent_key, parent_rows in parent_groups.items():
+        group = child_groups.get(parent_key)
+        if group is None or not len(group["starts"]):
+            continue
+        rows = np.asarray([
+            row for row in parent_rows
+            if parent_times[row] != _NAT_NS
+        ], dtype=int)
+        if not rows.size:
+            continue
+        starts = parent_times[rows]
+        end_windows = starts + interval_ns
+        candidates = np.searchsorted(
+            group["starts"],
+            end_windows,
+            side="left",
+        )
+        has_candidate = candidates > 0
+        if not np.any(has_candidate):
+            continue
+        prefix_max_end = _span_prefix_max_end(group, template, child)
+        candidate_rows = np.flatnonzero(has_candidate)
+        latest_end = prefix_max_end[candidates[candidate_rows] - 1]
+        output[rows[candidate_rows]] = (
+            latest_end > starts[candidate_rows]
+        ).astype(float)
+    return output

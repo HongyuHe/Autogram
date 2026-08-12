@@ -19,7 +19,10 @@ from . import synth as S
 KNOWN_SHAPES = (
     "row_sum", "col_sum", "two_end", "self_zero",
     "offset_pair", "agg_ref_balance", "presence_pair",
-    "nonneg", "nonpos",
+    "nonneg", "nonpos", "ratio", "proportional", "monotone", "windowed_ratio",
+    "conditional_positive", "conditional_zero",
+    "cross_grain", "sustained", "conjunction", "categorical",
+    "healthy_band",
 )
 
 
@@ -32,6 +35,7 @@ class ProxyEntry:
     n_snapshots: int = 160
     offset_hold_rate: float = 0.67
     presence_rate: float = 0.6
+    temporal_window: int = 5
     active: bool = True
 
 
@@ -78,14 +82,21 @@ def abstract_from_shapes(shapes, seed: int = 0) -> RegimeSpec:
 
 def generate(entry: ProxyEntry, seed: int = 0):
     """Interpret one declarative entry into a synthetic dataset (fresh entities)."""
+    exact_shapes = {
+        "two_end",
+        "ratio",
+        "windowed_ratio",
+        "cross_grain",
+    }
     return S.make_synthetic(
         n_entities=entry.n_entities,
         n_snapshots=entry.n_snapshots,
-        noise=entry.noise,
+        noise=0.0 if entry.shape in exact_shapes else entry.noise,
         seed=seed,
         families=(entry.shape,),
         offset_hold_rate=entry.offset_hold_rate,
         presence_rate=entry.presence_rate,
+        temporal_window=entry.temporal_window,
     )
 
 

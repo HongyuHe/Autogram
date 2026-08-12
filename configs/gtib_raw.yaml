@@ -1,0 +1,29 @@
+# Autogram profile for the generated GTIB raw shard-grain counters.
+dataset: gtib_raw
+data_path: data/gtib-emulation/timeseries_raw.csv
+known_path: configs/gtib_raw_known.yaml
+seed: 0
+
+schema:
+  backend: subagent
+  harness: copilot
+
+profile:
+  time_index: timestamp
+  group_keys: [consumer_id, shard_id]
+  condition_columns: [missing_flag, reset_flag]
+  windows: [1]
+  max_lag: 1
+
+eval:
+  band_mode: adaptive
+  tolerance: 0.05
+  hold_rate_threshold: 0.62
+  ci_alpha: 0.05
+
+search:
+  proposer: enumeration
+  max_complexity: 8
+  max_add_arity: 2
+  max_capability_tiers: 4
+  max_rules: 5000

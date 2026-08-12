@@ -1,0 +1,13 @@
+invariants:
+  - name: collector_counter_monotone_outside_resets
+    where: {reset_flag: false}
+    op: ">="
+    lhs: {delta: collector_input_counted}
+    rhs: 0
+
+  - name: presenter_counter_monotone_outside_resets
+    where: {reset_flag: false}
+    op: ">="
+    lhs: {delta: presenter_output_counted}
+    rhs: 0
+

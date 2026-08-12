@@ -80,6 +80,19 @@ HARNESSES: dict[str, Harness] = {
 DEFAULT_HARNESS = "copilot"
 
 
+def configured_harness() -> str:
+    value = os.environ.get(
+        "AUTOGRAM_SUBAGENT_HARNESS",
+        DEFAULT_HARNESS,
+    ).strip().lower()
+    if value not in HARNESSES:
+        raise ValueError(
+            f"unknown subagent harness {value!r}; "
+            f"choose one of {sorted(HARNESSES)}"
+        )
+    return value
+
+
 def _split_extra(value: str) -> tuple[str, ...]:
     if not value:
         return ()
@@ -106,7 +119,11 @@ class AutogramSubagentRunner:
         log_path: str | None = None,
         extra_args: tuple[str, ...] | None = None,
     ):
-        self.harness_name = (harness or os.environ.get("AUTOGRAM_SUBAGENT_HARNESS", DEFAULT_HARNESS)).strip().lower()
+        self.harness_name = (
+            str(harness).strip().lower()
+            if harness is not None
+            else configured_harness()
+        )
         spec = HARNESSES.get(self.harness_name)
         if spec is None:
             raise ValueError(

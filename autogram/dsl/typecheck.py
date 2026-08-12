@@ -29,14 +29,38 @@ def _roles_ok(term: A.Term, binder: str, G) -> bool:
     if isinstance(term, A.Scale):
         return _roles_ok(term.term, binder, G)
     if isinstance(term, A.Add):
-        return len(term.terms) <= G.max_add_arity and all(
+        cap = (
+            G.add_arity_cap(binder)
+            if hasattr(G, "add_arity_cap")
+            else getattr(G, "max_add_arity", len(term.terms))
+        )
+        return len(term.terms) <= cap and all(
             _roles_ok(t, binder, G) for t in term.terms)
     if isinstance(term, A.Agg):
-        return term.kind in G.agg_kinds and term.family_role in G.fams_for(binder)
+        return (
+            term.kind in A.AGG_KINDS
+            and term.kind in G.agg_kinds
+            and term.family_role in G.fams_for(binder)
+        )
     if isinstance(term, A.Mul):
         return _roles_ok(term.left, binder, G) and _roles_ok(term.right, binder, G)
     if isinstance(term, A.Div):
         return _roles_ok(term.num, binder, G) and _roles_ok(term.den, binder, G)
+    if isinstance(term, (A.Lag, A.Diff)):
+        return (
+            bool(getattr(G, "temporal_enabled", False))
+            and 0 < int(term.steps) <= int(getattr(G, "max_lag", 0))
+            and _roles_ok(term.term, binder, G)
+        )
+    if isinstance(term, A.Rolling):
+        return (
+            bool(getattr(G, "temporal_enabled", False))
+            and term.kind in ("SUM", "MIN", "MAX", "AVG")
+            and int(term.window) in tuple(getattr(G, "windows", ()))
+            and _roles_ok(term.term, binder, G)
+        )
+    if isinstance(term, A.RelatedAgg):
+        return term.role in G.related_for(binder)
     return False
 
 
@@ -56,7 +80,47 @@ def _has_measured(term: A.Term) -> bool:
         return _has_measured(term.left) or _has_measured(term.right)
     if isinstance(term, A.Div):
         return _has_measured(term.num) or _has_measured(term.den)
+    if isinstance(term, (A.Lag, A.Diff, A.Rolling)):
+        return _has_measured(term.term)
+    if isinstance(term, A.RelatedAgg):
+        return True
     return False
+
+
+def _has_boolean_ref(term: A.Term, binder: str, G) -> bool:
+    boolean_roles = set(G.booleans_for(binder))
+    if isinstance(term, A.Ref):
+        return term.role in boolean_roles
+    if isinstance(term, A.RelatedAgg):
+        return term.role in set(G.boolean_related_for(binder))
+    if isinstance(term, (A.Scale, A.Lag, A.Diff, A.Rolling)):
+        return _has_boolean_ref(term.term, binder, G)
+    if isinstance(term, A.Add):
+        return any(
+            _has_boolean_ref(child, binder, G)
+            for child in term.terms
+        )
+    if isinstance(term, A.Mul):
+        return (
+            _has_boolean_ref(term.left, binder, G)
+            or _has_boolean_ref(term.right, binder, G)
+        )
+    if isinstance(term, A.Div):
+        return (
+            _has_boolean_ref(term.num, binder, G)
+            or _has_boolean_ref(term.den, binder, G)
+        )
+    return False
+
+
+def _is_boolean_atomic(term: A.Term, binder: str, G) -> bool:
+    return (
+        isinstance(term, A.Ref)
+        and term.role in set(G.booleans_for(binder))
+    ) or (
+        isinstance(term, A.RelatedAgg)
+        and term.role in set(G.boolean_related_for(binder))
+    )
 
 
 def _base_family(role: str) -> str:
@@ -84,6 +148,14 @@ def _leaf_set(term: A.Term) -> set:
         return _leaf_set(term.left) | _leaf_set(term.right)
     if isinstance(term, A.Div):
         return _leaf_set(term.num) | _leaf_set(term.den)
+    if isinstance(term, A.Lag):
+        return {("t", "lag", term.steps, term.term.unparse())}
+    if isinstance(term, A.Diff):
+        return {("t", "diff", term.steps, term.term.unparse())}
+    if isinstance(term, A.Rolling):
+        return {("t", "rolling", term.kind, term.window, term.term.unparse())}
+    if isinstance(term, A.RelatedAgg):
+        return {("related", term.role)}
     return set()
 
 
@@ -104,6 +176,14 @@ def _leaf_list(term: A.Term) -> list:
         return _leaf_list(term.left) + _leaf_list(term.right)
     if isinstance(term, A.Div):
         return _leaf_list(term.num) + _leaf_list(term.den)
+    if isinstance(term, A.Lag):
+        return [("t", "lag", term.steps, term.term.unparse())]
+    if isinstance(term, A.Diff):
+        return [("t", "diff", term.steps, term.term.unparse())]
+    if isinstance(term, A.Rolling):
+        return [("t", "rolling", term.kind, term.window, term.term.unparse())]
+    if isinstance(term, A.RelatedAgg):
+        return [("related", term.role)]
     return []
 
 
@@ -117,10 +197,113 @@ def is_admissible(rule: A.Rule, G) -> tuple:
     if rule.binder not in G.binders:
         return False, f"binder {rule.binder!r} not enabled"
     atom = rule.atom
+    if rule.condition is not None:
+        condition = rule.condition
+        if not getattr(G, "conditional_enabled", False):
+            return False, "conditional rules are not enabled"
+        if condition.op == "all":
+            if not condition.values or any(
+                not isinstance(value, A.Condition)
+                or value.op == "all"
+                for value in condition.values
+            ):
+                return False, "condition conjunction must contain simple conditions"
+            max_terms = int(getattr(G, "max_condition_conjunction", 4))
+            if not (2 <= len(condition.values) <= max_terms):
+                return False, "condition conjunction arity is outside the configured bound"
+            if len({value.column for value in condition.values}) != len(condition.values):
+                return False, "condition conjunction must use distinct columns"
+            for value in condition.values:
+                probe = A.Rule(rule.binder, rule.atom, condition=value)
+                ok, reason = is_admissible(probe, G)
+                if not ok:
+                    return False, reason
+            condition = None
+        if condition is None:
+            pass
+        else:
+            allowed = getattr(G, "condition_columns", {})
+            if condition.column not in allowed:
+                return False, f"condition column {condition.column!r} is not enabled"
+            if condition.op not in ("==", "in"):
+                return False, f"condition operator {condition.op!r} is not enabled"
+            if not condition.values:
+                return False, "condition must contain at least one value"
+            if len(condition.values) > int(getattr(G, "max_condition_values", 4)):
+                return False, "condition exceeds the value cap"
+            allowed_values = set(allowed[condition.column])
+            if any(value not in allowed_values for value in condition.values):
+                return False, "condition value is not observed for the declared column"
+            if condition.op == "==" and len(condition.values) != 1:
+                return False, "equality condition requires exactly one value"
+            if condition.op == "in" and not (
+                2 <= len(condition.values) < len(allowed_values)
+            ):
+                return False, "membership condition requires a proper multi-value subset"
+    if isinstance(atom, A.BooleanDefinition):
+        if not getattr(G, "advanced_enabled", False):
+            return False, "advanced Boolean definitions are not enabled"
+        if not isinstance(atom.target, A.Ref) or atom.target.role not in G.booleans_for(rule.binder):
+            return False, "Boolean definition target must be a declared Boolean ref"
+        if not _roles_ok(atom.target, rule.binder, G):
+            return False, "Boolean definition target is not valid for binder"
+        ok, reason = _predicate_admissible(atom.predicate, rule.binder, G)
+        if not ok:
+            return False, reason
+        if not _definition_predicate_enumerable(atom.predicate):
+            return False, "Boolean predicate is outside the bounded definition grammar"
+        if _learned_bound_count(atom.predicate) > 2:
+            return False, "Boolean definition has too many learned thresholds"
+        if rule.complexity() > G.complexity_cap(rule.binder):
+            return False, "exceeds max complexity"
+        return True, ""
+    if isinstance(atom, A.CategoryDefinition):
+        if not getattr(G, "advanced_enabled", False):
+            return False, "categorical definitions are not enabled"
+        columns = getattr(G, "condition_columns", {})
+        if atom.target_column not in columns:
+            return False, "categorical target column is not declared"
+        if atom.default not in set(columns[atom.target_column]):
+            return False, "categorical default is not an observed target value"
+        if not atom.cases:
+            return False, "categorical definition needs at least one case"
+        for column, value in atom.cases:
+            if column not in columns or set(columns[column]) - {False, True, 0, 1}:
+                return False, "categorical cases must use declared Boolean columns"
+            if value not in set(columns[atom.target_column]):
+                return False, "categorical case emits an unknown target value"
+        if rule.complexity() > G.complexity_cap(rule.binder):
+            return False, "exceeds max complexity"
+        return True, ""
+    if isinstance(atom, A.BandDefinition):
+        if not getattr(G, "band_enabled", False):
+            return False, "distribution bands are not enabled"
+        if not _roles_ok(atom.term, rule.binder, G):
+            return False, "band term is not valid for binder"
+        if not _has_measured(atom.term):
+            return False, "band requires a measured term"
+        if _has_boolean_ref(atom.term, rule.binder, G):
+            return False, "band requires a numeric term"
+        if rule.complexity() > G.complexity_cap(rule.binder):
+            return False, "exceeds max complexity"
+        return True, ""
+    if not isinstance(atom, A.Compare):
+        return False, "unknown rule atom"
+    if atom.op not in A.OPS:
+        return False, f"unknown intrinsic op {atom.op!r}"
     if atom.op not in G.ops:
         return False, f"op {atom.op!r} not enabled"
     if not _roles_ok(atom.left, rule.binder, G) or not _roles_ok(atom.right, rule.binder, G):
         return False, "role/family not valid for binder"
+    left_boolean = _has_boolean_ref(atom.left, rule.binder, G)
+    right_boolean = _has_boolean_ref(atom.right, rule.binder, G)
+    if left_boolean or right_boolean:
+        if not (
+            _is_boolean_atomic(atom.left, rule.binder, G)
+            and _is_boolean_atomic(atom.right, rule.binder, G)
+            and atom.op in ("==", "!=", "<|>")
+        ):
+            return False, "Boolean refs only support Boolean equality, separation, or presence"
     # a comparison of a term with itself is non-informative (tautology for ==/~=/<=/>=,
     # contradiction for !=); reject structurally so search never spends budget on it.
     if atom.left == atom.right:
@@ -171,4 +354,109 @@ def is_admissible(rule: A.Rule, G) -> tuple:
     if atom.op == "<|>":
         if not (isinstance(atom.left, A.Ref) and isinstance(atom.right, A.Ref)):
             return False, "existence pairing only between atomic measured refs"
+    if atom.op == "~∝":
+        if not (isinstance(atom.left, A.Ref) and isinstance(atom.right, A.Ref)):
+            return False, "proportional equality only between atomic measured refs"
     return True, ""
+
+
+def _predicate_admissible(predicate: A.Predicate, binder: str, G) -> tuple[bool, str]:
+    if isinstance(predicate, A.Bound):
+        if predicate.op not in ("<", "<=", ">", ">="):
+            return False, f"unsupported predicate bound {predicate.op!r}"
+        if not _roles_ok(predicate.term, binder, G):
+            return False, "predicate term is not valid for binder"
+        if _has_boolean_ref(predicate.term, binder, G):
+            return False, "predicate bounds require numeric terms"
+        return True, ""
+    if isinstance(predicate, A.Sustained):
+        if predicate.window not in tuple(getattr(G, "run_lengths", ())):
+            return False, "sustained window is not enabled"
+        return _predicate_admissible(predicate.predicate, binder, G)
+    if isinstance(predicate, A.Conjunction):
+        if not (2 <= len(predicate.predicates) <= int(getattr(G, "max_conjunction_terms", 3))):
+            return False, "conjunction arity is outside the configured bound"
+        for item in predicate.predicates:
+            ok, reason = _predicate_admissible(item, binder, G)
+            if not ok:
+                return ok, reason
+        return True, ""
+    return False, "unknown Boolean predicate"
+
+
+def _learned_bound_count(predicate: A.Predicate) -> int:
+    if isinstance(predicate, A.Bound):
+        return int(predicate.threshold is None)
+    if isinstance(predicate, A.Sustained):
+        return _learned_bound_count(predicate.predicate)
+    if isinstance(predicate, A.Conjunction):
+        return sum(
+            _learned_bound_count(item)
+            for item in predicate.predicates
+        )
+    return 0
+
+
+def _enumerable_definition_operand(term) -> bool:
+    """Operand terms allowed under a bounded Boolean-definition bound.
+
+    A generic, bounded family parameterised over columns and windows -- NOT a fixed per-invariant
+    shape: a bare column, a finite difference of a column, a rolling aggregate of a column, or a
+    rolling aggregate of a pairwise column difference. Every alert-defining conjunction the plan
+    targets is expressible as a conjunction of bounds over these operands, and the enumeration is
+    kept finite by the grammar's window / arity / learned-threshold caps and the fail-loud max_rules.
+    """
+    if isinstance(term, A.Ref):
+        return True
+    if isinstance(term, A.Diff) and isinstance(term.term, A.Ref):
+        return True
+    if isinstance(term, A.Rolling):
+        inner = term.term
+        if isinstance(inner, A.Ref):
+            return True
+        if isinstance(inner, A.Add) and len(inner.terms) == 2:
+            direct = [t for t in inner.terms if isinstance(t, A.Ref)]
+            negated = [
+                t.term for t in inner.terms
+                if isinstance(t, A.Scale)
+                and float(t.coeff) == -1.0
+                and isinstance(t.term, A.Ref)
+            ]
+            if len(direct) == 1 and len(negated) == 1 and direct[0] != negated[0]:
+                return True
+    return False
+
+
+def _enumerable_definition_bound(bound) -> bool:
+    return (
+        isinstance(bound, A.Bound)
+        and _enumerable_definition_operand(bound.term)
+        and bound.threshold in (None, 0.0)
+    )
+
+
+def _definition_predicate_enumerable(
+    predicate: A.Predicate,
+) -> bool:
+    """Structural membership in the bounded Boolean-definition grammar.
+
+    This is a GENERIC shape check, not a per-invariant template: a single bound (or a run-length
+    sustained bound) over an admissible operand, or a conjunction whose every conjunct is such a
+    bound. Arity, learned-threshold count (<= 2), role validity and complexity are enforced
+    separately (``_predicate_admissible``, ``_learned_bound_count``, complexity cap), so a generic
+    two-term ``(a < ?) AND (b > ?)`` and the multi-term trajectory alert are admitted uniformly --
+    no conjunct's operator, position, or term is hard-coded to a specific known invariant.
+    """
+    if isinstance(predicate, A.Bound):
+        return _enumerable_definition_bound(predicate)
+    if isinstance(predicate, A.Sustained):
+        return (
+            isinstance(predicate.predicate.term, A.Ref)
+            and predicate.predicate.threshold is None
+        )
+    if isinstance(predicate, A.Conjunction):
+        return len(predicate.predicates) >= 2 and all(
+            _enumerable_definition_bound(item)
+            for item in predicate.predicates
+        )
+    return False

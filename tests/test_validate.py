@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 
 from autogram.config import DiscoveryConfig, SearchConfig
@@ -38,6 +41,29 @@ def test_regime_generates_one_sided_proxies():
         assert (d.matrix * sign >= 0).all()
 
 
+def test_algebraic_null_is_sign_balanced_per_column():
+    data = synth.make_null(
+        n_entities=4,
+        n_snapshots=160,
+        seed=0,
+    )
+
+    assert np.all(np.any(data.matrix > 0.0, axis=0))
+    assert np.all(np.any(data.matrix < 0.0, axis=0))
+
+
+def test_runtime_numeric_null_avoids_tied_temporal_differences():
+    generated = V._balanced_null_numeric(
+        np.resize(np.array([0.0, 1.0]), 1_000),
+        np.random.default_rng(0),
+        binary=False,
+    )
+    nonnegative_differences = np.mean(np.diff(generated) >= 0.0)
+
+    assert np.unique(generated).size > 900
+    assert 0.45 <= nonnegative_differences <= 0.55
+
+
 def test_score_recovery_exposes_numeric_one_sided_families(monkeypatch):
     # nonneg/nonpos are surfaced through the same uniform numeric recovery interface joint tuning
     # uses (getattr(rec, shape) >= 0.8), i.e. coverage of the planted one-sided columns.
@@ -52,6 +78,65 @@ def test_score_recovery_exposes_numeric_one_sided_families(monkeypatch):
     assert rec.nonneg == 0.75          # 3 of 4 nonneg columns covered by a >= 0 rule
     assert rec.nonpos == 0.5           # 1 of 2 nonpos columns covered by a <= 0 rule
     assert rec.recovered is False      # neither family reaches the 0.8 target
+
+
+def test_approximate_pair_does_not_recover_exact_pair_proxy(monkeypatch):
+    pair = frozenset({"left", "right"})
+    result = SimpleNamespace(portfolio=[])
+    monkeypatch.setattr(
+        V,
+        "portfolio_relations",
+        lambda _result: {
+            (
+                "equality",
+                "approximate",
+                ("pair", pair),
+            )
+        },
+    )
+
+    recovery = V.score_recovery(
+        result,
+        {
+            "two_end": {pair},
+            "offset_pair": {pair},
+        },
+    )
+
+    assert recovery.two_end == 0.0
+    assert recovery.offset_pair == 1.0
+
+
+def test_relation_signature_matching_is_type_sensitive_for_categoricals():
+    # Booleans and strings are exact categorical identities: True must not match 1, False must not
+    # match 0, and a numeric threshold declared as an integer still matches a fitted float.
+    assert not V.relation_signature_matches(True, 1)
+    assert not V.relation_signature_matches(False, 0)
+    assert not V.relation_signature_matches("1", 1)
+    assert V.relation_signature_matches(True, True)
+    assert V.relation_signature_matches(
+        ("bound", ("ref", "x"), "<", 0),
+        ("bound", ("ref", "x"), "<", 0.0),
+    )
+    assert V.relation_signature_matches(
+        ("code", "in", (1, 2)),
+        ("code", "in", (1, 2)),
+    )
+    assert not V.relation_signature_matches(
+        ("flag", "==", (True,)),
+        ("flag", "==", (1,)),
+    )
+
+
+def test_relation_signature_matching_keeps_structural_integers_exact():
+    assert not V.relation_signature_matches(
+        ("lag_bound", ("x", 99, ">=")),
+        ("lag_bound", ("x", 100, ">=")),
+    )
+    assert V.relation_signature_matches(
+        ("bound", ("ref", "x"), "<", 0.004),
+        ("bound", ("ref", "x"), "<", 0.00400001),
+    )
 
 
 def _outcome(shape, recovery, accepted=5, compact=True, slack=None):
@@ -71,6 +156,32 @@ def test_joint_candidate_rejected_with_one_null_equality():
     assert c.null_safe is False
     assert c.eligible is False
     assert V.select_candidate([c]) is None
+
+
+def test_joint_candidate_rejected_with_one_temporal_null_acceptance():
+    c = V.GridCandidate(
+        0.01,
+        0.66,
+        [_outcome("monotone", 0.9)],
+        null_equalities=0,
+        null_temporal=1,
+    )
+    assert c.null_safe is False
+    assert c.eligible is False
+    assert V.select_candidate([c]) is None
+
+
+def test_joint_candidate_rejected_with_one_definition_null_acceptance():
+    c = V.GridCandidate(
+        0.01,
+        0.66,
+        [_outcome("sustained", 0.9)],
+        null_equalities=0,
+        null_temporal=0,
+        null_definitions=1,
+    )
+    assert c.null_safe is False
+    assert c.eligible is False
 
 
 def test_joint_candidate_rejected_when_not_compact_or_has_scaled_slack():
@@ -105,7 +216,7 @@ def _fake_suite(shapes=("offset_pair",)):
 
 
 def test_tune_joint_selects_strictest_on_base_grid():
-    def fake_eval(suite, tol, thr, seed=0, band_mode="global"):
+    def fake_eval(suite, tol, thr, seed=0, band_mode="global", ci_alpha=0.05):
         rec = 0.9 if tol >= 0.01 else 0.5          # 0.005 is too tight to recover the proxy
         return V.GridCandidate(tol, thr, [V.ProxyOutcome("offset_pair", rec, 5, True, [])], 0)
     out = V.tune_joint(_fake_suite(), evaluate=fake_eval, band_mode="global")
@@ -116,8 +227,95 @@ def test_tune_joint_selects_strictest_on_base_grid():
     assert out["per_proxy"][0]["recovery"] == 0.9
 
 
+def test_tune_joint_stops_after_strictest_eligible_grid_cell():
+    calls = []
+
+    def fake_eval(suite, tol, thr, seed=0, band_mode="global", ci_alpha=0.05):
+        calls.append((tol, thr))
+        rec = 0.9 if tol >= 0.01 and thr <= 0.7 else 0.5
+        return V.GridCandidate(
+            tol,
+            thr,
+            [V.ProxyOutcome("offset_pair", rec, 5, True, [])],
+            0,
+        )
+
+    out = V.tune_joint(
+        _fake_suite(),
+        evaluate=fake_eval,
+        thresholds=[0.6, 0.7],
+        tolerances=[0.005, 0.01, 0.02],
+        max_expansions=0,
+    )
+
+    assert (out["tolerance"], out["hold_rate_threshold"]) == (0.01, 0.7)
+    assert calls == [(0.005, 0.7), (0.005, 0.6), (0.01, 0.7)]
+
+
+def test_tune_joint_accepts_an_eligible_explicit_starting_cell_first():
+    calls = []
+
+    def fake_eval(
+        suite,
+        tolerance,
+        threshold,
+        seed=0,
+        band_mode="global",
+        ci_alpha=0.05,
+    ):
+        calls.append((tolerance, threshold))
+        return V.GridCandidate(
+            tolerance,
+            threshold,
+            [V.ProxyOutcome("offset_pair", 1.0, 5, True, [])],
+            0,
+        )
+
+    result = V.tune_joint(
+        _fake_suite(),
+        evaluate=fake_eval,
+        initial_tolerance=0.05,
+        initial_threshold=0.62,
+    )
+
+    assert calls == [(0.05, 0.62)]
+    assert result["tolerance"] == 0.05
+    assert result["hold_rate_threshold"] == 0.62
+
+
+def test_tune_joint_forwards_confidence_alpha_to_grid_evaluation():
+    calls = []
+
+    def fake_eval(
+        suite,
+        tol,
+        thr,
+        seed=0,
+        band_mode="global",
+        ci_alpha=0.05,
+    ):
+        calls.append(ci_alpha)
+        return V.GridCandidate(
+            tol,
+            thr,
+            [V.ProxyOutcome("offset_pair", 0.9, 5, True, [])],
+            0,
+        )
+
+    V.tune_joint(
+        _fake_suite(),
+        evaluate=fake_eval,
+        thresholds=[0.7],
+        tolerances=[0.01],
+        max_expansions=0,
+        ci_alpha=0.1,
+    )
+
+    assert calls == [0.1]
+
+
 def test_tune_joint_expands_grid_until_eligible():
-    def eval_wide(suite, tol, thr, seed=0, band_mode="global"):
+    def eval_wide(suite, tol, thr, seed=0, band_mode="global", ci_alpha=0.05):
         rec = 0.9 if tol >= 0.1 else 0.5           # eligible only beyond the base grid max (0.05)
         return V.GridCandidate(tol, thr, [V.ProxyOutcome("offset_pair", rec, 5, True, [])], 0)
     out = V.tune_joint(_fake_suite(), evaluate=eval_wide, max_expansions=3, null_floor=0.5)
@@ -126,7 +324,7 @@ def test_tune_joint_expands_grid_until_eligible():
 
 
 def test_tune_joint_fails_loudly_with_per_proxy_evidence():
-    def never(suite, tol, thr, seed=0, band_mode="global"):
+    def never(suite, tol, thr, seed=0, band_mode="global", ci_alpha=0.05):
         return V.GridCandidate(tol, thr, [V.ProxyOutcome("offset_pair", 0.4, 5, True, [])], 0)
     with pytest.raises(V.CalibrationGridError) as ei:
         V.tune_joint(_fake_suite(), evaluate=never, max_expansions=2)
@@ -155,7 +353,7 @@ def test_tune_joint_memoizes_grid_cells_across_expansions():
     # growing grids re-list earlier cells, so without memoization they would be re-evaluated.
     calls = []
 
-    def rec_eval(suite, tol, thr, seed=0, band_mode="global"):
+    def rec_eval(suite, tol, thr, seed=0, band_mode="global", ci_alpha=0.05):
         calls.append((tol, thr))
         return V.GridCandidate(tol, thr, [V.ProxyOutcome("offset_pair", 0.4, 5, True, [])], 0)
 
@@ -204,6 +402,54 @@ def test_plant_and_recover_across_noise():
     assert any(any(by_noise.values()) for by_noise in pr.recovered.values())
 
 
+def test_deployed_validation_covers_every_supported_proxy_shape():
+    from autogram.discovery.regime import KNOWN_SHAPES
+
+    assert set(V._PLANT_FAMILIES) == set(KNOWN_SHAPES)
+
+
+def test_run_all_reports_all_null_classes(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        V,
+        "proxy_tune",
+        lambda seed=0: {
+            "ok": True,
+            "family_ok": {"ratio": True},
+            "runtime_recovery": {"ratio": True},
+            "tuned_threshold_tolerance": {},
+            "runtime_discovery": DiscoveryConfig(),
+            "runtime_search": SearchConfig(),
+        },
+    )
+    monkeypatch.setattr(
+        V,
+        "portfolio_quality",
+        lambda seed=0: {"ok": True},
+    )
+    monkeypatch.setattr(V, "null_accepted", lambda seed=0: 0)
+    suite = SimpleNamespace(
+        null=object(),
+        temporal_null=object(),
+        definition_null=object(),
+    )
+    monkeypatch.setattr(
+        V,
+        "prepare_proxy_suite",
+        lambda *args, **kwargs: suite,
+    )
+    monkeypatch.setattr(V, "null_equalities_at", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(V, "null_temporal_at", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(V, "null_definitions_at", lambda *args, **kwargs: 0)
+
+    report = V.run_all(seed=0)
+
+    assert report["null_equalities_accepted"] == 0
+    assert report["null_temporal_accepted"] == 0
+    assert report["null_definitions_accepted"] == 0
+
+
 def test_systematic_offset_family_recovers_near_two_thirds_hold_rate():
     data = synth.make_synthetic(
         n_entities=4, n_snapshots=180, noise=0.0, seed=0,
@@ -219,7 +465,9 @@ def test_systematic_offset_family_recovers_near_two_thirds_hold_rate():
     assert rec.offset_pair >= 0.8
     offset_rules = [
         e for e in res.portfolio
-        if e.rule.atom.op == "~=" and e.rule.atom.left == A.Ref("o0_rev") and e.rule.atom.right == A.Ref("o1")
+        if e.rule.atom.op in ("~=", "==")
+        and e.rule.atom.left == A.Ref("o0_rev")
+        and e.rule.atom.right == A.Ref("o1")
     ]
     assert offset_rules
     assert 0.64 <= offset_rules[0].hold_rate <= 0.70

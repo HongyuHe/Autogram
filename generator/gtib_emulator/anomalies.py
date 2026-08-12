@@ -1,7 +1,8 @@
 """Anomaly injector -- the source of the labelled ground truth.
 
-For each consumer this module schedules a set of non-overlapping events and
-turns them into three per-consumer control signals consumed downstream:
+For each consumer this module schedules separated events within each family plus
+one deliberate cross-family overlap when both true-loss and benign events exist,
+then turns them into three per-consumer control signals consumed downstream:
 
 * ``arrival_multiplier[t]``   -- benign traffic bursts (>= 1), applied to arrivals
   *before* the queue, so they create real dip+overshoot dynamics with no byte loss.
@@ -80,6 +81,19 @@ def _place_span(occupied: list[tuple[int, int]], length: int, n: int,
         end = start + length
         clash = any(not (end + margin <= s or start - margin >= e) for s, e in occupied)
         if not clash:
+            occupied.append((start, end))
+            return start, end
+    return None
+
+
+def _place_priority_probe(
+    occupied: list[tuple[int, int]],
+    length: int,
+    n: int,
+) -> tuple[int, int] | None:
+    for start in range(0, max(0, n - length + 1)):
+        end = start + length
+        if all(end <= left or start >= right for left, right in occupied):
             occupied.append((start, end))
             return start, end
     return None
@@ -169,8 +183,24 @@ def build_schedule(cfg: EmulatorConfig, consumer: Consumer,
     # Bursty ML tenants get proportionally more benign bursts than steady ones.
     tc = cfg.anomaly.benign_burst
     burst_rate = tc.count_per_consumer * (2.0 if consumer.archetype == "bursty_ml" else 1.0)
-    for _ in range(_n_events(burst_rate, rng)):
-        span = make_span(tc)
+    true_loss_events = [
+        event for event in events
+        if event.type.startswith("true_loss")
+    ]
+    for burst_index in range(_n_events(burst_rate, rng)):
+        if burst_index == 0 and true_loss_events:
+            dur_min = int(rng.integers(
+                tc.min_duration_minutes,
+                tc.max_duration_minutes + 1,
+            ))
+            length = minutes_to_steps(dur_min)
+            start = true_loss_events[0].span_start_step
+            end = min(n, start + length)
+            span = (start, end) if end > start else None
+            if span is not None:
+                occupied.append(span)
+        else:
+            span = make_span(tc)
         if span is None:
             continue
         start, end = span
@@ -187,8 +217,86 @@ def build_schedule(cfg: EmulatorConfig, consumer: Consumer,
             severity_pct=0.0, recovering=True, mechanism="traffic_burst",
             detection_sla_minutes=sla, expected_alert=False))
 
+    benign_events = [
+        event for event in events
+        if event.type == "benign_burst"
+    ]
+    benign_only_probe = None
+    if true_loss_events and benign_events:
+        benign_only_probe = _place_priority_probe(
+            occupied,
+            2 * steps_per_min,
+            n,
+        )
+        if benign_only_probe is not None:
+            start, end = benign_only_probe
+            amp = max(
+                tc.min_severity if tc.min_severity > 1.0 else 6.0,
+                1.0,
+            )
+            arrival_multiplier[start:end] *= amp
+            counter += 1
+            events.append(Event(
+                event_id=f"{consumer.consumer_id}_ev{counter:03d}",
+                consumer_id=consumer.consumer_id,
+                type="benign_burst",
+                shard_scope="all",
+                span_start_step=start,
+                span_end_step=end,
+                severity_pct=0.0,
+                recovering=True,
+                mechanism="priority_probe_burst",
+                detection_sla_minutes=sla,
+                expected_alert=False,
+            ))
+
     # ---- measurement/alignment artifact ------------------------------------
     # A handful of short artifact spans (benign wobble, no real loss).
+    if true_loss_events and benign_events:
+        anchor = true_loss_events[0]
+        length = min(
+            max(2, steps_per_min),
+            anchor.span_end_step - anchor.span_start_step,
+        )
+        start = anchor.span_end_step - length
+        end = anchor.span_end_step
+        artifact_mask[start:end] = True
+        occupied.append((start, end))
+        counter += 1
+        events.append(Event(
+            event_id=f"{consumer.consumer_id}_ev{counter:03d}",
+            consumer_id=consumer.consumer_id,
+            type="artifact",
+            shard_scope="all",
+            span_start_step=start,
+            span_end_step=end,
+            severity_pct=0.0,
+            recovering=True,
+            mechanism="priority_probe_alignment",
+            detection_sla_minutes=sla,
+            expected_alert=False,
+        ))
+    if benign_only_probe is not None:
+        probe_start, probe_end = benign_only_probe
+        length = min(max(2, steps_per_min), probe_end - probe_start)
+        start = probe_start
+        end = start + length
+        artifact_mask[start:end] = True
+        occupied.append((start, end))
+        counter += 1
+        events.append(Event(
+            event_id=f"{consumer.consumer_id}_ev{counter:03d}",
+            consumer_id=consumer.consumer_id,
+            type="artifact",
+            shard_scope="all",
+            span_start_step=start,
+            span_end_step=end,
+            severity_pct=0.0,
+            recovering=True,
+            mechanism="priority_probe_benign_alignment",
+            detection_sla_minutes=sla,
+            expected_alert=False,
+        ))
     for _ in range(_n_events(0.5, rng)):
         length = int(rng.integers(2, 6))  # a few raw steps
         span = _place_span(occupied, length, n, rng, margin=steps_per_min)

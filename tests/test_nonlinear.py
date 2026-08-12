@@ -6,7 +6,7 @@ from autogram.dsl import ast as A
 from autogram.dsl.grammar import Grammar
 from autogram.dsl.parser import rule_to_dict, rule_from_dict
 from autogram.dsl.typecheck import is_admissible
-from autogram.discovery.propose import EnumerationProposer
+from autogram.discovery.propose import EnumerationProposer, normalize_rule
 from autogram.logic.solver import atom_expr, is_trivial
 
 
@@ -38,6 +38,53 @@ def test_degree2_emits_products_and_ratios():
     t = _text(2)
     assert " * " in t, "no product enumerated"
     assert " / " in t, "no ratio enumerated"
+
+
+def test_unbounded_search_enumerates_every_declared_nonlinear_leaf():
+    roles = tuple(f"v{index:02d}" for index in range(20))
+    grammar = Grammar(
+        binders=("node",),
+        ops=("~=", "=="),
+        ref_roles={"node": roles},
+        fam_roles={"node": ()},
+        max_complexity=12,
+        max_add_arity=2,
+        max_degree=2,
+        max_rules=0,
+    )
+    target = normalize_rule(A.Rule(
+        "node",
+        A.Compare(
+            A.Ref("v19"),
+            "==",
+            A.Div(A.Ref("v17"), A.Ref("v18")),
+        ),
+    ))
+
+    assert target.signature() in {
+        rule.signature()
+        for rule in EnumerationProposer(grammar).propose()
+    }
+
+
+def test_unbounded_search_keeps_additive_terms_beyond_eight_refs():
+    roles = tuple(f"v{index:02d}" for index in range(9))
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=", "=="),
+        ref_roles={"record": roles},
+        fam_roles={"record": ()},
+        max_complexity=12,
+        max_add_arity=2,
+        max_degree=1,
+        max_rules=0,
+    )
+
+    assert any(
+        isinstance(rule.atom.left, A.Add)
+        or isinstance(rule.atom.right, A.Add)
+        for rule in EnumerationProposer(grammar).propose()
+    )
 
 
 def test_degree_cap_is_respected():

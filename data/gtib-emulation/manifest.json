@@ -13,37 +13,37 @@
     "n_minutes": 360
   },
   "event_counts": {
-    "benign_burst": 5,
+    "benign_burst": 11,
+    "artifact": 10,
     "true_loss_partial": 3,
     "true_loss_persistent": 2,
-    "artifact": 2,
     "true_loss_creeping": 1
   },
   "summary_stats": {
     "normal_ratio_1h_median": 0.99575,
-    "normal_ratio_1h_p05": 0.94857,
-    "normal_ratio_1h_p95": 1.00935,
-    "max_completeness_ratio_1m": 4.85119
+    "normal_ratio_1h_p05": 0.94997,
+    "normal_ratio_1h_p95": 1.00061,
+    "max_completeness_ratio_1m": 4.94675
   },
   "evaluation": {
-    "evaluated_minutes": 1770,
+    "evaluated_minutes": 1771,
     "static_rule": {
-      "tp": 412,
-      "fp": 280,
-      "fn": 198,
-      "tn": 880,
-      "false_positives_on_benign_minutes": 30,
-      "precision": 0.5954,
-      "recall": 0.6754
+      "tp": 504,
+      "fp": 265,
+      "fn": 106,
+      "tn": 896,
+      "false_positives_on_benign_minutes": 25,
+      "precision": 0.6554,
+      "recall": 0.8262
     },
     "trajectory_rule": {
-      "tp": 388,
-      "fp": 61,
-      "fn": 222,
-      "tn": 1099,
-      "false_positives_on_benign_minutes": 31,
-      "precision": 0.8641,
-      "recall": 0.6361
+      "tp": 430,
+      "fp": 37,
+      "fn": 180,
+      "tn": 1124,
+      "false_positives_on_benign_minutes": 20,
+      "precision": 0.9208,
+      "recall": 0.7049
     },
     "note": "static_rule.false_positives_on_benign_minutes > 0 with trajectory_rule fewer is the 'reproduce-the-bug' signal."
   },
@@ -135,7 +135,7 @@
       "detection_sla_minutes": 60
     },
     "output": {
-      "directory": "output",
+      "directory": "..\\data\\gtib-emulation",
       "fmt": "csv",
       "include_hidden_state": true,
       "write_raw": true,

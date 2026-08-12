@@ -109,6 +109,7 @@ def derive_consumer(cfg: EmulatorConfig, consumer: Consumer, obs: ObservedResult
     return pd.DataFrame({
         "timestamp": minute_ts,
         "consumer_id": consumer.consumer_id,
+        "archetype": consumer.archetype,
         "minute_index": np.arange(n_min),
         "input_rate_bytes_per_min": input_rate,
         "output_rate_bytes_per_min": output_rate,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from autogram.discovery import regime as R
 from autogram.discovery.known import (
@@ -70,9 +71,15 @@ def test_abstract_from_shapes_covers_known():
 
 
 def test_known_signatures():
-    assert _signature(KnownInvariant("a", "~=", "x", {"sum": ["y", "z"]}))[0] == "ref_sum"
-    assert _signature(KnownInvariant("a", "==", "x", "y"))[0] == "pair"
-    assert _signature(KnownInvariant("a", "==", "x", 0))[0] == "zero"
+    approximate = _signature(KnownInvariant("a", "~=", "x", {"sum": ["y", "z"]}))
+    exact_pair = _signature(KnownInvariant("a", "==", "x", "y"))
+    exact_zero = _signature(KnownInvariant("a", "==", "x", 0))
+    assert approximate[:2] == ("equality", "approximate")
+    assert approximate[2][0] == "ref_sum"
+    assert exact_pair[:2] == ("equality", "exact")
+    assert exact_pair[2][0] == "pair"
+    assert exact_zero[:2] == ("equality", "exact")
+    assert exact_zero[2][0] == "zero"
     assert _signature(KnownInvariant("a", "<|>", "x", "y"))[0] == "presence_pair"
     assert _signature(KnownInvariant("a", ">=", "x", 0))[0] == "one_sided"
 
@@ -86,6 +93,59 @@ def test_load_known_json(tmp_path):
 
 def test_precheck_unknown_harness_fails():
     assert precheck(harness="nope", backend="subagent")["ok"] is False
+
+
+def test_precheck_runs_and_compiles_a_real_induction_probe(monkeypatch):
+    calls = []
+
+    class ProbeInducer:
+        def induce(self, columns, sample_rows=None):
+            calls.append(tuple(columns))
+            return SimpleNamespace()
+
+    monkeypatch.setattr(
+        "autogram.calibrate.make_inducer",
+        lambda backend, **kwargs: ProbeInducer(),
+    )
+    monkeypatch.setattr(
+        "autogram.calibrate.compile_spec",
+        lambda spec: calls.append(("compiled", spec)),
+    )
+    monkeypatch.setattr(
+        "autogram.calibrate.shutil.which",
+        lambda command: command,
+    )
+
+    result = precheck(harness="copilot", backend="subagent")
+
+    assert result["ok"]
+    assert result["probe"] == "induced-and-compiled"
+    assert calls[0] == (
+        "measurement_n0_source",
+        "measurement_n0_destination",
+        "flow_n0_n0",
+    )
+    assert calls[1][0] == "compiled"
+
+
+def test_precheck_surfaces_induction_probe_failures(monkeypatch):
+    class BrokenInducer:
+        def induce(self, columns, sample_rows=None):
+            raise RuntimeError("probe timed out")
+
+    monkeypatch.setattr(
+        "autogram.calibrate.make_inducer",
+        lambda backend, **kwargs: BrokenInducer(),
+    )
+    monkeypatch.setattr(
+        "autogram.calibrate.shutil.which",
+        lambda command: command,
+    )
+
+    result = precheck(harness="copilot", backend="subagent")
+
+    assert not result["ok"]
+    assert any("probe timed out" in issue for issue in result["issues"])
 
 
 def test_split_known_holds_out_disjoint():

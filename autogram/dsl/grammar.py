@@ -36,12 +36,39 @@ class Grammar:
     max_complexity_by_binder: Dict[str, int] = field(default_factory=dict)
     max_add_arity_by_binder: Dict[str, int] = field(default_factory=dict)
     max_degree_by_binder: Dict[str, int] = field(default_factory=dict)
+    temporal_enabled: bool = False
+    max_lag: int = 0
+    windows: Tuple[int, ...] = ()
+    conditional_enabled: bool = False
+    condition_columns: Dict[str, Tuple[object, ...]] = field(default_factory=dict)
+    max_condition_values: int = 4
+    related_roles: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    boolean_roles: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    boolean_related_roles: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    advanced_enabled: bool = False
+    run_lengths: Tuple[int, ...] = ()
+    max_conjunction_terms: int = 3
+    max_rules: int = 0
+    max_nonlinear_leaves: int = 0
+    max_linear_leaves: int = 0
+    max_conditioned_rules: int = 0
+    band_enabled: bool = False
+    legacy_compat: bool = False
 
     def refs_for(self, binder: str) -> Tuple[str, ...]:
         return tuple(self.ref_roles.get(binder, ()))
 
     def fams_for(self, binder: str) -> Tuple[str, ...]:
         return tuple(self.fam_roles.get(binder, ()))
+
+    def related_for(self, binder: str) -> Tuple[str, ...]:
+        return tuple(self.related_roles.get(binder, ()))
+
+    def booleans_for(self, binder: str) -> Tuple[str, ...]:
+        return tuple(self.boolean_roles.get(binder, ()))
+
+    def boolean_related_for(self, binder: str) -> Tuple[str, ...]:
+        return tuple(self.boolean_related_roles.get(binder, ()))
 
     def complexity_cap(self, binder: str) -> int:
         return int(self.max_complexity_by_binder.get(binder, self.max_complexity))
@@ -76,7 +103,11 @@ def default_binder_caps(binders, ref_roles, fam_roles, max_complexity, max_add_a
 
 def grammar_from_adapter(adapter, max_complexity: int = 12,
                          max_add_arity: int = 3,
-                         scale_coeffs: Tuple[float, ...] = (-1.0, 0.5, 2.0)) -> Grammar:
+                         scale_coeffs: Tuple[float, ...] = (-1.0, 0.5, 2.0),
+                         max_rules: int = 0,
+                         max_nonlinear_leaves: int = 0,
+                         max_linear_leaves: int = 0,
+                         max_conditioned_rules: int = 0) -> Grammar:
     """Build the search grammar from a compiled schema adapter (the induced ontology).
 
     Per-binder size caps are populated by default from the binder structure (see
@@ -88,6 +119,33 @@ def grammar_from_adapter(adapter, max_complexity: int = 12,
     max_degree = getattr(adapter, "max_degree", 1)
     comp, arity, deg = default_binder_caps(binders, ref_roles, fam_roles,
                                            max_complexity, max_add_arity, max_degree)
+    if getattr(adapter, "temporal_enabled", False):
+        comp = {binder: int(max_complexity) for binder in binders}
+    if getattr(adapter, "advanced_enabled", False) and "record" in comp:
+        comp["record"] = max(int(max_complexity), 16)
+    uses_extended_capabilities = (
+        bool(getattr(adapter, "temporal_enabled", False))
+        or bool(getattr(adapter, "conditional_enabled", False))
+        or bool(getattr(adapter, "advanced_enabled", False))
+        or bool(getattr(adapter, "band_enabled", False))
+        or bool(getattr(adapter, "related_templates", {}))
+        or "~\u221d" in tuple(adapter.ops)
+        or "<" in tuple(adapter.ops)
+        or ">" in tuple(adapter.ops)
+    )
+    legacy_compat = (
+        getattr(adapter, "codec_kind", "") == "dict_gt_hidden"
+        and not uses_extended_capabilities
+    )
+    if legacy_compat:
+        comp = {
+            binder: int(max_complexity)
+            for binder in binders
+        }
+        arity = {
+            binder: int(max_add_arity)
+            for binder in binders
+        }
     return Grammar(
         binders=binders,
         ops=tuple(adapter.ops),
@@ -102,4 +160,34 @@ def grammar_from_adapter(adapter, max_complexity: int = 12,
         max_complexity_by_binder=comp,
         max_add_arity_by_binder=arity,
         max_degree_by_binder=deg,
+        temporal_enabled=bool(getattr(adapter, "temporal_enabled", False)),
+        max_lag=int(getattr(adapter, "max_lag", 0)),
+        windows=tuple(getattr(adapter, "windows", ())),
+        conditional_enabled=bool(getattr(adapter, "conditional_enabled", False)),
+        condition_columns={
+            name: tuple(values)
+            for name, values in getattr(adapter, "condition_columns", {}).items()
+        },
+        max_condition_values=int(getattr(adapter, "max_condition_values", 4)),
+        related_roles={
+            binder: tuple(adapter.related_for(binder))
+            for binder in binders
+        },
+        boolean_roles={
+            binder: tuple(adapter.booleans_for(binder))
+            for binder in binders
+        },
+        boolean_related_roles={
+            binder: tuple(adapter.boolean_related_for(binder))
+            for binder in binders
+        },
+        advanced_enabled=bool(getattr(adapter, "advanced_enabled", False)),
+        run_lengths=tuple(getattr(adapter, "run_lengths", ())),
+        max_conjunction_terms=int(getattr(adapter, "max_conjunction_terms", 3)),
+        max_rules=int(max_rules),
+        max_nonlinear_leaves=int(max_nonlinear_leaves),
+        max_linear_leaves=int(max_linear_leaves),
+        max_conditioned_rules=int(max_conditioned_rules),
+        band_enabled=bool(getattr(adapter, "band_enabled", False)),
+        legacy_compat=legacy_compat,
     )

@@ -90,3 +90,104 @@ def test_parse_is_inverse_of_unparse():
     ]
     for r in rules:
         assert parse_rule_line(r.unparse()).unparse() == r.unparse()
+
+
+def test_parse_is_inverse_for_temporal_conditional_and_definition_rules():
+    rules = [
+        A.Rule(
+            "record",
+            A.Compare(A.Diff(A.Ref("loss"), 1), ">", A.Const(0)),
+            condition=A.Condition("label", "==", ("true_loss",)),
+        ),
+        A.Rule(
+            "record",
+            A.Compare(A.Ref("rate"), "==", A.RelatedAgg("raw_rate")),
+        ),
+        A.Rule(
+            "record",
+            A.BooleanDefinition(
+                A.Ref("alert"),
+                A.Sustained(A.Bound(A.Ref("ratio"), "<", None), 10),
+            ),
+        ),
+        A.Rule(
+            "record",
+            A.BooleanDefinition(
+                A.Ref("trajectory"),
+                A.Conjunction((
+                    A.Bound(A.Ref("ratio"), "<", None),
+                    A.Bound(A.Rolling(A.Ref("deficit"), 45, "SUM"), ">", 0.0),
+                    A.Bound(A.Diff(A.Ref("ratio"), 45), "<=", 0.0),
+                )),
+            ),
+        ),
+        A.Rule(
+            "record",
+            A.CategoryDefinition(
+                "label",
+                (
+                    ("is_true_loss", "true_loss"),
+                    ("is_benign", "benign_burst"),
+                ),
+                "normal",
+            ),
+        ),
+        A.Rule(
+            "record",
+            A.CategoryDefinition(
+                "label",
+                (
+                    ("flag_true", "True"),
+                    ("flag_comma", "a, b"),
+                    ("flag_quote", 'x"y'),
+                ),
+                "normal; default=other",
+            ),
+        ),
+        A.Rule(
+            "record",
+            A.BandDefinition(A.Ref("ratio"), None),
+            condition=A.Condition(
+                "",
+                "all",
+                (
+                    A.Condition("archetype", "==", ("steady",)),
+                    A.Condition("label", "==", ("normal",)),
+                ),
+            ),
+        ),
+        A.Rule(
+            "record",
+            A.BandDefinition(A.Ref("ratio"), None),
+            condition=A.Condition(
+                "label",
+                "in",
+                ("True", "a, b", 'x"y'),
+            ),
+        ),
+    ]
+    for rule in rules:
+        assert parse_rule_line(rule.unparse()) == rule
+
+
+def test_typed_scalar_rendering_distinguishes_strings_from_primitives():
+    string_rule = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (("flag", "True"),),
+            "None",
+        ),
+    )
+    primitive_rule = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (("flag", True),),
+            None,
+        ),
+    )
+
+    assert string_rule.signature() != primitive_rule.signature()
+    assert parse_rule_line(string_rule.unparse()) == string_rule
+    assert parse_rule_line(primitive_rule.unparse()) == primitive_rule

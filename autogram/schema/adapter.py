@@ -28,6 +28,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import pandas as pd
+
 from ..loader.names import ColumnSemantics
 
 
@@ -72,6 +74,21 @@ class SchemaAdapter:
     role_exclusions: Tuple[frozenset, ...] = ()
     ref_glyphs: Dict[str, str] = field(default_factory=dict)
     fam_glyphs: Dict[str, str] = field(default_factory=dict)
+    time_index: str = ""
+    group_keys: Tuple[str, ...] = ()
+    condition_columns: Dict[str, Tuple[object, ...]] = field(default_factory=dict)
+    temporal_enabled: bool = False
+    max_lag: int = 0
+    windows: Tuple[int, ...] = ()
+    conditional_enabled: bool = False
+    max_condition_values: int = 4
+    related_templates: Dict[Tuple[str, str], object] = field(default_factory=dict)
+    boolean_roles: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    advanced_enabled: bool = False
+    run_lengths: Tuple[int, ...] = ()
+    max_conjunction_terms: int = 3
+    metadata_columns: Tuple[str, ...] = ()
+    band_enabled: bool = False
 
     def refs_for(self, binder: str) -> Tuple[str, ...]:
         return tuple(self.ref_roles.get(binder, ()))
@@ -79,12 +96,34 @@ class SchemaAdapter:
     def fams_for(self, binder: str) -> Tuple[str, ...]:
         return tuple(self.fam_roles.get(binder, ()))
 
+    def related_for(self, binder: str) -> Tuple[str, ...]:
+        return tuple(
+            role
+            for template_binder, role in self.related_templates
+            if template_binder == binder
+        )
+
+    def resolve_related(self, role: str, binder: str):
+        return self.related_templates.get((binder, role))
+
+    def booleans_for(self, binder: str) -> Tuple[str, ...]:
+        return tuple(self.boolean_roles.get(binder, ()))
+
+    def boolean_related_for(self, binder: str) -> Tuple[str, ...]:
+        return tuple(
+            role
+            for (template_binder, role), template
+            in self.related_templates.items()
+            if template_binder == binder
+            and getattr(template, "mode", "") == "span_any"
+        )
+
     # -- seam 1: name parsing ------------------------------------------------
     def parse_column(self, name: str, nodes) -> Optional[ColumnSemantics]:
         """Recover :class:`ColumnSemantics` from a column name (or ``None`` if no pattern)."""
         for p in self.patterns:
             if p.matcher == "regex":
-                m = p.rx.match(name)
+                m = p.rx.fullmatch(name)
                 if not m:
                     continue
                 groups = m.groupdict()
@@ -128,7 +167,7 @@ class SchemaAdapter:
             for p in self.patterns:
                 if p.matcher != "regex" or not p.token_groups:
                     continue
-                m = p.rx.match(c)
+                m = p.rx.fullmatch(c)
                 if m:
                     g = m.groupdict()
                     for name in p.token_groups:
@@ -171,6 +210,8 @@ class SchemaAdapter:
         sel = self.family_selectors.get((binder, family_role))
         if sel is None:
             return ()
+        if sel.columns:
+            return tuple(c for c in sel.columns if c in nm.by_name)
         out = []
         for c, sem in nm.by_name.items():
             if sem.kind != sel.match_kind:
@@ -209,11 +250,14 @@ class SchemaAdapter:
     # -- seam 4: cell codec --------------------------------------------------
     def decode_observed(self, v) -> float:
         if self.codec_kind == "scalar":
-            return float("nan") if v is None else float(v)
+            if hasattr(v, "get"):
+                value = v.get(self.codec_primary)
+                return float("nan") if value is None or bool(pd.isna(value)) else float(value)
+            return float("nan") if v is None or bool(pd.isna(v)) else float(v)
         if not hasattr(v, "get"):
-            return float("nan") if v is None else float(v)
+            return float("nan") if v is None or bool(pd.isna(v)) else float(v)
         x = v.get(self.codec_primary)
-        return float("nan") if x is None else float(x)
+        return float("nan") if x is None or bool(pd.isna(x)) else float(x)
 
     # -- glyphs (interpretability; role names are reused so engine unparse is unchanged) --
     def ref_glyph(self, role: str) -> str:

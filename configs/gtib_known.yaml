@@ -1,0 +1,113 @@
+invariants:
+  - {name: backlog_non_negative, op: ">=", lhs: backlog_bytes, rhs: 0}
+  - {name: input_rate_non_negative, op: ">=", lhs: input_rate_bytes_per_min, rhs: 0}
+  - {name: output_rate_non_negative, op: ">=", lhs: output_rate_bytes_per_min, rhs: 0}
+
+  - name: steady_normal_healthy_band
+    where:
+      all:
+        - {archetype: steady}
+        - {label: normal}
+    op: "~band"
+    lhs: completeness_ratio
+    rhs: {center: 0.998}
+
+  - name: completeness_ratio_definition
+    op: "=="
+    lhs: completeness_ratio
+    rhs: {ratio: [output_rate_bytes_per_min, input_rate_bytes_per_min]}
+
+  - name: observed_input_output_proportionality
+    where:
+      all:
+        - {archetype: steady}
+        - {label: normal}
+    op: "~∝"
+    lhs: output_rate_bytes_per_min
+    rhs: input_rate_bytes_per_min
+
+  - name: cumulative_loss_monotone
+    op: ">="
+    lhs: {delta: cum_lost_bytes}
+    rhs: 0
+
+  - name: smoothed_ratio_windowed
+    op: "=="
+    lhs: completeness_ratio_1h
+    rhs:
+      ratio:
+        - {roll_sum: [output_rate_bytes_per_min, 60]}
+        - {roll_sum: [input_rate_bytes_per_min, 60]}
+
+  - name: true_loss_accumulates
+    where: {label: true_loss}
+    op: ">"
+    lhs: {delta: cum_lost_bytes}
+    rhs: 0
+
+  - name: benign_spans_lose_no_bytes
+    where: {label_in: [benign_burst, artifact]}
+    op: "~="
+    lhs: {delta: cum_lost_bytes}
+    rhs: 0
+
+  - name: input_rate_from_raw_shards
+    op: "=="
+    lhs: input_rate_bytes_per_min
+    rhs: {related: raw_input_rate}
+
+  - name: output_rate_from_raw_shards
+    op: "=="
+    lhs: output_rate_bytes_per_min
+    rhs: {related: raw_output_rate}
+
+  - name: backlog_from_raw_shards
+    op: "=="
+    lhs: backlog_bytes
+    rhs: {related: raw_backlog}
+
+  - name: cumulative_loss_from_raw_shards
+    op: "=="
+    lhs: cum_lost_bytes
+    rhs: {related: raw_cum_lost}
+
+  - name: static_alert_definition
+    op: ":="
+    lhs: static_alert
+    rhs:
+      sustained:
+        term: completeness_ratio_1h
+        op: "<"
+        threshold: 0.99
+        window: 10
+
+  - name: trajectory_alert_definition
+    op: ":="
+    lhs: traj_alert
+    rhs:
+      and:
+        - {bound: [completeness_ratio_1h, "<", 0.98]}
+        - bound:
+            - {roll_sum: [{difference: [input_rate_bytes_per_min, output_rate_bytes_per_min]}, 45]}
+            - ">"
+            - 0
+        - {bound: [{delta: [completeness_ratio_1h, 45]}, "<=", 0]}
+
+  - name: oracle_is_true_loss
+    op: "=="
+    lhs: oracle_alert
+    rhs: is_true_loss
+
+  - {name: true_loss_mask_from_events, op: "==", lhs: is_true_loss, rhs: {related: event_true_loss}}
+  - {name: benign_mask_from_events, op: "==", lhs: is_benign_burst, rhs: {related: event_benign_burst}}
+  - {name: artifact_mask_from_events, op: "==", lhs: is_artifact, rhs: {related: event_artifact}}
+
+  - name: label_priority_definition
+    op: ":="
+    lhs: label
+    rhs:
+      priority:
+        - {when: is_true_loss, value: true_loss}
+        - {when: is_benign_burst, value: benign_burst}
+        - {when: is_artifact, value: artifact}
+      default: normal

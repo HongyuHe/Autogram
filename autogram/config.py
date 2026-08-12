@@ -22,10 +22,23 @@ class DiscoveryConfig:
     band_holdout_frac: float = 0.3      # split-conformal holdout for the adaptive band
     separation_tolerance: float = 1e-6  # minimum relative gap for != separations
     presence_tolerance: float = 1e-9    # relative non-zero cutoff for <|> pairings
+    ordering_tolerance: float = 1e-12   # strict < and > margin on the relative residual
     hold_rate_threshold: float = 0.62   # Wilson lower bound required for approximate-law acceptance
     ci_alpha: float = 0.05              # Wilson interval confidence level
     subsample: int = 0                  # 0 => use every grounded point
     seed: int = 0
+    min_condition_points: int = 20
+    min_condition_fraction: float = 0.01
+    parameter_holdout_frac: float = 0.3
+    min_proportional_points: int = 8
+    definition_min_lift: float = 0.05
+    # Learned-threshold sweep ceiling. A Boolean/definition bound with a learned threshold is fit
+    # over the fit-split midpoints between consecutive distinct effective-term values (plus below-
+    # min / above-max edge sentinels), which is exhaustive for a single stump and jointly exact
+    # across a conjunction's learned bounds. 0 keeps that exact default; a positive value is a
+    # fail-loud safety ceiling that raises SearchSpaceTruncatedError when a bound exposes more
+    # fit-split candidate thresholds than the cap, so the sweep can never be silently coarsened.
+    max_threshold_candidates: int = 0
 
     # Acceptance-threshold policy for the hold-rate bar theta. DEFAULT "global" applies one flat
     # hold_rate_threshold to every rule, so theta is shared across candidates; this makes the
@@ -48,8 +61,13 @@ class SearchConfig:
     proposer: str = "enumeration"
     max_complexity: int = DEFAULT_MAX_COMPLEXITY
     max_add_arity: int = DEFAULT_MAX_ADD_ARITY
-    max_rules: int = 0                  # 0 => exhaust the bounded grammar
+    max_rules: int = 0                  # 0 => no ceiling; positive values fail if the bounded grammar is larger
+    max_nonlinear_leaves: int = 0       # positive => fail if the declared nonlinear leaves exceed it
+    max_linear_leaves: int = 0          # positive => fail if the declared scaled/additive leaves exceed it
+    max_conditioned_rules: int = 0      # 0 => condition every eligible temporal rule
     seed: int = 0
+    max_lag: int = 0                    # 0 => preserve the induced/profiled grammar bound
+    windows: tuple[int, ...] = ()       # empty => preserve the induced/profiled windows
 
 
 @dataclass

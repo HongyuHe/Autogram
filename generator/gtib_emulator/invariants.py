@@ -119,9 +119,19 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
         results.append(_soft("steady_normal_ratio_in_healthy_band", True, "no steady-normal minutes."))
 
     # -- Soft: benign bursts lose no bytes; true loss accumulates ------------
-    benign_ok, benign_detail = _event_loss_behaviour(records, events, benign=True)
+    benign_ok, benign_detail = _event_loss_behaviour(
+        cfg,
+        records,
+        events,
+        benign=True,
+    )
     results.append(_soft("benign_events_do_not_lose_bytes", benign_ok, benign_detail))
-    loss_ok, loss_detail = _event_loss_behaviour(records, events, benign=False)
+    loss_ok, loss_detail = _event_loss_behaviour(
+        cfg,
+        records,
+        events,
+        benign=False,
+    )
     results.append(_soft("true_loss_events_accumulate_deficit", loss_ok, loss_detail))
 
     return results
@@ -168,7 +178,7 @@ def _collect_steady(records: list[dict[str, Any]], label: str, col: str) -> np.n
     return np.concatenate(chunks) if chunks else np.array([])
 
 
-def _event_loss_behaviour(records: list[dict[str, Any]], events: pd.DataFrame,
+def _event_loss_behaviour(cfg: EmulatorConfig, records: list[dict[str, Any]], events: pd.DataFrame,
                           benign: bool) -> tuple[bool, str]:
     """Check that benign events add ~0 true-loss and true-loss events add >0."""
 
@@ -177,6 +187,13 @@ def _event_loss_behaviour(records: list[dict[str, Any]], events: pd.DataFrame,
     by_consumer = {rec["consumer"].consumer_id: rec for rec in records}
     checked = 0
     violations = 0
+    overlap_skipped = 0
+    checked_by_type: dict[str, int] = {}
+    matching_types = {
+        str(value)
+        for value in events["type"].unique()
+        if (value in ("benign_burst", "artifact")) == benign
+    }
     for _, ev in events.iterrows():
         is_benign = ev["type"] in ("benign_burst", "artifact")
         if is_benign != benign:
@@ -184,13 +201,58 @@ def _event_loss_behaviour(records: list[dict[str, Any]], events: pd.DataFrame,
         rec = by_consumer.get(ev["consumer_id"])
         if rec is None:
             continue
+        if benign:
+            overlapping_loss = events[
+                (events["consumer_id"] == ev["consumer_id"])
+                & ~events["type"].isin(("benign_burst", "artifact"))
+                & (events["span_start"] < ev["span_end"])
+                & (events["span_end"] > ev["span_start"])
+            ]
+            if not overlapping_loss.empty:
+                overlap_skipped += 1
+                continue
         frame = rec["frame"]
         seg = frame[(frame["timestamp"] >= ev["span_start"]) & (frame["timestamp"] < ev["span_end"])]
-        if len(seg) < 2:
-            continue
-        delta_loss = float(seg["cum_lost_bytes"].iloc[-1] - seg["cum_lost_bytes"].iloc[0])
-        input_bytes = float(np.nansum(seg["input_rate_bytes_per_min"].to_numpy()))
+        if len(seg) >= 2:
+            delta_loss = float(
+                seg["cum_lost_bytes"].iloc[-1]
+                - seg["cum_lost_bytes"].iloc[0]
+            )
+            input_bytes = float(np.nansum(
+                seg["input_rate_bytes_per_min"].to_numpy()
+            ))
+        else:
+            start = np.datetime64(
+                cfg.time.start_timestamp.replace("Z", "")
+            )
+            dt = int(cfg.time.raw_scrape_seconds)
+            first = int(
+                (np.datetime64(ev["span_start"]) - start)
+                / np.timedelta64(dt, "s")
+            )
+            stop = int(
+                (np.datetime64(ev["span_end"]) - start)
+                / np.timedelta64(dt, "s")
+            )
+            first = max(0, first)
+            stop = min(cfg.n_raw_steps, stop)
+            if stop <= first:
+                continue
+            prior = max(0, first - 1)
+            current = max(prior, stop - 1)
+            phys = rec["phys"]
+            delta_loss = float(
+                np.sum(phys.cum_true_loss[:, current])
+                - np.sum(phys.cum_true_loss[:, prior])
+            )
+            input_bytes = float(
+                np.sum(phys.cum_input[:, current])
+                - np.sum(phys.cum_input[:, prior])
+            )
         checked += 1
+        checked_by_type[str(ev["type"])] = (
+            checked_by_type.get(str(ev["type"]), 0) + 1
+        )
         if benign:
             if delta_loss > max(1.0, 1e-6 * input_bytes):
                 violations += 1
@@ -199,7 +261,26 @@ def _event_loss_behaviour(records: list[dict[str, Any]], events: pd.DataFrame,
                 violations += 1
     if checked == 0:
         return True, "no matching events with enough coverage."
-    ok = violations == 0
+    uncovered = sorted(
+        event_type
+        for event_type in matching_types
+        if checked_by_type.get(event_type, 0) == 0
+    )
+    ok = violations == 0 and not uncovered
     kind = "benign" if benign else "true-loss"
     expect = "add ~0 lost bytes" if benign else "accumulate lost bytes"
-    return ok, f"{violations}/{checked} {kind} events violated the expectation that they {expect}."
+    suffix = (
+        f"; skipped {overlap_skipped} precedence-probe overlaps"
+        if overlap_skipped else ""
+    )
+    coverage = ", ".join(
+        f"{event_type}:{checked_by_type.get(event_type, 0)}"
+        for event_type in sorted(matching_types)
+    )
+    if uncovered:
+        suffix += f"; uncovered subtypes={uncovered}"
+    return (
+        ok,
+        f"{violations}/{checked} {kind} events violated the expectation "
+        f"that they {expect}; coverage={coverage}{suffix}.",
+    )

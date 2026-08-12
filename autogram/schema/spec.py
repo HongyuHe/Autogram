@@ -119,6 +119,7 @@ class FamilySelector:
     match_kind: str
     match_direction: Optional[str] = None
     predicates: Tuple[Tuple[str, str, str], ...] = ()
+    columns: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,29 @@ class CellCodec:
     kind: str = "dict_gt_hidden"
     primary: str = "ground_truth"
     clean: str = "hidden_ground_truth"
+
+
+@dataclass(frozen=True)
+class RelatedTemplate:
+    """A bounded parent-to-child aggregation over a named related frame."""
+
+    binder: str
+    role: str
+    relation: str
+    column: str
+    mode: str
+    parent_keys: Tuple[str, ...]
+    child_keys: Tuple[str, ...]
+    partition_keys: Tuple[str, ...]
+    parent_time: str
+    child_time: str
+    window_seconds: int
+    reset_column: str = ""
+    validity_columns: Tuple[str, ...] = ()
+    span_start: str = ""
+    span_end: str = ""
+    filter_column: str = ""
+    filter_values: Tuple[object, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -159,3 +183,23 @@ class GrammarSpec:
     max_degree: int = 1                         # proposer opt-in: >=2 enables products/ratios (item 6)
     role_exclusions: Tuple[frozenset, ...] = ()  # proposer blocklist of role pairs (item 2)
     notes: str = ""
+    time_index: str = ""
+    group_keys: Tuple[str, ...] = ()
+    condition_columns: Dict[str, Tuple[object, ...]] = field(default_factory=dict)
+    temporal_enabled: bool = False
+    max_lag: int = 0
+    windows: Tuple[int, ...] = ()
+    conditional_enabled: bool = False
+    max_condition_values: int = 4
+    related_templates: Tuple[RelatedTemplate, ...] = ()
+    boolean_roles: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    advanced_enabled: bool = False
+    run_lengths: Tuple[int, ...] = ()
+    max_conjunction_terms: int = 3
+    metadata_columns: Tuple[str, ...] = ()
+    band_enabled: bool = False
+    aggregations_widened: bool = False
+    temporal_bounds_widened: bool = False
+    advanced_bounds_widened: bool = False
+    degree_widened: bool = False
+    proportional_widened: bool = False

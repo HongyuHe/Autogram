@@ -17,6 +17,7 @@ from .spec import (
     FamilySelector,
     RefTemplate,
     RoleOntology,
+    RelatedTemplate,
     GrammarSpec,
 )
 from .adapter import SchemaAdapter
@@ -28,6 +29,7 @@ __all__ = [
     "FamilySelector",
     "RefTemplate",
     "RoleOntology",
+    "RelatedTemplate",
     "GrammarSpec",
     "SchemaAdapter",
     "CompileError",

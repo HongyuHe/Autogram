@@ -33,3 +33,29 @@ def test_z3_solver_checks_tautology_equivalence_subsumption():
     assert equivalent(ge, le)
     assert subsumes(eq, ge)
     assert not subsumes(ge, eq)
+
+
+def test_z3_symbol_encoding_is_injective_across_similar_role_names():
+    # Roles that differ only by a non-alphanumeric character (hyphen vs underscore) must map to
+    # distinct Z3 symbols; a non-injective encoding would conflate them and wrongly report the two
+    # equalities as logically equivalent.
+    left = _rule("node", A.Ref("a-b"), "==", A.Ref("c"))
+    right = _rule("node", A.Ref("a_b"), "==", A.Ref("c"))
+
+    assert not equivalent(left, right)
+    assert not subsumes(left, right)
+    assert not subsumes(right, left)
+
+
+def test_z3_symbol_encoding_is_injective_for_control_and_separator_chars():
+    from autogram.logic.solver import _var_name
+
+    keys = [
+        ("ref", "a\x1fb"),
+        ("ref", "a", "b"),
+        ("ref", "a_b"),
+        ("proportional_coefficient", "x", "y"),
+        ("proportional_coefficient", "x_y"),
+    ]
+    names = [_var_name(k) for k in keys]
+    assert len(set(names)) == len(names)

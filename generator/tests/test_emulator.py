@@ -76,8 +76,14 @@ def test_derived_schema(result):
         "backlog_bytes", "cum_lost_bytes",
         "is_true_loss", "is_benign_burst", "is_artifact", "label", "oracle_alert",
         "traj_alert",
+        "archetype",
     }
     assert expected.issubset(set(result.derived.columns))
+
+
+def test_raw_schema_includes_per_shard_hidden_state_when_enabled(result):
+    assert result.config.output.include_hidden_state is True
+    assert {"backlog_bytes", "cum_lost_bytes"}.issubset(result.raw.columns)
 
 
 def test_events_have_expected_alert_semantics(result):
@@ -88,6 +94,43 @@ def test_events_have_expected_alert_semantics(result):
     benign = ev[ev["type"].isin(["benign_burst", "artifact"])]
     assert (true_loss["expected_alert"] == True).all()      # noqa: E712
     assert (benign["expected_alert"] == False).all()        # noqa: E712
+
+
+def test_priority_masks_exercise_cross_family_precedence(result):
+    event_types = set(result.events["type"]) if not result.events.empty else set()
+    has_true = any(value.startswith("true_loss") for value in event_types)
+    has_benign = bool(event_types & {"benign_burst", "artifact"})
+    if not (has_true and has_benign):
+        pytest.skip("tiny schedule did not draw both priority families")
+    flags = result.derived[[
+        "is_true_loss",
+        "is_benign_burst",
+        "is_artifact",
+    ]]
+
+    assert (flags["is_true_loss"] & flags["is_benign_burst"]).any()
+    assert (flags["is_true_loss"] & flags["is_artifact"]).any()
+    assert (
+        flags["is_benign_burst"]
+        & flags["is_artifact"]
+        & ~flags["is_true_loss"]
+    ).any()
+
+
+def test_benign_invariant_covers_artifact_subtype(result):
+    check = next(
+        item
+        for item in check_all(
+            result.config,
+            result.records,
+            result.events,
+        )
+        if item.name == "benign_events_do_not_lose_bytes"
+    )
+
+    assert check.passed
+    assert "artifact:" in check.detail
+    assert "artifact:0" not in check.detail
 
 
 def test_healthy_ratio_above_alert_threshold_for_steady(result):

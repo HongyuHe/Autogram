@@ -6,17 +6,24 @@ import json
 from dataclasses import replace
 from types import SimpleNamespace
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from autogram.config import DiscoveryConfig
 from autogram.calibrate import (
     CalibrationConfig, _capability_tiers, _derive_regime, _knob_schedule, _merge_specs,
-    _spec_summary, _widen_spec, calibrate,
+    _split_known,
+    _make_calibration_inducer, _spec_summary, _widen_spec, calibrate,
 )
-from autogram.discovery.known import KnownInvariant
+from autogram.discovery.known import KnownInvariant, load_known
+from autogram.discovery.known import _signature as _known_signature
+from autogram.discovery.induce import SchemaInducer
 from autogram.discovery.regime import ProxyEntry, RegimeSpec
+from autogram.loader.gtib import profile_dataframe
 from autogram.schema.spec import (
-    ColumnPattern, FamilySelector, GrammarSpec, RefTemplate, RoleOntology,
+    CellCodec, ColumnPattern, FamilySelector, GrammarSpec, RefTemplate, RelatedTemplate,
+    RoleOntology,
 )
 
 
@@ -28,14 +35,62 @@ def _mini_spec(agg=("SUM",), max_degree=1, role_exclusions=()):
                        max_degree=max_degree, role_exclusions=role_exclusions)
 
 
+class _CalibrationInducer(SchemaInducer):
+    def induce(self, columns, sample_rows=None) -> GrammarSpec:
+        if any(str(column).startswith("flow_") for column in columns):
+            from tests.test_gtib_proxies import _SyntheticInducer
+            return _SyntheticInducer().induce(columns, sample_rows)
+        return GrammarSpec(
+            name="calibration_frame",
+            patterns=(
+                ColumnPattern(
+                    "placeholder",
+                    "regex",
+                    "unused",
+                    "unused",
+                    regex=r"^does_not_match$",
+                ),
+            ),
+            ontology=RoleOntology(
+                binders=("network",),
+                ref_roles={"network": ()},
+                fam_roles={"network": ()},
+            ),
+            ref_templates=(),
+            family_selectors=(),
+            binder_enumerate={"network": "singleton"},
+            cell_codec=CellCodec(kind="scalar"),
+        )
+
+
 def test_calibration_defaults_global_while_discovery_stays_adaptive():
     # The engine default is unchanged; calibration (config + CLI) defaults to one fixed global band.
     from autogram.cli import build_parser
     assert DiscoveryConfig().band_mode == "adaptive"
     assert CalibrationConfig().band_mode == "global"
-    assert CalibrationConfig().max_capability_tiers == 3
+    assert CalibrationConfig().max_capability_tiers == 5
     a = build_parser().parse_args(["calibrate", "--input", "x.pkl", "--known", "k.yaml"])
     assert a.band_mode == "global"
+
+
+def test_known_split_is_disjoint_and_rejects_singleton_catalog():
+    known = [
+        KnownInvariant(f"i{index}", "==", f"x{index}", f"y{index}")
+        for index in range(3)
+    ]
+    calibration, validation = _split_known(
+        known,
+        frac=0.99,
+        seed=0,
+    )
+
+    assert calibration
+    assert validation
+    assert {item.name for item in calibration}.isdisjoint(
+        item.name for item in validation
+    )
+    with pytest.raises(ValueError, match="at least two"):
+        _split_known(known[:1], frac=0.3, seed=0)
 
 
 def test_widen_spec_enables_all_aggs_and_degree():
@@ -94,6 +149,44 @@ def test_spec_summary_reports_capabilities():
 def test_calibration_config_saves_rules_by_default():
     c = CalibrationConfig()
     assert c.save_rules is True and c.rules_dir == "rules"
+
+
+def test_calibrate_api_rejects_unbounded_automatic_advanced_tier(tmp_path):
+    known = _write_known(tmp_path, [
+        {"name": "x_nonnegative", "op": ">=", "lhs": "x", "rhs": 0},
+        {"name": "y_nonnegative", "op": ">=", "lhs": "y", "rhs": 0},
+    ])
+    frame = profile_dataframe(pd.DataFrame({
+        "x": [1.0, 2.0],
+        "y": [2.0, 3.0],
+    }))
+
+    with pytest.raises(ValueError, match="finite max_rules"):
+        calibrate(
+            frame,
+            known,
+            CalibrationConfig(
+                max_capability_tiers=5,
+                max_rules=0,
+                save_rules=False,
+            ),
+        )
+
+
+def test_calibration_honors_configured_schema_backend(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "autogram.calibrate.make_inducer",
+        lambda backend, **kwargs: calls.append((backend, kwargs)) or object(),
+    )
+
+    _make_calibration_inducer(CalibrationConfig(backend="openai", harness="copilot"))
+    _make_calibration_inducer(CalibrationConfig(backend="subagent", harness="codex"))
+
+    assert calls == [
+        ("openai", {}),
+        ("subagent", {"harness": "codex"}),
+    ]
 
 
 def test_write_rules_dl_persists_learned_portfolio(tmp_path):
@@ -175,6 +268,59 @@ def test_merge_specs_is_identity_preserving_superset_of_base():
     assert m.role_exclusions == (frozenset({"a", "b"}),)
 
 
+def test_merge_specs_unions_all_capability_fields():
+    base = _mini_spec()
+    related = RelatedTemplate(
+        binder="node",
+        role="raw",
+        relation="child",
+        column="counter",
+        mode="sum_delta",
+        parent_keys=(),
+        child_keys=(),
+        partition_keys=("shard",),
+        parent_time="timestamp",
+        child_time="timestamp",
+        window_seconds=60,
+    )
+    new = replace(
+        _mini_spec(),
+        time_index="timestamp",
+        group_keys=("tenant",),
+        condition_columns={"label": ("normal", "alert")},
+        temporal_enabled=True,
+        max_lag=7,
+        windows=(3, 7),
+        conditional_enabled=True,
+        max_condition_values=6,
+        related_templates=(related,),
+        boolean_roles={"node": ("a",)},
+        advanced_enabled=True,
+        run_lengths=(3, 5),
+        max_conjunction_terms=4,
+        metadata_columns=("tenant",),
+        band_enabled=True,
+    )
+
+    merged = _merge_specs(base, new)
+
+    assert merged.time_index == "timestamp"
+    assert merged.group_keys == ("tenant",)
+    assert merged.condition_columns == {"label": ("normal", "alert")}
+    assert merged.temporal_enabled
+    assert merged.max_lag == 7
+    assert merged.windows == (3, 7)
+    assert merged.conditional_enabled
+    assert merged.max_condition_values == 6
+    assert merged.related_templates == (related,)
+    assert merged.boolean_roles == {"node": ("a",)}
+    assert merged.advanced_enabled
+    assert merged.run_lengths == (3, 5)
+    assert merged.max_conjunction_terms == 4
+    assert merged.metadata_columns == ("tenant",)
+    assert merged.band_enabled
+
+
 # --- regime derivation + calibrate wiring ---------------------------------------------------
 
 def test_derive_regime_from_calibration_shapes():
@@ -202,14 +348,79 @@ def _write_known(tmp_path, invs):
     return str(p)
 
 
+def test_calibrate_runs_real_tuning_nulls_discovery_and_report(
+    monkeypatch,
+    tmp_path,
+):
+    import autogram.calibrate as calibration
+
+    frame = profile_dataframe(pd.DataFrame({
+        "x": np.linspace(1.0, 120.0, 120),
+        "y": np.linspace(2.0, 240.0, 120),
+    }))
+    known = _write_known(tmp_path, [
+        {"name": "x_nonnegative", "op": ">=", "lhs": "x", "rhs": 0},
+        {"name": "y_nonnegative", "op": ">=", "lhs": "y", "rhs": 0},
+    ])
+    monkeypatch.setattr(
+        calibration,
+        "make_inducer",
+        lambda *args, **kwargs: _CalibrationInducer(),
+    )
+
+    report = calibrate(
+        frame,
+        known,
+        CalibrationConfig(
+            max_capability_tiers=1,
+            max_iterations=1,
+            max_complexity=6,
+            max_add_arity=2,
+            max_rules=500,
+            save_rules=False,
+            tolerance=0.05,
+            hold_rate_threshold=0.72,
+        ),
+        name="production_path",
+    )
+
+    assert report["recall_all"] == 1.0
+    assert report["recall_validation"] == 1.0
+    assert report["false_discovery"] == {
+        "null_equalities_accepted": 0,
+        "null_temporal_accepted": 0,
+        "null_definitions_accepted": 0,
+    }
+    assert report["n_rules_learned"] > 0
+    from autogram.dsl.parser import rule_from_dict
+
+    assert all(
+        rule_from_dict(item["rule_payload"]).unparse()
+        == item["rule"]
+        for item in report["learned_invariants"]
+    )
+
+
 def _fake_calibrate_env(monkeypatch, *, recall_fn, null_fn, tune=None):
     """Patch calibrate's discovery seams so the loop runs with no LLM / no enumeration."""
     import autogram.calibrate as C
     from autogram.discovery.validate import PreparedProxy, ProxySuite
 
-    def fake_prepare(regime, seed=0, inducer=None):
+    def fake_prepare(regime, seed=0, inducer=None, **kwargs):
         pos = [PreparedProxy(e.shape, object(), object(), {}) for e in regime.active_entries()]
         return ProxySuite(positives=pos, null=PreparedProxy("null", object(), object(), {}))
+
+    def fake_runtime(ds, grammar, search_cfg, **kwargs):
+        return ProxySuite(
+            positives=[],
+            null=PreparedProxy("runtime_null", ds, grammar, {}),
+            candidate_counts={
+                "all": 0,
+                "equalities": 0,
+                "temporal": 0,
+                "definitions": 0,
+            },
+        )
 
     def default_tune(suite, seed=0, band_mode="global", null_floor=0.5, max_expansions=3, **kw):
         shapes = [p.shape for p in suite.positives]
@@ -220,6 +431,7 @@ def _fake_calibrate_env(monkeypatch, *, recall_fn, null_fn, tune=None):
 
     monkeypatch.setattr(C, "make_inducer", lambda *a, **k: object())
     monkeypatch.setattr(C, "prepare_proxy_suite", fake_prepare)
+    monkeypatch.setattr(C, "prepare_runtime_null_controls", fake_runtime)
     monkeypatch.setattr(C, "tune_joint", tune or default_tune)
     monkeypatch.setattr(C, "induce_spec", lambda cols, inducer, *a, **k: _mini_spec())
     monkeypatch.setattr(C, "build_dataframe_grammar",
@@ -244,6 +456,80 @@ def test_calibrate_reports_selected_proxy_shapes_and_evidence(monkeypatch, tmp_p
     assert set(ev[0]) >= {"recovery", "accepted", "compact"}      # per-proxy tuning evidence
     assert report["proxies"]["selected_null_equalities"] == 0
     assert "null_equalities_accepted" in report["false_discovery"]
+    assert set(report["provenance"]) == {
+        "engine_source_sha256",
+        "input_sha256",
+        "known_sha256",
+        "calibration_config_sha256",
+    }
+    assert all(
+        len(value) == 64
+        for value in report["provenance"].values()
+    )
+    assert report["induction"] == {
+        "backend": "subagent",
+        "harness": "copilot",
+    }
+    grammar_spec = report["grammar_specs"][0]
+    assert len(grammar_spec["normalized_spec_sha256"]) == 64
+    assert grammar_spec["normalized_spec"]["ontology"]["binders"]
+
+
+def test_calibration_hashes_the_post_profile_runtime_spec(
+    monkeypatch,
+    tmp_path,
+):
+    _fake_calibrate_env(
+        monkeypatch,
+        recall_fn=lambda _config: 1.0,
+        null_fn=lambda _config: 0,
+    )
+    known = _write_known(tmp_path, [
+        {"name": "x_nonnegative", "op": ">=", "lhs": "x", "rhs": 0},
+        {"name": "y_nonnegative", "op": ">=", "lhs": "y", "rhs": 0},
+    ])
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "timestamp": pd.date_range(
+                "2026-01-01",
+                periods=20,
+                freq="1min",
+            ),
+            "tenant": ["a"] * 20,
+            "x": np.arange(20, dtype=float),
+            "y": np.arange(20, dtype=float),
+        }),
+        time_index="timestamp",
+        group_keys=("tenant",),
+        temporal_windows=(3,),
+        max_lag=3,
+    )
+
+    report = calibrate(
+        frame,
+        known,
+        CalibrationConfig(
+            max_capability_tiers=1,
+            max_iterations=1,
+            save_rules=False,
+        ),
+    )
+    spec = report["grammar_specs"][0]["normalized_spec"]
+
+    assert spec["ontology"]["binders"] == ["record"]
+    assert spec["time_index"] == "timestamp"
+    assert spec["group_keys"] == ["tenant"]
+    assert spec["windows"] == [3]
+    assert spec["metadata_columns"] == []
+
+    # The published SHA-256 must be reproducible from the published normalized spec alone: a fresh
+    # JSON round-trip fingerprint of the reported spec must equal the reported digest. This guards
+    # against tuple/list drift between the hashed object and the serialized object (I8).
+    from autogram.calibrate import _json_fingerprint, _json_normalize
+
+    published = report["grammar_specs"][0]
+    assert _json_fingerprint(_json_normalize(spec)) == published["normalized_spec_sha256"]
+    assert _json_fingerprint(spec) == published["normalized_spec_sha256"]
 
 
 def test_calibrate_unsafe_relaxed_rung_cannot_win(monkeypatch, tmp_path):
@@ -264,6 +550,60 @@ def test_calibrate_unsafe_relaxed_rung_cannot_win(monkeypatch, tmp_path):
     assert max(h["calibration_recall"] for h in unsafe) > report["recall_all"]
 
 
+def test_calibrate_continues_capability_widening_when_recall_stalls(monkeypatch, tmp_path):
+    _fake_calibrate_env(
+        monkeypatch,
+        recall_fn=lambda _config: 0.5,
+        null_fn=lambda _config: 0,
+    )
+    known = _write_known(
+        tmp_path,
+        [
+            {"name": f"i{i}", "op": "~=", "lhs": f"x{i}", "rhs": f"y{i}"}
+            for i in range(4)
+        ],
+    )
+    report = calibrate(
+        SimpleNamespace(columns=["x0", "y0"]),
+        known,
+        CalibrationConfig(max_capability_tiers=3, save_rules=False),
+    )
+
+    assert report["grammar_reinductions"] == 2
+    assert {entry["grammar_tier"] for entry in report["trajectory"]} == {0, 1, 2}
+
+
+def test_calibrate_applies_max_iterations_globally_across_tiers(
+    monkeypatch,
+    tmp_path,
+):
+    _fake_calibrate_env(
+        monkeypatch,
+        recall_fn=lambda _config: 0.5,
+        null_fn=lambda _config: 0,
+    )
+    known = _write_known(
+        tmp_path,
+        [
+            {"name": f"i{i}", "op": "~=", "lhs": f"x{i}", "rhs": f"y{i}"}
+            for i in range(4)
+        ],
+    )
+
+    report = calibrate(
+        SimpleNamespace(columns=["x0", "y0"]),
+        known,
+        CalibrationConfig(
+            max_capability_tiers=3,
+            max_iterations=1,
+            save_rules=False,
+        ),
+    )
+
+    assert report["iterations"] == 1
+    assert report["grammar_reinductions"] == 0
+
+
 def test_derive_regime_rejects_custom_regime_with_no_active_entries():
     # A caller-supplied regime with nothing active would prepare no positive proxies; reject it
     # clearly before any preparation, instead of silently "calibrating" on an empty suite.
@@ -273,16 +613,27 @@ def test_derive_regime_rejects_custom_regime_with_no_active_entries():
             _derive_regime(CalibrationConfig(regime=empty), [KnownInvariant("i1", "~=", "x", "y")])
 
 
-def test_calibrate_memoizes_null_gate_across_tiers(monkeypatch, tmp_path):
-    # Across multiple grammar tiers the same relaxation-ladder rungs recur; the per-rung null gate
-    # must be memoized by (band_mode, tolerance, threshold) so each unique config is scored once,
-    # while unsafe rungs still cannot win.
+def test_calibrate_scores_each_runtime_grammar_with_memoized_rungs(monkeypatch, tmp_path):
+    # Each widened grammar gets its own runtime-parity null, while repeated access to one tier/rung
+    # remains memoized and unsafe rungs still cannot win.
     import autogram.calibrate as C
     from autogram.discovery.validate import PreparedProxy, ProxySuite
 
-    def fake_prepare(regime, seed=0, inducer=None):
+    def fake_prepare(regime, seed=0, inducer=None, **kwargs):
         pos = [PreparedProxy(e.shape, object(), object(), {}) for e in regime.active_entries()]
         return ProxySuite(positives=pos, null=PreparedProxy("null", object(), object(), {}))
+
+    def fake_runtime(ds, grammar, search_cfg, **kwargs):
+        return ProxySuite(
+            positives=[],
+            null=PreparedProxy("runtime_null", ds, grammar, {}),
+            candidate_counts={
+                "all": 0,
+                "equalities": 0,
+                "temporal": 0,
+                "definitions": 0,
+            },
+        )
 
     def fake_tune(suite, seed=0, band_mode="global", null_floor=0.5, max_expansions=3, **kw):
         shapes = [p.shape for p in suite.positives]
@@ -314,6 +665,7 @@ def test_calibrate_memoizes_null_gate_across_tiers(monkeypatch, tmp_path):
 
     monkeypatch.setattr(C, "make_inducer", lambda *a, **k: object())
     monkeypatch.setattr(C, "prepare_proxy_suite", fake_prepare)
+    monkeypatch.setattr(C, "prepare_runtime_null_controls", fake_runtime)
     monkeypatch.setattr(C, "tune_joint", fake_tune)
     monkeypatch.setattr(C, "induce_spec", lambda cols, inducer, *a, **k: _mini_spec())
     monkeypatch.setattr(C, "build_dataframe_grammar", fake_build)
@@ -326,11 +678,119 @@ def test_calibrate_memoizes_null_gate_across_tiers(monkeypatch, tmp_path):
     report = calibrate(SimpleNamespace(columns=["x0", "y0"]), known,
                        CalibrationConfig(max_capability_tiers=3, save_rules=False))
 
-    # (a) three tiers ran, but each unique (band_mode, tolerance, threshold) config scored once
+    # (a) three tiers ran and each tier scored every distinct rung exactly once
     assert report["grammar_reinductions"] == 2                    # tiers 1 and 2 re-induced
-    assert len(null_calls) == len(set(null_calls)) == 4           # 4 distinct rungs, no re-eval
+    assert len(null_calls) == 12
+    assert len(set(null_calls)) == 4
     # (b) an unsafe relaxed rung (higher recall) still cannot win
     assert report["config"]["tolerance"] == 0.05
     assert report["false_discovery"]["null_equalities_accepted"] == 0
     unsafe = [h for h in report["trajectory"] if h["null_equalities"] >= 1]
     assert unsafe and max(h["calibration_recall"] for h in unsafe) > report["recall_all"]
+
+
+def test_known_split_keeps_alias_relations_on_the_same_side():
+    # Round-24: the split must be by canonical relation signature, not list position. "x == y" and
+    # "y == x" denote the SAME relation, so placing one in calibration and the other in validation
+    # would mean tuning directly on a "held-out" invariant -- the calibration/validation gap would
+    # stop being an overfitting alarm.
+    known = [
+        KnownInvariant("forward", "==", "x", "y"),
+        KnownInvariant("reverse", "==", "y", "x"),
+        KnownInvariant("other", "==", "a", "b"),
+        KnownInvariant("third", "==", "c", "d"),
+    ]
+
+    for seed in range(25):
+        calibration, validation = _split_known(known, frac=0.5, seed=seed)
+        calib_names = {item.name for item in calibration}
+        valid_names = {item.name for item in validation}
+        assert calib_names.isdisjoint(valid_names)
+        assert calib_names | valid_names == {"forward", "reverse", "other", "third"}
+        # The aliases travel together.
+        assert ("forward" in calib_names) == ("reverse" in calib_names)
+        # And the two halves share no canonical signature at all.
+        calib_sigs = {_known_signature(item) for item in calibration}
+        valid_sigs = {_known_signature(item) for item in validation}
+        assert calib_sigs.isdisjoint(valid_sigs), seed
+
+
+def test_known_split_rejects_a_catalog_of_only_aliases():
+    # If every entry canonicalises to one relation there is nothing to hold out, and calibration
+    # must fail loudly rather than report a recall figure against a split it did not really make.
+    aliases = [
+        KnownInvariant("forward", "==", "x", "y"),
+        KnownInvariant("reverse", "==", "y", "x"),
+    ]
+    with pytest.raises(ValueError, match="two distinct known-invariant relations"):
+        _split_known(aliases, frac=0.5, seed=0)
+
+
+def test_checked_in_gtib_split_is_signature_disjoint():
+    known = load_known("configs/gtib_known.yaml")
+    for seed in range(5):
+        calibration, validation = _split_known(known, frac=0.3, seed=seed)
+        assert len(calibration) + len(validation) == len(known)
+        calib_sigs = {_known_signature(item) for item in calibration}
+        valid_sigs = {_known_signature(item) for item in validation}
+        assert calib_sigs.isdisjoint(valid_sigs), seed
+
+
+def test_known_split_keeps_exact_and_approximate_forms_of_one_relation_together():
+    # Round-26: `recover_known` expands an APPROXIMATE equality so the exact rule also recovers it
+    # (`known._matching_signatures`). "x ~= y" and "x == y" are therefore recovered by one and the
+    # same discovered rule, so splitting them apart would put a "held-out" invariant within reach of
+    # the calibration half. Exact-signature grouping missed this because the two signatures differ
+    # in their strength tag.
+    known = [
+        KnownInvariant("approx", "~=", "x", "y"),
+        KnownInvariant("exact", "==", "x", "y"),
+        KnownInvariant("other", "==", "a", "b"),
+        KnownInvariant("third", "==", "c", "d"),
+    ]
+
+    for seed in range(25):
+        calibration, validation = _split_known(known, frac=0.5, seed=seed)
+        calib = {item.name for item in calibration}
+        valid = {item.name for item in validation}
+        assert calib.isdisjoint(valid)
+        assert calib | valid == {"approx", "exact", "other", "third"}
+        assert ("approx" in calib) == ("exact" in calib), seed
+
+
+def test_known_split_merges_entries_that_data_canonicalization_makes_identical():
+    """Round-27: the split must apply the same data-dependent canonicalisation as recovery.
+
+    `recover_known` drops summed members whose observed data is negligible against the anchor's
+    scale, so `total == SUM(a)` and `total == SUM(a, z)` with `z` identically zero are recovered by
+    one and the same rule. Comparing signatures without that transform let the pair straddle the
+    split, which would put a "held-out" invariant directly within reach of the calibration half.
+    """
+    from autogram.calibrate import _ColumnScaleView
+
+    df = pd.DataFrame({
+        "total": np.linspace(10.0, 20.0, 50),
+        "a": np.linspace(10.0, 20.0, 50),
+        "z": np.zeros(50),
+        "p": np.linspace(1.0, 2.0, 50),
+        "q": np.linspace(3.0, 4.0, 50),
+    })
+    known = [
+        KnownInvariant("plain", "==", "total", {"sum": ["a"]}),
+        KnownInvariant("padded", "==", "total", {"sum": ["a", "z"]}),
+        KnownInvariant("other", "==", "p", "q"),
+        KnownInvariant("third", "==", "q", "p"),
+        KnownInvariant("fourth", ">=", "p", 0),
+    ]
+    view = _ColumnScaleView(df)
+
+    # Without the canonicalising view the two spellings look like different relations.
+    bare_calib, bare_valid = _split_known(known, frac=0.5, seed=0)
+    assert {item.name for item in bare_calib} | {item.name for item in bare_valid}
+
+    for seed in range(25):
+        calibration, validation = _split_known(known, frac=0.4, seed=seed, frame=view)
+        calib = {item.name for item in calibration}
+        valid = {item.name for item in validation}
+        assert calib.isdisjoint(valid)
+        assert ("plain" in calib) == ("padded" in calib), seed

@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="luxury">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Autogram × gtib — Implementation Plan</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/daisyui.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/daisyui@5.5.19/themes.css">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4/dist/index.global.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "base", securityLevel: "strict",
+    themeVariables: { fontSize: "16px", fontFamily: "ui-sans-serif, system-ui, sans-serif" } });
+</script>
+<style>
+  [data-theme="luxury"] { --color-base-content: #ffffff; }
+  *, *::before, *::after { box-sizing: border-box; }
+  body { color: #ffffff; }
+  :where(.grid, .flex) > * { min-width: 0; }
+  :where(p, h1, h2, h3, h4, h5, h6, li, dd, blockquote, td, th, .badge, .label) { overflow-wrap: anywhere; }
+  :where(img, svg, video, canvas, iframe) { max-width: 100%; height: auto; }
+  .prose-white, .prose-white * { color: #ffffff; }
+  .mermaid-card { background:#f5f7fa; border-radius:1rem; padding:1.25rem; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre.code { background:#11151c; color:#e6edf3; padding:1rem 1.15rem; border-radius:0.75rem; overflow-x:auto;
+             font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:0.86rem; line-height:1.5;
+             border:1px solid rgba(255,255,255,0.08); }
+  pre.code .c { color:#7ee787; }        /* comment */
+  pre.code .k { color:#ff7b72; }        /* key */
+  pre.code .v { color:#a5d6ff; }        /* value */
+  table td, table th { vertical-align: top; }
+  .tag-yes { color:#3fb950; } .tag-part { color:#d29922; } .tag-no { color:#f85149; }
+  h2 { scroll-margin-top: 1rem; }
+</style>
+</head>
+<body class="bg-base-200">
+<main class="mx-auto max-w-6xl p-5 lg:p-9">
+
+  <!-- HERO -->
+  <section class="hero bg-base-100 rounded-box border border-base-content/10 mb-6">
+    <div class="hero-content flex-col items-start gap-3 py-8">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="badge badge-primary">Implementation Plan</span>
+        <span class="badge badge-soft">Autogram</span>
+        <span class="badge badge-soft badge-accent">gtib dataset</span>
+        <span class="badge badge-ghost mono">repo: HongyuHe/Autogram</span>
+      </div>
+      <h1 class="text-3xl lg:text-4xl font-bold">Teaching Autogram to discover the gtib invariants</h1>
+      <p class="text-base lg:text-lg max-w-4xl">
+        A staged plan to extend Autogram from <b>per-snapshot, wide-table</b> discovery (its CrossCheck comfort zone)
+        to the <b>time-series, ratio, and conditional</b> laws that dominate the gtib byte-completeness dataset.
+        Written to be implementable by an engineer who has never seen Autogram before: every phase names the exact
+        files and functions to change, the invariants it unlocks, and how to test it.
+      </p>
+    </div>
+  </section>
+
+  <!-- TL;DR STATS -->
+  <div class="stats stats-vertical lg:stats-horizontal w-full shadow bg-base-100 border border-base-content/10 mb-6">
+    <div class="stat">
+      <div class="stat-title text-white/70">gtib invariants catalogued</div>
+      <div class="stat-value text-primary">17</div>
+      <div class="stat-desc text-white/70">3 hidden-physical · 9 emitted identities · 5 soft</div>
+    </div>
+    <div class="stat">
+      <div class="stat-title text-white/70">Expressible today (after ingest)</div>
+      <div class="stat-value tag-yes">3</div>
+      <div class="stat-desc text-white/70">the one-sided bounds + healthy band</div>
+    </div>
+    <div class="stat">
+      <div class="stat-title text-white/70">Unlocked by the plan</div>
+      <div class="stat-value tag-part">13</div>
+      <div class="stat-desc text-white/70">ratios, proportionality, temporal, conditional</div>
+    </div>
+    <div class="stat">
+      <div class="stat-title text-white/70">Truly unrecoverable</div>
+      <div class="stat-value tag-no">1</div>
+      <div class="stat-desc text-white/70">only A1 — its data is never emitted</div>
+    </div>
+  </div>
+
+  <!-- TOC -->
+  <div class="card card-border bg-base-100 mb-8">
+    <div class="card-body py-4">
+      <div class="flex flex-wrap gap-x-6 gap-y-1 text-sm">
+        <a class="link link-hover" href="#tldr">1 · Executive summary</a>
+        <a class="link link-hover" href="#primer">2 · Autogram in five minutes</a>
+        <a class="link link-hover" href="#gap">3 · Gap analysis</a>
+        <a class="link link-hover" href="#gaps4">4 · The four core gaps</a>
+        <a class="link link-hover" href="#phases">5 · The phased plan</a>
+        <a class="link link-hover" href="#prep">6 · Data prep &amp; known-invariants file</a>
+        <a class="link link-hover" href="#calib">7 · Calibration recipe</a>
+        <a class="link link-hover" href="#testing">8 · Testing</a>
+        <a class="link link-hover" href="#risks">9 · Risks &amp; scope</a>
+        <a class="link link-hover" href="#appendix">10 · Appendix: extension-point map</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- 1. EXECUTIVE SUMMARY -->
+  <section id="tldr" class="mb-10">
+    <h2 class="text-2xl font-bold mb-3">1 · Executive summary</h2>
+    <div class="prose-white max-w-none space-y-3 text-[15px]">
+      <p>
+        Autogram discovers laws from data by letting an LLM propose a <b>grammar</b> (a bounded vocabulary of
+        candidate relations) from variable <b>names only</b>, then exhaustively enumerating every candidate law in
+        that grammar, screening each with the Z3 solver, and keeping only the laws the <b>values</b> support. It was
+        built for and tuned on <b>CrossCheck</b>: wide tables where every row is an independent network snapshot and
+        the laws are per-snapshot algebra (equalities, family sums, conservation, bounds).
+      </p>
+      <p>
+        <b>gtib is a different kind of dataset.</b> It is long/tidy, scalar-celled telemetry of a byte-completeness
+        SLO, and its high-value laws are <b>temporal and dynamic</b>: ratios, rolling-window ratios, cumulative
+        monotonicity, per-consumer proportionality, and relations that hold only under a categorical condition. Those
+        shapes are the ones the CrossCheck family list does not cover, so most of them are not expressible in
+        Autogram today.
+      </p>
+      <p>The plan is five phases, each independently shippable and testable:</p>
+    </div>
+
+    <ul class="steps steps-vertical lg:steps-horizontal w-full my-5">
+      <li class="step step-primary" data-content="0">
+        <div class="text-left px-2 py-1">
+          <div class="font-semibold">Ingest</div>
+          <div class="text-xs text-white/70">read long/tidy CSV → wide observations</div>
+        </div>
+      </li>
+      <li class="step step-primary" data-content="1">
+        <div class="text-left px-2 py-1">
+          <div class="font-semibold">Ratios</div>
+          <div class="text-xs text-white/70">division identity + learned proportionality</div>
+        </div>
+      </li>
+      <li class="step step-primary" data-content="2">
+        <div class="text-left px-2 py-1">
+          <div class="font-semibold">Time</div>
+          <div class="text-xs text-white/70">lag, difference/rate, rolling window</div>
+        </div>
+      </li>
+      <li class="step step-accent" data-content="3">
+        <div class="text-left px-2 py-1">
+          <div class="font-semibold">Conditionals</div>
+          <div class="text-xs text-white/70">relations conditioned on a label</div>
+        </div>
+      </li>
+      <li class="step step-primary" data-content="4">
+        <div class="text-left px-2 py-1">
+          <div class="font-semibold">Advanced</div>
+          <div class="text-xs text-white/70">cross-grain joins · multi-term logic</div>
+        </div>
+      </li>
+    </ul>
+
+    <div role="alert" class="alert alert-info alert-soft">
+      <span><b>Scope:</b> build all five phases — we optimize for the most complete, highest-quality discovery, not
+      for minimal effort. Phases 0–3 cover every <i>observable</i> gtib data law; Phase 4 adds the relational-join,
+      multi-term-conjunction, and run-length machinery so even the alert-<i>defining</i> rules become discoverable.
+      The one law no method can recover from this data is <b>A1</b> (byte conservation), because its latent backlog
+      term is never emitted — a property of the data, not of Autogram.</span>
+    </div>
+  </section>
+
+  <!-- 2. PRIMER -->
+  <section id="primer" class="mb-10">
+    <h2 class="text-2xl font-bold mb-3">2 · Autogram in five minutes (for the newcomer)</h2>
+    <div class="prose-white max-w-none space-y-3 text-[15px] mb-4">
+      <p>Autogram is a pipeline from <span class="mono">variable names</span> + <span class="mono">values</span>
+      to a portfolio of accepted laws. The LLM touches only the names; everything that decides whether a law
+      <i>holds</i> is deterministic and data-driven.</p>
+    </div>
+
+    <div class="mermaid-card mb-4">
+      <pre class="mermaid">
+flowchart TD
+  subgraph NAMES["names only (LLM sees this)"]
+    cols["variable names<br/>e.g. completeness_ratio, output_rate"]
+  end
+  subgraph VALUES["values only (LLM never sees this)"]
+    data[("observed values")]
+  end
+  cols --> induce["① INDUCE GrammarSpec<br/>one LLM call: roles, families, ops, capabilities"]
+  induce --> compile["compile → SchemaAdapter<br/>trusted, eval-free interpreter"]
+  compile --> grammar["build Grammar = the bounded search space"]
+  data --> frame["Frame + NameModel<br/>(scalar or dict cells)"]
+  grammar --> enum["② ENUMERATE every candidate law<br/>exhaustive, up to complexity/degree caps"]
+  frame --> enum
+  enum --> screen["③ SCREEN with Z3<br/>drop tautology / contradiction / subsumed"]
+  screen --> accept["④ ACCEPT statistically<br/>capped conformal band + Wilson-CI hold-rate"]
+  accept --> archive["⑤ ARCHIVE (Pareto)<br/>non-redundant portfolio → rules/*.dl"]
+  known["known invariants<br/>(held-out split)"] -. score recall .-> report
+  archive --> report["report: recall + null-acceptance (false discovery)"]
+      </pre>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="card card-border bg-base-100"><div class="card-body">
+        <h3 class="card-title text-lg">The rule shape (DSL)</h3>
+        <p class="text-sm">Every candidate is a single quantified atom:</p>
+        <pre class="code">∀ b in &lt;binder&gt;:  L(b)  &lt;op&gt;  R(b)</pre>
+        <p class="text-sm">The engine grounds it to a residual population <span class="mono">ρ = L − R</span> with scale
+        <span class="mono">s = max(|L|,|R|)</span>, then asks: on what fraction of points is
+        <span class="mono">|ρ| ≤ tolerance·s</span>? A law is accepted if that hold-rate clears a threshold with a
+        Wilson confidence interval, and if Z3 says it is non-trivial.</p>
+      </div></div>
+      <div class="card card-border bg-base-100"><div class="card-body">
+        <h3 class="card-title text-lg">What it can express today</h3>
+        <ul class="text-sm list-disc ml-5 space-y-1">
+          <li><b>Terms:</b> <span class="mono">Ref</span> (a column), <span class="mono">Const</span>,
+            <span class="mono">Scale</span> (fixed coeffs −1, 0.5, 2), <span class="mono">Add</span> (n-ary sum),
+            <span class="mono">Agg</span> (SUM/MIN/MAX/AVG over a family), <span class="mono">Mul</span>,
+            <span class="mono">Div</span> (behind degree ≥ 2).</li>
+          <li><b>Ops:</b> <span class="mono">~=</span> (within band), <span class="mono">==</span>,
+            <span class="mono">&lt;=</span>, <span class="mono">&gt;=</span>, <span class="mono">!=</span>,
+            <span class="mono">&lt;|&gt;</span> (presence pairing).</li>
+          <li><b>Capability tiers</b> widen the grammar on demand: tier 1 turns on all aggregations, tier 2 turns on
+            products/ratios (<span class="mono">max_degree = 2</span>).</li>
+        </ul>
+      </div></div>
+    </div>
+
+    <div role="alert" class="alert alert-warning alert-soft mt-4">
+      <span><b>The load-bearing constraint:</b> a rule relates columns <i>within a single row</i> (one binding).
+      There is no notion of time, order, lag, or "the previous row". Every gtib law that references time is therefore
+      out of reach until Phase 2.</span>
+    </div>
+
+    <div class="card card-border bg-base-100 mt-4"><div class="card-body py-4">
+      <h3 class="card-title text-base">Where things live in the repo (orientation map)</h3>
+      <p class="text-sm mb-2">Every phase below cites exact <span class="mono">file → function</span> targets; this
+        table is the directory-level map so you know which area each change lands in.</p>
+      <div class="overflow-x-auto rounded-box border border-base-content/10">
+        <table class="table table-xs">
+          <thead><tr class="text-white"><th>Path</th><th>What is there</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">autogram/dsl/</td><td>the rule algebra: <span class="mono">ast.py</span> (terms/ops), <span class="mono">grammar.py</span> (search space + caps), <span class="mono">typecheck.py</span> (admissibility), <span class="mono">evaluate.py</span> (grounding → residuals), <span class="mono">binders.py</span>, <span class="mono">parser.py</span>, <span class="mono">render.py</span></td></tr>
+            <tr><td class="mono">autogram/discovery/</td><td>the pipeline: <span class="mono">induce.py</span> + <span class="mono">subagent.py</span> (LLM → GrammarSpec), <span class="mono">propose.py</span> (enumeration), <span class="mono">evaluate.py</span> (acceptance), <span class="mono">archive.py</span> (portfolio), <span class="mono">known.py</span> (known-invariant matching), <span class="mono">regime.py</span> + <span class="mono">synth.py</span> + <span class="mono">validate.py</span> (proxies + recovery scoring), <span class="mono">loop.py</span>, <span class="mono">export.py</span></td></tr>
+            <tr><td class="mono">autogram/schema/</td><td><span class="mono">spec.py</span> (the <span class="mono">GrammarSpec</span> dataclass), <span class="mono">compiler.py</span> + <span class="mono">adapter.py</span> (compile the spec to the trusted, eval-free runtime)</td></tr>
+            <tr><td class="mono">autogram/logic/solver.py</td><td>Z3 screening: triviality / contradiction / equivalence / subsumption</td></tr>
+            <tr><td class="mono">autogram/evaluator/</td><td><span class="mono">band.py</span> (capped conformal band), <span class="mono">threshold.py</span> (per-rule bar), <span class="mono">metrics.py</span> (Wilson CI)</td></tr>
+            <tr><td class="mono">autogram/loader/</td><td><span class="mono">loader.py</span> (the <span class="mono">Frame</span>/<span class="mono">Dataset</span>), <span class="mono">names.py</span> (column tokenizer / <span class="mono">NameModel</span>)</td></tr>
+            <tr><td class="mono">autogram/config.py · calibrate.py · cli.py</td><td>knobs (<span class="mono">DiscoveryConfig</span>/<span class="mono">SearchConfig</span>), the calibration loop + capability tiers, and the CLI verbs</td></tr>
+            <tr><td class="mono">data/gtib-emulation/</td><td>the gtib dataset used here: <span class="mono">timeseries_raw.csv</span>, <span class="mono">timeseries_derived.csv</span>, <span class="mono">events.csv</span>, <span class="mono">manifest.json</span></td></tr>
+            <tr><td class="mono">generator/gtib_emulator/</td><td>the emulator that produces gtib; <span class="mono">invariants.py</span> is the executable ground-truth contract</td></tr>
+            <tr><td class="mono">data/README.md</td><td>the gtib + CrossCheck data dictionaries and full invariant catalogues (the A/B/C IDs used in this plan)</td></tr>
+            <tr><td class="mono">docs/</td><td><span class="mono">calibration_protocol.md</span> (the contract) and <span class="mono">known_invariants.example.yaml</span> (the declaration template)</td></tr>
+            <tr><td class="mono">tests/ · data/crosscheck-samples/ · configs/ · rules/</td><td>the pytest suite to mirror; the CrossCheck baseline data; per-dataset configs; and the generated <span class="mono">.dl</span> rule outputs</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div></div>
+  </section>
+
+  <!-- 3. GAP ANALYSIS -->
+  <section id="gap" class="mb-10">
+    <h2 class="text-2xl font-bold mb-3">3 · Gap analysis — every gtib invariant vs. Autogram</h2>
+    <div class="card card-border bg-base-100 mb-4"><div class="card-body py-4">
+      <h3 class="card-title text-base">Notation &amp; terms (so this plan stands alone)</h3>
+      <div class="grid sm:grid-cols-2 gap-x-6 gap-y-1 text-sm">
+        <div><span class="mono">IR</span> = <span class="mono">input_rate_bytes_per_min</span></div>
+        <div><span class="mono">OR</span> = <span class="mono">output_rate_bytes_per_min</span></div>
+        <div><span class="mono">CR</span> = <span class="mono">completeness_ratio</span> (one minute)</div>
+        <div><span class="mono">CR1h</span> = the 60-minute smoothed ratio</div>
+        <div><span class="mono">B</span>, <span class="mono">L</span> = <span class="mono">backlog_bytes</span>, <span class="mono">cum_lost_bytes</span></div>
+        <div><span class="mono">η</span> = per-consumer metering factor (≈ 0.998)</div>
+        <div><span class="mono">Δx</span> (or <span class="mono">∇x</span>) = one-step change <span class="mono">x[t] − x[t−1]</span></div>
+        <div><span class="mono">Σ<sub>60</sub></span> = sum over the last 60 minutes</div>
+      </div>
+      <p class="text-xs text-white/70 mt-2"><b>Granularity</b> (informally "grain") = the level of detail one row
+        represents; gtib has two, one row per shard per 10&nbsp;s and one row per consumer per minute.
+        <b>Ingestion</b> = reading the raw files into Autogram's internal table so the engine can test candidate
+        laws on them.</p>
+    </div></div>
+    <p class="text-[15px] mb-3 prose-white">Each row is one gtib invariant (IDs match the
+      <span class="mono">data/README.md</span> catalogue). "Today?" is whether Autogram can express and accept it
+      right now, after only reshaping the data.</p>
+    <div class="overflow-x-auto rounded-box border border-base-content/10 bg-base-100">
+      <table class="table table-zebra table-sm">
+        <thead><tr class="text-white">
+          <th>ID</th><th>Invariant</th><th>Shape it needs</th><th>Today?</th><th>Phase</th>
+        </tr></thead>
+        <tbody>
+          <tr><td>A2</td><td>Backlog ≥ 0</td><td>one-sided bound</td><td class="tag-yes">✅ yes</td><td>0</td></tr>
+          <tr><td>A5</td><td>Rates ≥ 0</td><td>one-sided bound</td><td class="tag-yes">✅ yes</td><td>0</td></tr>
+          <tr><td>A6</td><td>Healthy band (steady/normal)</td><td>band membership + frequency</td><td class="tag-yes">✅ yes</td><td>0</td></tr>
+          <tr><td>B1</td><td>CR = OR / IR</td><td>ratio (Div, degree 2)</td><td class="tag-part">⚠ enumerable at deg 2, not scorable as "known"</td><td>1</td></tr>
+          <tr><td>C1</td><td>Metering: OR ≈ η·(physical)</td><td>proportionality with a <i>learned</i> constant</td><td class="tag-no">❌ coeffs are fixed {−1,0.5,2}</td><td>1</td></tr>
+          <tr><td>B7</td><td>B, L = Σ<sub>shards</sub></td><td>n-ary family SUM</td><td class="tag-part">⚠ needs cross-grain materialization</td><td>0b</td></tr>
+          <tr><td>A3</td><td>Cumulative loss non-decreasing</td><td>temporal monotonicity Δx ≥ 0</td><td class="tag-no">❌ no time axis</td><td>2</td></tr>
+          <tr><td>B2</td><td>CR1h = Σ<sub>60</sub>OR / Σ<sub>60</sub>IR</td><td>rolling window + ratio</td><td class="tag-no">❌</td><td>2</td></tr>
+          <tr><td>B3</td><td>Rate = Σ<sub>shards</sub> Δ<sub>min</sub>(counter)</td><td>time-difference + cross-grain sum</td><td class="tag-no">❌</td><td>2 + 0b</td></tr>
+          <tr><td>B5*</td><td>Trajectory slope term (CR1h[m] − CR1h[m−45])</td><td>lag + difference</td><td class="tag-no">❌</td><td>2</td></tr>
+          <tr><td>A4</td><td>Counters non-decreasing <i>unless reset</i></td><td>conditional temporal monotonicity</td><td class="tag-no">❌</td><td>2 + 3</td></tr>
+          <tr><td>A7</td><td>Benign spans lose no bytes</td><td>label-conditioned near-equality of Δ</td><td class="tag-no">❌</td><td>2 + 3</td></tr>
+          <tr><td>A8</td><td>True-loss spans accumulate a deficit</td><td>label-conditioned positivity of Δ</td><td class="tag-no">❌</td><td>2 + 3</td></tr>
+          <tr><td>B4</td><td>Static alert = sustained &lt; 0.99 for ≥ 10 min</td><td>run-length / STL bounded-always predicate</td><td class="tag-part">◐ new predicate class</td><td>4</td></tr>
+          <tr><td>B5</td><td>Trajectory alert (full conjunction)</td><td>multi-term conjunction (∧ of atoms)</td><td class="tag-part">◐ new logic node</td><td>4</td></tr>
+          <tr><td>B6</td><td>Oracle = is_true_loss; label from spans</td><td>boolean equality + categorical span map</td><td class="tag-part">◐ oracle trivial; span-map is a definition</td><td>4</td></tr>
+          <tr class="opacity-80"><td>A1</td><td>Byte conservation I = O + Q + L</td><td>additive balance with a <i>latent</i>, unemitted term</td><td class="tag-no">❌ unrecoverable — physical counters never emitted</td><td>—</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="text-xs text-white/60 mt-2">Every invariant except A1 is targeted by the plan. A1 is the single law no
+      method can recover here, because the physical input/output counters it needs are never written to the files.
+      B5's lagged-slope <i>term</i> arrives in Phase 2; its full three-way conjunction is Phase 4.</p>
+  </section>
+
+  <!-- 4. FOUR CORE GAPS -->
+  <section id="gaps4" class="mb-10">
+    <h2 class="text-2xl font-bold mb-3">4 · The four core gaps to close</h2>
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="card card-border bg-base-100"><div class="card-body">
+        <div class="flex items-center gap-2"><span class="badge badge-primary">Gap 1</span><h3 class="card-title text-lg">Shape &amp; granularity of the data</h3></div>
+        <p class="text-sm">Autogram expects a <b>wide</b> table (columns = variables, rows = independent
+          observations). gtib is <b>long/tidy</b>: identity lives in row values (<span class="mono">consumer_id</span>,
+          <span class="mono">shard_id</span>, <span class="mono">minute_index</span>), and it comes at <b>two
+          granularities</b> (one row per shard per 10&nbsp;s of raw counters, and one row per consumer per minute of
+          derived quantities). <b>Ingestion</b> — reading the files into Autogram's internal table — must reshape to
+          wide observations and, for the one cross-granularity law, pre-compute the per-minute shard increments.</p>
+      </div></div>
+      <div class="card card-border bg-base-100"><div class="card-body">
+        <div class="flex items-center gap-2"><span class="badge badge-primary">Gap 2</span><h3 class="card-title text-lg">No time axis</h3></div>
+        <p class="text-sm">Rules relate columns within one row. gtib's signature laws are across rows in time order:
+          monotonicity (<span class="mono">Δx ≥ 0</span>), rolling-window ratios, and lagged slopes. The DSL needs new
+          <b>temporal terms</b> (lag, difference/rate, rolling window) and a grounding path that works
+          <i>per ordered group</i> instead of per independent row.</p>
+      </div></div>
+      <div class="card card-border bg-base-100"><div class="card-body">
+        <div class="flex items-center gap-2"><span class="badge badge-primary">Gap 3</span><h3 class="card-title text-lg">Ratios &amp; learned constants</h3></div>
+        <p class="text-sm">The completeness ratio is a literal <span class="mono">CR = OR/IR</span> per-row division
+          identity, and metering is a proportionality <span class="mono">OR ≈ η·IR</span> with a per-consumer constant
+          η. Division exists in the DSL (degree 2) but is not <i>scorable</i> as a known invariant, and there is
+          <b>no way to fit an arbitrary coefficient</b> (scale coeffs are the fixed set {−1, 0.5, 2}). Fitting that
+          constant from data is exactly a <b>symbolic-regression</b> sub-problem; Phase 1 borrows a robust estimator
+          for it.</p>
+      </div></div>
+      <div class="card card-border bg-base-100"><div class="card-body">
+        <div class="flex items-center gap-2"><span class="badge badge-accent">Gap 4</span><h3 class="card-title text-lg">Conditional relations</h3></div>
+        <p class="text-sm">Several laws hold only on a subpopulation: counters rise <i>unless</i> a reset; loss stays
+          flat <i>on benign spans</i> and grows <i>on true-loss spans</i>. The DSL is a single unconditional atom, so
+          it needs an optional <b>condition</b> (<span class="mono">where label == …</span>) that filters the residual
+          population before the hold-rate is computed.</p>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- 5. PHASES -->
+  <section id="phases" class="mb-10">
+    <h2 class="text-2xl font-bold mb-4">5 · The phased plan</h2>
+
+    <!-- PHASE 0 -->
+    <div class="card card-border bg-base-100 mb-5">
+      <div class="card-body">
+        <div class="flex flex-wrap items-center gap-2 mb-1">
+          <span class="badge badge-lg badge-primary">Phase 0</span>
+          <h3 class="card-title text-xl">Ingest gtib as wide observations</h3>
+          <span class="badge badge-soft ml-auto">scope: data-prep + CLI</span>
+        </div>
+        <p class="text-sm mb-2"><b>Goal.</b> Get gtib's derived table into Autogram so each per-(consumer, minute) row
+          is one observation and the quantities (<span class="mono">completeness_ratio</span>,
+          <span class="mono">output_rate…</span>, <span class="mono">backlog_bytes</span>, …) are <span class="mono">Ref</span>
+          leaves under one binder. This is mostly <b>data prep</b>, not engine change: the "scalar" cell codec already
+          exists, and induction already reads flat column names.</p>
+        <p class="text-sm mb-1"><b>Design.</b></p>
+        <ul class="text-sm list-disc ml-5 space-y-1 mb-2">
+          <li><b>0a — per-grain wide frame.</b> Write a tiny converter that loads
+            <span class="mono">timeseries_derived.csv</span> and emits a pickled DataFrame with one row per
+            (consumer, minute) and scalar columns. Binder = <span class="mono">singleton</span> (all columns are refs
+            of one binder). Optionally keep <span class="mono">consumer_id</span>/<span class="mono">minute_index</span>
+            as an index so Phase 2 can recover order/group.</li>
+          <li><b>0b — cross-grain materialization (for B7/B3).</b> Also emit per-minute shard-increment columns
+            <span class="mono">shard_&lt;k&gt;_input_increment</span> so a family SUM can be tested
+            (<span class="mono">input_rate == SUM(shard_*_input_increment)</span>). This is the pragmatic way to reach
+            the one cross-grain sum without an engine change.</li>
+          <li>Accept a <span class="mono">.csv</span> path directly in the CLI so the converter can be skipped later.</li>
+        </ul>
+        <p class="text-sm mb-1"><b>Files.</b></p>
+        <div class="overflow-x-auto rounded-box border border-base-content/10 mb-2">
+          <table class="table table-xs">
+            <thead><tr class="text-white"><th>File / function</th><th>Change</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">generator/… or scripts/gtib_to_wide.py</td><td>new converter (long → wide pickle + shard-increment columns)</td></tr>
+              <tr><td class="mono">autogram/cli.py → cmd_discover</td><td>accept <span class="mono">.csv</span> input (read_csv) in addition to pickle</td></tr>
+              <tr><td class="mono">autogram/discovery/induce.py → _schema_prompt</td><td>(only if induction misparses flat scalar names) add a convention describing the tidy, scalar layout</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-sm"><b>Unlocks:</b> A2, A5 (bounds), A6 (band). <b>Acceptance:</b>
+          <span class="mono">autogram discover --input gtib_derived_wide.pkl</span> induces a spec whose refs include
+          the derived quantities, and accepts the three non-negativity/band laws.</p>
+      </div>
+    </div>
+
+    <!-- PHASE 1 -->
+    <div class="card card-border bg-base-100 mb-5">
+      <div class="card-body">
+        <div class="flex flex-wrap items-center gap-2 mb-1">
+          <span class="badge badge-lg badge-primary">Phase 1</span>
+          <h3 class="card-title text-xl">Ratios &amp; learned proportionality as scorable shapes</h3>
+          <span class="badge badge-soft ml-auto">scope: new operator + scoring</span>
+        </div>
+        <p class="text-sm mb-2"><b>Goal.</b> Make the ratio identity <span class="mono">CR = OR/IR</span> (B1) and the
+          metering proportionality <span class="mono">OR ≈ η·IR</span> (C1) declarable, enumerable, screened, accepted,
+          and <i>scored against a known-invariants file</i>.</p>
+        <p class="text-sm mb-1"><b>Design.</b></p>
+        <ul class="text-sm list-disc ml-5 space-y-1 mb-2">
+          <li><b>B1</b> is already <i>enumerable</i> once <span class="mono">max_degree = 2</span> (the
+            <span class="mono">Div</span> node exists). The gap is that a ratio is not a recognised
+            <i>known-invariant shape</i>, so it can never be scored. Add a <span class="mono">{ratio: [num, den]}</span>
+            rhs form.</li>
+          <li><b>C1</b> needs a coefficient fit from data. Add a <b>proportional-equality operator</b>
+            <span class="mono">~∝</span>: for <span class="mono">y ~∝ x</span>, fit the constant with a <b>robust
+            estimator borrowed from symbolic regression</b> — the Theil–Sen estimator or RANSAC (Fischler &amp; Bolles,
+            1981), which shrug off the burst/overshoot outliers, falling back to least squares — then score the
+            hold-rate of <span class="mono">|y − ĉ·x| ≤ tol·s</span>. Fitting a small number of real coefficients from
+            a candidate term is precisely what symbolic-regression systems do (e.g. sparse regression, PySR-style
+            search), so adopting their estimators keeps the step principled; the constant is fit from data like the
+            band, never hard-coded, so the "data decides" contract holds.</li>
+        </ul>
+        <p class="text-sm mb-1"><b>Files (by pipeline stage).</b></p>
+        <div class="overflow-x-auto rounded-box border border-base-content/10 mb-2">
+          <table class="table table-xs">
+            <thead><tr class="text-white"><th>Stage</th><th>File → function</th><th>Change</th></tr></thead>
+            <tbody>
+              <tr><td>Enumerate</td><td class="mono">dsl/ast.py</td><td>add <span class="mono">"~∝"</span> to <span class="mono">OPS</span></td></tr>
+              <tr><td>Enumerate</td><td class="mono">discovery/propose.py → _candidate_rules</td><td>emit <span class="mono">Ref ~∝ Ref</span> and reuse <span class="mono">Div</span> templates for the ratio identity</td></tr>
+              <tr><td>Enumerate</td><td class="mono">dsl/typecheck.py → is_admissible</td><td>allow <span class="mono">~∝</span> between two measured refs</td></tr>
+              <tr><td>Screen</td><td class="mono">logic/solver.py → atom_expr</td><td>encode <span class="mono">~∝</span> as <span class="mono">left == k·right</span> with a fresh real k (sound triviality/subsumption)</td></tr>
+              <tr><td>Accept</td><td class="mono">discovery/evaluate.py → evaluate</td><td>branch for <span class="mono">~∝</span>: fit ĉ, compute holds; <span class="mono">band.py</span> reuses <span class="mono">|ρ|/s</span></td></tr>
+              <tr><td>Declare</td><td class="mono">discovery/known.py → _signature, shapes_for_invariant</td><td>parse <span class="mono">{ratio:[…]}</span> and <span class="mono">~∝</span>; map to proxy shapes <span class="mono">ratio</span>, <span class="mono">proportional</span></td></tr>
+              <tr><td>Score</td><td class="mono">discovery/validate.py → _operand_sig, score_recovery</td><td>emit <span class="mono">("ratio",…)</span> / <span class="mono">("proportional",…)</span> signatures; add coverage lines</td></tr>
+              <tr><td>Score</td><td class="mono">discovery/synth.py, regime.py</td><td>plant ratio + proportional proxies; add ids to <span class="mono">KNOWN_SHAPES</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-sm"><b>Unlocks:</b> B1, C1. <b>Acceptance:</b> a known-invariants file declaring the ratio and
+          proportional laws reaches recall 1.0 on them with <span class="mono">null_equalities_accepted = 0</span>.</p>
+      </div>
+    </div>
+
+    <!-- PHASE 2 -->
+    <div class="card card-border bg-base-100 mb-5">
+      <div class="card-body">
+        <div class="flex flex-wrap items-center gap-2 mb-1">
+          <span class="badge badge-lg badge-primary">Phase 2</span>
+          <h3 class="card-title text-xl">A time axis, grounded in established theory</h3>
+          <span class="badge badge-soft ml-auto">scope: core temporal grounding</span>
+        </div>
+        <p class="text-sm mb-2"><b>Goal.</b> Give the DSL a first-class time axis so it can relate a value to earlier
+          values in the same ordered group (a consumer, or a consumer + shard). We adopt <b>conventional notation and
+          established theory</b> rather than inventing bespoke terms.</p>
+        <p class="text-sm mb-1"><b>Two standard frameworks supply everything:</b></p>
+        <ul class="text-sm list-disc ml-5 space-y-1 mb-2">
+          <li><b>The backshift (lag) operator</b> from classical time-series analysis (Box &amp; Jenkins, 1970):
+            <span class="mono">B</span> shifts one step, so <span class="mono">Bᵏx = x[t−k]</span>, and the
+            first-difference operator is <span class="mono">∇ = 1 − B</span> (thus <span class="mono">∇x = x[t] − x[t−1]</span>,
+            a rate). A rolling window is a finite sum of lagged terms. These are the algebraic <i>terms</i> — standard
+            operators, not new inventions.</li>
+          <li><b>Signal Temporal Logic (STL)</b> (Maler &amp; Nickovic, FORMATS 2004) for the temporal <i>predicates</i>,
+            with bounded operators <span class="mono">□<sub>[0,W]</sub></span> ("always within a window") and
+            <span class="mono">◇<sub>[0,W]</sub></span> ("eventually"). STL's <b>quantitative robustness semantics</b>
+            (Fainekos &amp; Pappas 2009; Donzé &amp; Maler 2010) return a real-valued margin, which maps directly onto
+            Autogram's residual/band — Autogram's monitor already <i>is</i> a robustness evaluator, so STL is the
+            natural home for these laws.</li>
+        </ul>
+        <p class="text-sm mb-1">The new terms are then standard operators, and the laws are STL formulas over them:</p>
+        <pre class="code"><span class="c"># AST nodes implement the backshift algebra:  Bᵏ (lag),  ∇ (difference),  Σ_window (rolling sum)</span>
+monotonicity     □(∇x ≥ 0)                                  <span class="c"># A3 / A4</span>
+windowed ratio   x  ~=  (Σ<sub>[0,60]</sub> OR) / (Σ<sub>[0,60]</sub> IR)          <span class="c"># B2</span>
+lagged slope     (x − Bᵏx) ≤ 0                              <span class="c"># B5 slope term</span></pre>
+        <p class="text-sm mt-2 mb-1">A complementary lens for the <i>rate</i> laws is <b>sparse identification of
+          nonlinear dynamics</b> (SINDy; Brunton, Proctor &amp; Kutz, PNAS 2016): it fits governing equations of
+          <span class="mono">∇x</span> by selecting from a library of candidate terms — exactly Autogram's
+          enumerate-then-select loop applied to differences. It is the reference point for the difference/rate
+          templates and confirms the approach is standard practice.</p>
+        <p class="text-sm mt-2 mb-1"><b>Files.</b></p>
+        <div class="overflow-x-auto rounded-box border border-base-content/10 mb-2">
+          <table class="table table-xs">
+            <thead><tr class="text-white"><th>Stage</th><th>File → function</th><th>Change</th></tr></thead>
+            <tbody>
+              <tr><td>Ingest</td><td class="mono">loader/loader.py, loader/names.py, schema/spec.py, schema/adapter.py</td><td>carry a <b>time index</b> + <b>group keys</b>; expose per-group ordered arrays; a spec field <span class="mono">time_index</span>/<span class="mono">group_keys</span></td></tr>
+              <tr><td>Enumerate</td><td class="mono">dsl/ast.py</td><td>add the backshift <span class="mono">Bᵏ</span> (lag), difference <span class="mono">∇</span>, and rolling-window-sum operators as AST nodes (+ complexity/degree/unparse), add to the <span class="mono">Term</span> union</td></tr>
+              <tr><td>Enumerate</td><td class="mono">discovery/propose.py</td><td>temporal term builders + the templates above</td></tr>
+              <tr><td>Enumerate</td><td class="mono">dsl/typecheck.py, dsl/grammar.py</td><td>admissibility (window ≤ cap, lag ≤ cap); new caps <span class="mono">max_lag</span>, allowed <span class="mono">windows</span>, a temporal capability flag</td></tr>
+              <tr><td>Ground</td><td class="mono">dsl/evaluate.py → ground/eval_term</td><td><b>biggest change</b>: sort each group by time, compute the lag/difference/window operators along the axis, pool residuals</td></tr>
+              <tr><td>Screen</td><td class="mono">logic/solver.py → _term_expr, _leaf_key, _leaves</td><td>treat temporal nodes as opaque reals (or encode <span class="mono">∇</span> as x<sub>t</sub> − x<sub>t−1</sub>); recognise the new leaves</td></tr>
+              <tr><td>Declare/Score</td><td class="mono">known.py, validate.py, synth.py, regime.py</td><td>declaration forms <span class="mono">{delta:…}</span>/<span class="mono">{roll_sum:[col,W]}</span>; signatures + planted <b>time-series</b> proxies + shape ids</td></tr>
+              <tr><td>Config</td><td class="mono">config.py, calibrate.py</td><td>window set / max_lag knobs; a temporal <b>capability tier</b> in <span class="mono">_capability_tiers</span>/<span class="mono">_widen_spec</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-sm"><b>Unlocks:</b> A3 (Δloss ≥ 0), B2 (windowed ratio), the B5 slope term, and the Δ half of B3.
+          <b>Acceptance:</b> on a synthetic time-series proxy with a planted monotone series and a planted windowed
+          ratio, recall 1.0 with null-acceptance 0; a null shuffled-in-time control must <i>not</i> accept the
+          monotonicity.</p>
+      </div>
+    </div>
+
+    <!-- PHASE 3 -->
+    <div class="card card-border bg-base-100 mb-5">
+      <div class="card-body">
+        <div class="flex flex-wrap items-center gap-2 mb-1">
+          <span class="badge badge-lg badge-accent">Phase 3</span>
+          <h3 class="card-title text-xl">Conditional relations</h3>
+          <span class="badge badge-soft ml-auto">scope: new predicate class</span>
+        </div>
+        <p class="text-sm mb-2"><b>Goal.</b> Let a law hold only on a subpopulation named by a categorical/boolean
+          column, so the label-conditioned and reset-conditioned laws become expressible.</p>
+        <pre class="code"><span class="c"># dsl/ast.py — an optional condition on the Rule</span>
+Rule(binder, atom, condition = Condition("label", "==", "true_loss"))
+<span class="c"># grounding keeps only rows where the condition holds, then computes the hold-rate there</span></pre>
+        <p class="text-sm mt-2 mb-1"><b>Files.</b></p>
+        <div class="overflow-x-auto rounded-box border border-base-content/10 mb-2">
+          <table class="table table-xs">
+            <thead><tr class="text-white"><th>Stage</th><th>File → function</th><th>Change</th></tr></thead>
+            <tbody>
+              <tr><td>Ingest</td><td class="mono">loader/names.py, schema/spec.py</td><td>a new column <b>kind</b> for categorical/boolean condition columns + their observed values (today every column is <span class="mono">role="volume"</span>)</td></tr>
+              <tr><td>Enumerate</td><td class="mono">dsl/ast.py, discovery/propose.py</td><td><span class="mono">Condition</span> node; enumerate a small bounded set of conditions (label==value, flag==false) and attach to templates</td></tr>
+              <tr><td>Ground</td><td class="mono">dsl/evaluate.py</td><td>apply the condition mask before pooling residuals; require a minimum support on the conditioned subset</td></tr>
+              <tr><td>Screen</td><td class="mono">logic/solver.py → atom_expr</td><td>condition as antecedent: <span class="mono">Implies(condition, atom)</span> for triviality/subsumption</td></tr>
+              <tr><td>Declare/Score</td><td class="mono">known.py, validate.py, synth.py, regime.py</td><td>a <span class="mono">where: {label: value}</span> clause; conditional signatures; planted conditional proxies; shape ids</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-sm"><b>Unlocks:</b> A4 (Δcounter ≥ 0 where not reset), A7 (Δloss ≈ 0 where benign), A8 (Δloss &gt; 0
+          where true-loss). Requires Phase 2 (the <span class="mono">∇</span> term) underneath.</p>
+      </div>
+    </div>
+
+    <!-- PHASE 4 -->
+    <div class="card card-border bg-base-100 mb-2">
+      <div class="card-body">
+        <div class="flex flex-wrap items-center gap-2 mb-1">
+          <span class="badge badge-lg badge-primary">Phase 4</span>
+          <h3 class="card-title text-xl">Cross-grain joins &amp; multi-term logic</h3>
+          <span class="badge badge-soft ml-auto">scope: relational + logic layer</span>
+        </div>
+        <p class="text-sm mb-2"><b>Goal.</b> Complete the picture — the cross-granularity sum, multi-term conjunctions,
+          and run-length predicates — so even the alert-<i>defining</i> rules become discoverable, not just the
+          simple data laws.</p>
+        <ul class="text-sm list-disc ml-5 space-y-1">
+          <li><b>B3 (cross-granularity rate).</b> Build a first-class relational join between the per-shard-step and
+            per-consumer-minute granularities (a binder that aggregates the finer grain into the coarser), so
+            <span class="mono">IR = Σ<sub>shards</sub> ∇(counter)</span> is discovered directly. The Phase-0b
+            materialization is the fast path; the join is the general one, and we build both.</li>
+          <li><b>B4 (sustained alert).</b> Add a run-length operator, i.e. the STL bounded-always
+            <span class="mono">□<sub>[0,10min]</sub></span> (Maler &amp; Nickovic), so "below threshold for ≥ 10
+            consecutive minutes" is a first-class predicate with quantitative robustness.</li>
+          <li><b>B5 (full trajectory rule) &amp; B6 (oracle).</b> Add a conjunction node
+            (<span class="mono">∧</span> of atoms) so multi-term alert definitions are expressible;
+            <span class="mono">oracle_alert == is_true_loss</span> is then a plain boolean equality, and the
+            label-from-spans mapping a categorical relation.</li>
+          <li><b>A1</b> (byte conservation with the latent backlog term) is the one law <b>no method can recover</b>
+            from this data, because the physical input/output counters it needs are never emitted. That is a data
+            limitation, not an Autogram one.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6. DATA PREP + KNOWN FILE -->
+  <section id="prep" class="mb-10">
+    <h2 class="text-2xl font-bold mb-3">6 · Data prep &amp; the gtib known-invariants file</h2>
+    <p class="text-[15px] mb-3 prose-white">A single <span class="mono">known_invariants.yaml</span> drives calibration
+      and recall scoring. Below is the target file; each entry is annotated with the phase that makes it declarable.
+      Entries in <span class="tag-yes">green</span> work today; the rest depend on the new declaration forms this plan
+      adds.</p>
+    <p class="text-sm mb-3 prose-white"><b>Inputs &amp; references.</b> The dataset is
+      <span class="mono">data/gtib-emulation/timeseries_derived.csv</span> (raw counters in
+      <span class="mono">timeseries_raw.csv</span>); the full invariant catalogue with the A/B/C IDs used here lives in
+      <span class="mono">data/README.md</span>; the executable ground-truth contract is
+      <span class="mono">generator/gtib_emulator/invariants.py</span>; and the declaration syntax mirrors
+      <span class="mono">docs/known_invariants.example.yaml</span>, parsed by
+      <span class="mono">autogram/discovery/known.py</span>.</p>
+    <pre class="code"><span class="k">invariants:</span>
+  <span class="c"># ── Phase 0 · works today ─────────────────────────────</span>
+  - {name: backlog_non_negative,      op: <span class="v">"&gt;="</span>, lhs: <span class="v">backlog_bytes</span>,             rhs: 0}
+  - {name: input_rate_non_negative,   op: <span class="v">"&gt;="</span>, lhs: <span class="v">input_rate_bytes_per_min</span>,  rhs: 0}
+  - {name: output_rate_non_negative,  op: <span class="v">"&gt;="</span>, lhs: <span class="v">output_rate_bytes_per_min</span>, rhs: 0}
+
+  <span class="c"># ── Phase 1 · ratio + proportionality (new rhs / op) ──</span>
+  - name: completeness_ratio_definition
+    op: <span class="v">"=="</span>
+    lhs: <span class="v">completeness_ratio</span>
+    rhs: { <span class="k">ratio</span>: [<span class="v">output_rate_bytes_per_min</span>, <span class="v">input_rate_bytes_per_min</span>] }
+  - name: metering_proportionality
+    op: <span class="v">"~∝"</span>
+    lhs: <span class="v">output_rate_bytes_per_min</span>
+    rhs: <span class="v">input_rate_bytes_per_min</span>
+
+  <span class="c"># ── Phase 2 · temporal (new term forms) ───────────────</span>
+  - name: cumulative_loss_monotone
+    op: <span class="v">"&gt;="</span>
+    lhs: { <span class="k">delta</span>: <span class="v">cum_lost_bytes</span> }          <span class="c"># value[t] − value[t−1]</span>
+    rhs: 0
+  - name: smoothed_ratio_windowed
+    op: <span class="v">"=="</span>
+    lhs: <span class="v">completeness_ratio_1h</span>
+    rhs: { <span class="k">ratio</span>: [ {roll_sum: [<span class="v">output_rate_bytes_per_min</span>, 60]},
+                    {roll_sum: [<span class="v">input_rate_bytes_per_min</span>, 60]} ] }
+
+  <span class="c"># ── Phase 3 · conditional (new 'where' clause) ────────</span>
+  - name: true_loss_accumulates
+    where: { <span class="k">label</span>: <span class="v">true_loss</span> }
+    op: <span class="v">"&gt;"</span>
+    lhs: { <span class="k">delta</span>: <span class="v">cum_lost_bytes</span> }
+    rhs: 0
+  - name: benign_spans_lose_no_bytes
+    where: { <span class="k">label_in</span>: [<span class="v">benign_burst</span>, <span class="v">artifact</span>] }
+    op: <span class="v">"~="</span>
+    lhs: { <span class="k">delta</span>: <span class="v">cum_lost_bytes</span> }
+    rhs: 0</pre>
+    <div role="alert" class="alert alert-soft alert-info mt-3">
+      <span>The <span class="mono">ratio</span>, <span class="mono">~∝</span>, <span class="mono">delta</span>,
+      <span class="mono">roll_sum</span>, and <span class="mono">where</span> forms are <b>new</b> declaration syntax
+      introduced by Phases 1–3. Each must be taught to <span class="mono">known.py:_signature</span> (parse) and
+      <span class="mono">validate.py:_operand_sig</span> (match) — they are coupled and must be changed together.</span>
+    </div>
+  </section>
+
+  <!-- 7. CALIBRATION -->
+  <section id="calib" class="mb-10">
+    <h2 class="text-2xl font-bold mb-3">7 · Calibration recipe for gtib</h2>
+    <div class="grid md:grid-cols-2 gap-4">
+      <div class="card card-border bg-base-100"><div class="card-body">
+        <h3 class="card-title text-lg">Commands</h3>
+        <pre class="code"><span class="c"># 0. sanity: can the harness induce a schema?</span>
+autogram precheck --harness copilot
+
+<span class="c"># 1. reshape long → wide (Phase 0 converter)</span>
+python scripts/gtib_to_wide.py \
+  data/gtib-emulation/timeseries_derived.csv \
+  --out gtib_derived_wide.pkl
+
+<span class="c"># 2. calibrate against the known file</span>
+autogram calibrate \
+  --input gtib_derived_wide.pkl \
+  --known gtib_known.yaml \
+  --band-mode adaptive \
+  --max-capability-tiers 3 \
+  --out gtib_report.json</pre>
+      </div></div>
+      <div class="card card-border bg-base-100"><div class="card-body">
+        <h3 class="card-title text-lg">Why these knobs</h3>
+        <ul class="text-sm list-disc ml-5 space-y-1">
+          <li><b>adaptive band</b>: gtib laws span very different scales (byte counters vs. a ratio near 1), so a
+            per-candidate capped band fits better than one global tolerance.</li>
+          <li><b>max-capability-tiers 3</b>: reaches products/ratios (needed for B1/B2). Phase 2 adds a further
+            temporal tier beyond these three.</li>
+          <li><b>proxy suite</b> is derived from the calibration-split shapes; the new shapes (ratio, proportional,
+            temporal, conditional) each need a planted proxy in <span class="mono">synth.py</span> so they can be tuned
+            <i>generically</i>, never against the real gtib answers.</li>
+          <li><b>null control stays on</b>: read <span class="mono">false_discovery.null_equalities_accepted</span> in
+            the report — it must stay at 0. Recall is only meaningful next to it.</li>
+          <li><b>read the contract first</b>: <span class="mono">docs/calibration_protocol.md</span> and
+            <span class="mono">AGENTS.md</span> define the loop and the calibration/validation split; per-dataset
+            configs live in <span class="mono">configs/</span> (mirror <span class="mono">configs/abilene.yaml</span>);
+            learned rules are written to <span class="mono">rules/</span>.</li>
+        </ul>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- 8. TESTING -->
+  <section id="testing" class="mb-10">
+    <h2 class="text-2xl font-bold mb-3">8 · Testing strategy</h2>
+    <div class="overflow-x-auto rounded-box border border-base-content/10 bg-base-100">
+      <table class="table table-sm table-zebra">
+        <thead><tr class="text-white"><th>Phase</th><th>Unit test (mirror <span class="mono">tests/</span>)</th><th>Pass condition</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>ingest gtib wide frame; enumerate + accept the 3 bounds/band laws</td><td>the 3 laws appear in the portfolio; induction exposes the derived refs</td></tr>
+          <tr><td>1</td><td>plant a ratio and a <span class="mono">y=c·x</span> series in synthetic data</td><td>recall 1.0 on ratio + proportional; <span class="mono">null_equalities_accepted = 0</span></td></tr>
+          <tr><td>2</td><td>planted monotone series + planted windowed ratio; <b>time-shuffled null</b></td><td>both recovered; the shuffled-in-time null does <b>not</b> accept monotonicity (guards against spurious temporal fits)</td></tr>
+          <tr><td>3</td><td>planted label-conditioned positivity/near-zero</td><td>recovered only under the correct condition; the unconditioned version is rejected</td></tr>
+          <tr><td>4</td><td>planted cross-granularity sum, a sustained (run-length) predicate, and a two-term conjunction</td><td>each recovered; run-length and conjunction match their planted spans exactly</td></tr>
+          <tr class="bg-success/10"><td><b>every</b></td><td><b>CrossCheck non-regression (golden test)</b>: re-run Abilene + GÉANT discovery after every phase and diff against a checked-in baseline</td><td>the accepted portfolio <b>and</b> known-invariant recall are <b>byte-for-byte unchanged</b> vs. baseline</td></tr>
+          <tr><td>all</td><td>end-to-end on <span class="mono">data/gtib-emulation</span> with <span class="mono">gtib_known.yaml</span></td><td>held-out recall climbs monotonically per phase; null stays 0</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="text-sm text-white/70 mt-2">The time-shuffled null in Phase 2 is the most important new safeguard: it is the
+      temporal analogue of the existing random-noise null, and it keeps a monotone-looking coincidence from being
+      accepted as a law. The <b>CrossCheck golden test runs after every phase</b>, so any change that would alter the
+      existing Abilene/GÉANT results fails the build immediately — the new capabilities only ever <i>add</i> reach.
+      Tests live in <span class="mono">tests/</span> (mirror the existing modules); the CrossCheck baseline data is
+      <span class="mono">data/crosscheck-samples/</span>, and the golden baseline is produced by
+      <span class="mono">autogram calibrate</span> against <span class="mono">configs/abilene.yaml</span> /
+      <span class="mono">configs/geant.yaml</span>.</p>
+  </section>
+
+  <!-- 9. RISKS -->
+  <section id="risks" class="mb-10">
+    <h2 class="text-2xl font-bold mb-3">9 · Risks &amp; scope</h2>
+    <div class="grid md:grid-cols-3 gap-4 mb-4">
+      <div class="card card-border bg-base-100"><div class="card-body">
+        <h3 class="card-title text-base">Core change, fully isolated</h3>
+        <p class="text-sm">Phase 2's grouped-temporal grounding changes the core assumption that residual points are
+          independent rows, touching <span class="mono">dsl/evaluate.py</span> and its interaction with subsampling,
+          the band split, and support counting. It lands <b>behind a capability flag</b>, leaving the per-row path
+          byte-for-byte intact — and the CrossCheck golden test proves it, so existing learning is never disturbed.</p>
+      </div></div>
+      <div class="card card-border bg-base-100"><div class="card-body">
+        <h3 class="card-title text-base">Enumeration blow-up</h3>
+        <p class="text-sm">Temporal terms multiply the candidate space (each ref × each lag × each window). Bound them
+          hard: a tiny allowed window set (e.g. {45, 60}), <span class="mono">max_lag</span> small, and temporal terms
+          gated to their own capability tier so they only appear when simpler tiers stall.</p>
+      </div></div>
+      <div class="card card-border bg-base-100"><div class="card-body">
+        <h3 class="card-title text-base">Solver completeness</h3>
+        <p class="text-sm">Ratios and temporal terms are Z3-opaque (like <span class="mono">Div</span> today), so
+          logical pruning weakens and more candidates reach the statistical gate. Acceptable, but expect larger
+          portfolios; lean on the archive's subsumption and the null control.</p>
+      </div></div>
+    </div>
+    <div role="alert" class="alert alert-success alert-soft">
+      <span><b>Non-regression guarantee.</b> Every new capability (ratios, temporal operators, conditions, cross-grain
+      joins) is added <b>behind a capability flag or a new tier</b>, and the default per-row path is unchanged. A
+      checked-in <b>golden test</b> re-runs the Abilene and GÉANT discovery after every phase and fails the build if
+      the accepted portfolio or recall shifts at all — so extending Autogram for gtib provably cannot degrade what
+      already works on CrossCheck.</span>
+    </div>
+    <div class="mt-4">
+      <h3 class="font-semibold mb-2">The one thing no method can recover here</h3>
+      <div class="flex flex-wrap gap-2">
+        <span class="badge badge-soft badge-error">A1 byte conservation (I = O + Q + L) — its physical counters are never emitted, so no discovery method can observe it</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 10. APPENDIX -->
+  <section id="appendix" class="mb-6">
+    <h2 class="text-2xl font-bold mb-3">10 · Appendix — the six-stage extension-point map</h2>
+    <p class="text-[15px] mb-3 prose-white">Any brand-new relation shape must flow through six functional stages.
+      This is the checklist to consult for every new op/term the plan introduces (file → function).</p>
+    <div class="join join-vertical w-full">
+      <div class="collapse collapse-arrow join-item border border-base-content/10 bg-base-100">
+        <input type="checkbox" checked>
+        <div class="collapse-title font-medium">(a) Let the LLM propose it · (b) Enumerate it</div>
+        <div class="collapse-content text-sm">
+          <ul class="list-disc ml-5 space-y-1">
+            <li><b>(a) Propose</b> — <span class="mono">discovery/induce.py → _schema_prompt</span> (the only place the
+              model learns the contract: ops, agg kinds, degree, role conventions) + the
+              <span class="mono">_augment_*</span> helpers. No change if the shape uses existing roles/ops.</li>
+            <li><b>(b) Enumerate</b> — <span class="mono">dsl/ast.py</span> (new <span class="mono">Term</span> node or
+              <span class="mono">OPS</span>/<span class="mono">AGG_KINDS</span> entry) · <span class="mono">discovery/propose.py
+              → _candidate_rules</span> (a term builder + a yield block) · <span class="mono">dsl/typecheck.py →
+              is_admissible</span> (relax so the form passes) · <span class="mono">dsl/grammar.py</span> (new caps
+              such as <span class="mono">max_lag</span>/windows).</li>
+          </ul>
+        </div>
+      </div>
+      <div class="collapse collapse-arrow join-item border border-base-content/10 bg-base-100">
+        <input type="checkbox">
+        <div class="collapse-title font-medium">(c) Screen it in Z3 · (d) Accept it statistically</div>
+        <div class="collapse-content text-sm">
+          <ul class="list-disc ml-5 space-y-1">
+            <li><b>(c) Screen</b> — <span class="mono">logic/solver.py</span>: <span class="mono">_term_expr</span> (Z3
+              encoding, opaque fresh real if not exactly encodable) · <span class="mono">atom_expr</span> (new op) ·
+              <span class="mono">_leaf_key</span>/<span class="mono">_leaves</span> (recognise new leaves).</li>
+            <li><b>(d) Accept</b> — <span class="mono">dsl/evaluate.py → eval_term</span> (vectorised evaluation) ·
+              <span class="mono">evaluator/band.py → violation_magnitude</span> (if a new coverage form) ·
+              <span class="mono">discovery/evaluate.py → evaluate</span> (a branch computing <span class="mono">holds</span>,
+              a tolerance knob) · <span class="mono">discovery/archive.py → _op_strength</span> (ranking + don't get
+              dropped by the scaled-slack filters).</li>
+          </ul>
+        </div>
+      </div>
+      <div class="collapse collapse-arrow join-item border border-base-content/10 bg-base-100">
+        <input type="checkbox">
+        <div class="collapse-title font-medium">(e) Declare it as known · (f) Match/score it (recall)</div>
+        <div class="collapse-content text-sm">
+          <ul class="list-disc ml-5 space-y-1">
+            <li><b>(e) Declare</b> — <span class="mono">discovery/known.py → _signature</span> (parse the new
+              <span class="mono">{op, lhs, rhs}</span>) + <span class="mono">shapes_for_invariant</span> (map to a proxy
+              shape id) + <span class="mono">docs/known_invariants.example.yaml</span>.</li>
+            <li><b>(f) Score</b> — <span class="mono">discovery/validate.py → _operand_sig</span> (emit a relation
+              signature) + a <span class="mono">Recovery</span> field + <span class="mono">score_recovery</span> line ·
+              <span class="mono">discovery/synth.py</span> (plant the shape in <span class="mono">make_synthetic</span> +
+              <span class="mono">_planted</span>; ensure the null never plants it) ·
+              <span class="mono">discovery/regime.py → KNOWN_SHAPES</span>.</li>
+          </ul>
+          <p class="mt-2"><b>Coupling to remember:</b> declaration (<span class="mono">known.py:_signature</span>) and
+            matching (<span class="mono">validate.py:_operand_sig</span>) recognise the same structural forms — a new
+            shape must be added to <i>both</i> or it can be declared but never scored (or vice-versa).</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-5 text-sm text-white/70">
+      <p><b>Sources.</b> Extension-point map and file:function references verified by reading the Autogram source
+        (<span class="mono">autogram/dsl</span>, <span class="mono">discovery</span>, <span class="mono">logic</span>,
+        <span class="mono">evaluator</span>, <span class="mono">schema</span>, <span class="mono">loader</span>,
+        <span class="mono">config.py</span>, <span class="mono">calibrate.py</span>). gtib invariants and data model
+        verified by reading <span class="mono">generator/gtib_emulator</span> and loading
+        <span class="mono">data/gtib-emulation</span> (B1 division identity confirmed to 4.4e-16). The gtib data
+        dictionary lives in <span class="mono">data/README.md</span>.</p>
+    </div>
+  </section>
+
+  <div class="text-center text-xs text-white/50 pb-6">Autogram × gtib implementation plan · review draft</div>
+
+</main>
+</body>
+</html>

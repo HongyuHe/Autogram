@@ -21,6 +21,7 @@ used to re-render already-saved ``.dl`` portfolios in the explicit form.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import List, Optional, Tuple
 
@@ -130,6 +131,18 @@ def _render_term(term: A.Term, binder: str, adapter, facts) -> str:
     if isinstance(term, A.Div):
         return (f"({_render_term(term.num, binder, adapter, facts)} / "
                 f"{_render_term(term.den, binder, adapter, facts)})")
+    if isinstance(term, A.Lag):
+        return f"B^{term.steps}({_render_term(term.term, binder, adapter, facts)})"
+    if isinstance(term, A.Diff):
+        suffix = "" if term.steps == 1 else f"_{term.steps}"
+        return f"Δ{suffix}({_render_term(term.term, binder, adapter, facts)})"
+    if isinstance(term, A.Rolling):
+        return (
+            f"{term.kind}_{term.window}("
+            f"{_render_term(term.term, binder, adapter, facts)})"
+        )
+    if isinstance(term, A.RelatedAgg):
+        return term.unparse()
     return term.unparse()
 
 
@@ -144,28 +157,58 @@ def render_rule(rule: A.Rule, adapter=None) -> str:
     facts = _schema_facts(adapter)
     var_list = ", ".join(_binder_vars(adapter, rule.binder))
     head = f"[forall {rule.binder} {var_list}]" if var_list else f"[forall {rule.binder}]"
+    if isinstance(rule.atom, A.BooleanDefinition):
+        target = _render_term(rule.atom.target, rule.binder, adapter, facts)
+        condition = f" where {rule.condition.unparse()}" if rule.condition is not None else ""
+        return f"{head} {target} := {rule.atom.predicate.unparse()}{condition}"
+    if isinstance(rule.atom, A.CategoryDefinition):
+        condition = f" where {rule.condition.unparse()}" if rule.condition is not None else ""
+        return f"{head} {rule.atom.unparse()}{condition}"
+    if isinstance(rule.atom, A.BandDefinition):
+        term = _render_term(rule.atom.term, rule.binder, adapter, facts)
+        center = "?" if rule.atom.center is None else A.Const(rule.atom.center).unparse()
+        condition = f" where {rule.condition.unparse()}" if rule.condition is not None else ""
+        return f"{head} {term} ~band {center}{condition}"
     left = _render_term(rule.atom.left, rule.binder, adapter, facts)
     right = _render_term(rule.atom.right, rule.binder, adapter, facts)
-    return f"{head} {left} {rule.atom.op} {right}"
+    condition = f" where {rule.condition.unparse()}" if rule.condition is not None else ""
+    return f"{head} {left} {rule.atom.op} {right}{condition}"
 
 
 # ---------------------------------------------------------------------------
 # Inverse of Rule.unparse: parse the compact surface form back into an AST.
 # ---------------------------------------------------------------------------
 
-_OPS = (" <|> ", " ~= ", " == ", " != ", " <= ", " >= ")
+_OPS = (" <|> ", " ~∝ ", " ~= ", " == ", " != ", " <= ", " >= ", " < ", " > ")
 _AGG_RE = re.compile(r"^(SUM|MIN|MAX|AVG)\((\w+)\)$")
 _SCALE_RE = re.compile(r"^(-?\d+(?:\.\d+)?)\*(.+)$")
 _NUM_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_LAG_RE = re.compile(r"^LAG_(\d+)\((.*)\)$")
+_DIFF_RE = re.compile(r"^DELTA_(\d+)\((.*)\)$")
+_ROLL_RE = re.compile(r"^ROLL_(SUM|MIN|MAX|AVG)_(\d+)\((.*)\)$")
+_RELATED_RE = re.compile(r"^RELATED\((\w+)\)$")
 
 
 def _split_top(s: str, sep: str) -> List[str]:
-    """Split ``s`` on ``sep`` only at parenthesis depth 0."""
+    """Split ``s`` on ``sep`` only outside parentheses and quoted strings."""
     out, depth, last = [], 0, 0
+    quoted = False
+    escaped = False
     i, n, m = 0, len(s), len(sep)
     while i <= n - m:
         c = s[i]
-        if c == "(":
+        if quoted:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == '"':
+                quoted = False
+            i += 1
+            continue
+        if c == '"':
+            quoted = True
+        elif c == "(":
             depth += 1
         elif c == ")":
             depth -= 1
@@ -192,6 +235,18 @@ def _parse_primary(s: str) -> A.Term:
     m = _AGG_RE.match(s)
     if m:
         return A.Agg(m.group(1), m.group(2))
+    m = _LAG_RE.match(s)
+    if m:
+        return A.Lag(_parse_term(m.group(2)), int(m.group(1)))
+    m = _DIFF_RE.match(s)
+    if m:
+        return A.Diff(_parse_term(m.group(2)), int(m.group(1)))
+    m = _ROLL_RE.match(s)
+    if m:
+        return A.Rolling(_parse_term(m.group(3)), int(m.group(2)), m.group(1))
+    m = _RELATED_RE.match(s)
+    if m:
+        return A.RelatedAgg(m.group(1))
     m = _SCALE_RE.match(s)
     if m:
         return A.Scale(float(m.group(1)), _parse_primary(m.group(2)))
@@ -214,10 +269,151 @@ def parse_rule_line(text: str) -> A.Rule:
     if not m:
         raise ValueError(f"not a rule line: {text!r}")
     binder, body = m.group(1), m.group(2)
+    condition = None
+    condition_parts = _split_top(body, " where ")
+    if len(condition_parts) == 2:
+        body, condition_text = condition_parts
+        condition = _parse_condition(condition_text)
+    elif len(condition_parts) > 2:
+        raise ValueError(f"ambiguous condition in rule: {text!r}")
+    definition = _split_top(body, " := ")
+    if len(definition) == 2:
+        target, predicate_text = definition
+        if predicate_text.startswith("PRIORITY("):
+            atom = _parse_category_definition(target.strip(), predicate_text)
+        else:
+            atom = A.BooleanDefinition(
+                _parse_term(target),
+                _parse_predicate(predicate_text),
+            )
+        return A.Rule(binder, atom, condition=condition)
+    band = _split_top(body, " ~band ")
+    if len(band) == 2:
+        center = None if band[1].strip() == "?" else float(band[1].strip())
+        return A.Rule(
+            binder,
+            A.BandDefinition(_parse_term(band[0]), center),
+            condition=condition,
+        )
     for op in _OPS:
         parts = _split_top(body, op)
         if len(parts) == 2:
             left = _parse_term(parts[0])
             right = _parse_term(parts[1])
-            return A.Rule(binder, A.Compare(left, op.strip(), right))
+            return A.Rule(
+                binder,
+                A.Compare(left, op.strip(), right),
+                condition=condition,
+            )
     raise ValueError(f"no comparison operator found in: {body!r}")
+
+
+def _parse_condition(text: str) -> A.Condition:
+    text = text.strip()
+    all_match = re.fullmatch(r"ALL\((.*)\)", text)
+    if all_match:
+        return A.Condition(
+            "",
+            "all",
+            tuple(
+                _parse_condition(part)
+                for part in _split_top(all_match.group(1), ", ")
+                if part.strip()
+            ),
+        )
+    match = re.fullmatch(r"(\w+)\s+in\s+\((.*)\)", text)
+    if match:
+        values = tuple(
+            _parse_scalar(part.strip())
+            for part in _split_top(match.group(2), ", ")
+            if part.strip()
+        )
+        return A.Condition(match.group(1), "in", values)
+    match = re.fullmatch(r"(\w+)\s+(==|!=)\s+(.+)", text)
+    if not match:
+        raise ValueError(f"invalid condition: {text!r}")
+    return A.Condition(
+        match.group(1),
+        match.group(2),
+        (_parse_scalar(match.group(3).strip()),),
+    )
+
+
+def _parse_predicate(text: str) -> A.Predicate:
+    text = text.strip()
+    if text.startswith("(") and text.endswith(")") and _balanced_outer(text):
+        text = text[1:-1].strip()
+    conjunction = _split_top(text, " AND ")
+    if len(conjunction) > 1:
+        return A.Conjunction(tuple(_parse_predicate(part) for part in conjunction))
+    sustained = re.fullmatch(r"ALWAYS_(\d+)\((.*)\)", text)
+    if sustained:
+        predicate = _parse_predicate(sustained.group(2))
+        if not isinstance(predicate, A.Bound):
+            raise ValueError("ALWAYS requires a bound predicate")
+        return A.Sustained(predicate, int(sustained.group(1)))
+    for operator in (" <= ", " >= ", " < ", " > "):
+        parts = _split_top(text, operator)
+        if len(parts) == 2:
+            threshold = None if parts[1].strip() == "?" else float(parts[1].strip())
+            return A.Bound(_parse_term(parts[0]), operator.strip(), threshold)
+    raise ValueError(f"invalid Boolean predicate: {text!r}")
+
+
+def _parse_category_definition(target: str, text: str) -> A.CategoryDefinition:
+    text = text.strip()
+    if not text.startswith("PRIORITY(") or not text.endswith(")"):
+        raise ValueError(f"invalid categorical definition: {text!r}")
+    parts = _split_top(text[len("PRIORITY("):-1], "; default=")
+    if len(parts) != 2:
+        raise ValueError(f"invalid categorical definition: {text!r}")
+    cases = []
+    case_text = parts[0].strip()
+    if case_text:
+        for item in _split_top(case_text, ", "):
+            if "->" not in item:
+                raise ValueError(
+                    f"invalid categorical case: {item!r}"
+                )
+            column, value = item.split("->", 1)
+            cases.append((column.strip(), _parse_scalar(value.strip())))
+    return A.CategoryDefinition(
+        target,
+        tuple(cases),
+        _parse_scalar(parts[1].strip()),
+    )
+
+
+def _parse_scalar(text: str):
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        value = None
+    else:
+        if value is None or isinstance(
+            value,
+            (str, bool, int, float),
+        ):
+            return value
+    if text == "True":
+        return True
+    if text == "False":
+        return False
+    if text == "None":
+        return None
+    if _NUM_RE.match(text):
+        value = float(text)
+        return int(value) if value.is_integer() else value
+    return text
+
+
+def _balanced_outer(text: str) -> bool:
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0 and index != len(text) - 1:
+                return False
+    return depth == 0

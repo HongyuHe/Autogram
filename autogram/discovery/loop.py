@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import re
 from typing import List, Optional, Sequence
 
 import numpy as np
+import pandas as pd
 
 from ..config import DiscoveryConfig, SearchConfig
 from ..dsl.grammar import Grammar, grammar_from_adapter
 from ..loader.loader import Dataset, build_dataset, load_dataframe
 from ..schema.compiler import compile_spec
+from ..schema.spec import ColumnPattern, FamilySelector, RefTemplate, RelatedTemplate
 from .archive import ParetoArchive
 from .evaluate import DataOnlyEvaluator, Evaluation
 from .induce import SchemaInducer, induce_spec, make_inducer
@@ -59,14 +62,13 @@ def _make_proposer(G: Grammar, scfg: SearchConfig):
 def _run_dataset(ds: Dataset, G: Grammar, *, proposer, dcfg: DiscoveryConfig, scfg: SearchConfig) -> DiscoveryResult:
     evaluator = DataOnlyEvaluator(ds, dcfg)
     proposer_obj = proposer or _make_proposer(G, scfg)
-    archive = ParetoArchive()
+    logically_screened = isinstance(proposer_obj, EnumerationProposer)
+    archive = ParetoArchive(legacy_compat=G.legacy_compat)
     candidates = proposer_obj.propose(0, (), None)
-    if scfg.max_rules and scfg.max_rules > 0:
-        candidates = candidates[:scfg.max_rules]
     diagnostics: List[str] = []
     seen_diagnostics = set()
     for rule in candidates:
-        ev = evaluator.evaluate(rule)
+        ev = evaluator.evaluate(rule, logically_screened=logically_screened)
         if "grounded 0 points" in ev.reason:
             key = (ev.rule.binder, ev.reason)
             if key not in seen_diagnostics and len(diagnostics) < 20:
@@ -106,9 +108,18 @@ def prepare_columns(columns: Sequence[str], matrix: np.ndarray, *,
     scfg = search_cfg or SearchConfig()
     inducer = inducer or make_inducer("subagent")
     spec = induce_spec(columns, inducer, sample_rows)
+    spec = _apply_search_temporal_bounds(spec, scfg)
     adapter = compile_spec(spec)
     ds = _dataset_from_columns(columns, matrix, adapter, name, timestamps)
-    G = grammar_from_adapter(adapter, scfg.max_complexity, scfg.max_add_arity)
+    G = grammar_from_adapter(
+        adapter,
+        scfg.max_complexity,
+        scfg.max_add_arity,
+        max_rules=scfg.max_rules,
+        max_nonlinear_leaves=scfg.max_nonlinear_leaves,
+        max_linear_leaves=scfg.max_linear_leaves,
+        max_conditioned_rules=scfg.max_conditioned_rules,
+    )
     return ds, G, spec
 
 
@@ -134,9 +145,23 @@ def prepare_dataframe(df, *, inducer: Optional[SchemaInducer] = None,
     """
     scfg = search_cfg or SearchConfig()
     inducer = inducer or make_inducer("subagent")
-    spec = induce_spec(list(df.columns), inducer, sample_rows=None)
-    ds, G = build_dataframe_grammar(df, spec, search_cfg=scfg, name=name)
-    return ds, G, spec
+    induced_spec = induce_spec(
+        list(df.columns),
+        inducer,
+        sample_rows=None,
+    )
+    runtime_spec = normalize_dataframe_spec(
+        df,
+        induced_spec,
+        scfg,
+    )
+    ds, G = build_dataframe_grammar(
+        df,
+        runtime_spec,
+        search_cfg=scfg,
+        name=name,
+    )
+    return ds, G, runtime_spec
 
 
 def build_dataframe_grammar(df, spec, *, search_cfg: Optional[SearchConfig] = None,
@@ -147,11 +172,324 @@ def build_dataframe_grammar(df, spec, *, search_cfg: Optional[SearchConfig] = No
     (more aggregations / higher degree), this rebuilds the runnable grammar from the edited spec.
     """
     scfg = search_cfg or SearchConfig()
+    spec = normalize_dataframe_spec(df, spec, scfg)
     adapter = compile_spec(spec)
     timestamps = df["timestamp"].values if "timestamp" in df.columns else None
     ds = load_dataframe(df, adapter, name, timestamps=timestamps)
-    G = grammar_from_adapter(adapter, scfg.max_complexity, scfg.max_add_arity)
+    G = grammar_from_adapter(
+        adapter,
+        scfg.max_complexity,
+        scfg.max_add_arity,
+        max_rules=scfg.max_rules,
+        max_nonlinear_leaves=scfg.max_nonlinear_leaves,
+        max_linear_leaves=scfg.max_linear_leaves,
+        max_conditioned_rules=scfg.max_conditioned_rules,
+    )
     return ds, G
+
+
+def normalize_dataframe_spec(
+    df,
+    spec,
+    search_cfg: Optional[SearchConfig] = None,
+):
+    """Return the exact post-profile, post-search spec used at runtime."""
+
+    scfg = search_cfg or SearchConfig()
+    return _apply_search_temporal_bounds(
+        _augment_profiled_dataframe_spec(df, spec),
+        scfg,
+    )
+
+
+def _apply_search_temporal_bounds(spec, search_cfg: SearchConfig):
+    updates = {}
+    if int(search_cfg.max_lag) > 0:
+        updates["max_lag"] = int(search_cfg.max_lag)
+    if search_cfg.windows:
+        updates["windows"] = tuple(sorted({
+            int(window) for window in search_cfg.windows
+        }))
+    return replace(spec, **updates) if updates else spec
+
+
+def _augment_profiled_dataframe_spec(df, spec):
+    """Add a generic singleton record binder from explicit DataFrame profile metadata."""
+
+    from ..loader.gtib import AUTOGRAM_PROFILE_ATTR
+
+    profile = getattr(df, "attrs", {}).get(
+        AUTOGRAM_PROFILE_ATTR
+    )
+    if not profile:
+        return spec
+
+    time_index = str(profile.get("time_index") or "")
+    group_keys = tuple(str(c) for c in profile.get("group_keys", ()) if c in df.columns)
+    condition_names = tuple(
+        str(c) for c in profile.get("condition_columns", ()) if c in df.columns
+    )
+    metadata_columns = tuple(
+        str(column)
+        for column in profile.get("metadata_columns", ())
+        if column in df.columns
+    )
+    metadata = {time_index, *group_keys, *condition_names, *metadata_columns} - {""}
+    family_members = {
+        str(column)
+        for columns in profile.get("families", {}).values()
+        for column in columns
+    }
+    numeric_columns = [
+        str(c) for c in df.columns
+        if (c not in metadata or pd.api.types.is_bool_dtype(df[c]))
+        and (
+            pd.api.types.is_numeric_dtype(df[c])
+            or pd.api.types.is_bool_dtype(df[c])
+        )
+    ]
+    measured = [
+        column for column in numeric_columns
+        if column not in family_members
+    ]
+    if not measured:
+        raise ValueError("profiled DataFrame contains no numeric or Boolean measured columns")
+
+    def role_name(column: str, used: set[str]) -> str:
+        base = re.sub(r"\W+", "_", column).strip("_") or "value"
+        if base[0].isdigit():
+            base = "v_" + base
+        role = base
+        serial = 2
+        while role in used:
+            role = f"{base}_{serial}"
+            serial += 1
+        used.add(role)
+        return role
+
+    onto = spec.ontology
+    binders = ("record",)
+    used: set[str] = set()
+    roles: list[str] = []
+    patterns = list(spec.patterns)
+    templates = []
+    existing_patterns = {p.name for p in patterns}
+    existing_templates = {(t.binder, t.role) for t in templates}
+    column_roles: dict[str, str] = {}
+    for index, column in enumerate(numeric_columns):
+        existing = next(
+            (
+                t.role for t in templates
+                if t.binder == "record" and t.template == column
+            ),
+            None,
+        )
+        role = existing or role_name(column, used)
+        column_roles[column] = role
+        if column in measured and role not in roles:
+            roles.append(role)
+        pattern_name = f"tabular_exact_{index}_{role}"
+        if pattern_name not in existing_patterns:
+            patterns.append(ColumnPattern(
+                name=pattern_name,
+                matcher="regex",
+                kind="tabular",
+                direction=role,
+                regex=rf"^{re.escape(column)}$",
+            ))
+        if column in measured and ("record", role) not in existing_templates:
+            templates.append(RefTemplate("record", role, column))
+
+    selectors = []
+    family_roles = []
+    existing_selectors = {(s.binder, s.family_role) for s in selectors}
+    for family_name, columns in profile.get("families", {}).items():
+        role = re.sub(r"\W+", "_", str(family_name)).strip("_") or "family"
+        if role not in family_roles:
+            family_roles.append(role)
+        if ("record", role) not in existing_selectors:
+            selectors.append(FamilySelector(
+                binder="record",
+                family_role=role,
+                match_kind="tabular",
+                columns=tuple(str(c) for c in columns if c in column_roles),
+            ))
+
+    ref_roles = {"record": tuple(roles)}
+    fam_roles = {"record": tuple(family_roles)}
+    profile_agg_kinds = tuple(
+        str(kind)
+        for kind in profile.get("agg_kinds", ())
+    )
+    agg_kinds = (
+        tuple(dict.fromkeys((
+            *onto.agg_kinds,
+            *profile_agg_kinds,
+        )))
+        if getattr(spec, "aggregations_widened", False)
+        else profile_agg_kinds or tuple(onto.agg_kinds)
+    )
+    ontology = replace(
+        onto,
+        binders=binders,
+        ref_roles=ref_roles,
+        fam_roles=fam_roles,
+        ops=tuple(dict.fromkeys(
+            tuple(
+                op
+                for op in onto.ops
+                if op not in ("<", ">", "~∝")
+            )
+            + (("<", ">") if time_index else ())
+            + (
+                ("~∝",)
+                if (
+                    profile.get("proportional", False)
+                    or getattr(
+                        spec,
+                        "proportional_widened",
+                        False,
+                    )
+                )
+                else ()
+            )
+        )),
+        agg_kinds=agg_kinds,
+    )
+    condition_columns = {
+        name: tuple(pd.unique(df[name].dropna()).tolist())
+        for name in condition_names
+    }
+    boolean_roles = {
+        "record": tuple(
+            column_roles[column]
+            for column in measured
+            if pd.api.types.is_bool_dtype(df[column])
+        ),
+    }
+    related_templates = []
+    existing_related = set()
+    for role, raw in profile.get("related_aggregates", {}).items():
+        key = ("record", str(role))
+        if key in existing_related:
+            continue
+        related_templates.append(RelatedTemplate(
+            binder="record",
+            role=str(role),
+            relation=str(raw["relation"]),
+            column=str(raw["column"]),
+            mode=str(raw["mode"]),
+            parent_keys=tuple(str(value) for value in raw.get("parent_keys", ())),
+            child_keys=tuple(str(value) for value in raw.get("child_keys", ())),
+            partition_keys=tuple(str(value) for value in raw.get("partition_keys", ())),
+            parent_time=str(raw["parent_time"]),
+            child_time=str(raw["child_time"]),
+            window_seconds=int(raw["window_seconds"]),
+            reset_column=str(raw.get("reset_column", "")),
+            validity_columns=tuple(str(value) for value in raw.get("validity_columns", ())),
+            span_start=str(raw.get("span_start", "")),
+            span_end=str(raw.get("span_end", "")),
+            filter_column=str(raw.get("filter_column", "")),
+            filter_values=tuple(raw.get("filter_values", ())),
+        ))
+    return replace(
+        spec,
+        patterns=tuple(patterns),
+        ontology=ontology,
+        ref_templates=tuple(templates),
+        family_selectors=tuple(selectors),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=replace(spec.cell_codec, kind="scalar"),
+        time_index=time_index,
+        group_keys=group_keys,
+        condition_columns=condition_columns,
+        conditional_enabled=bool(condition_columns),
+        temporal_enabled=bool(time_index),
+        max_lag=(
+            max(
+                int(getattr(spec, "max_lag", 0)),
+                int(profile.get("max_lag", 0)),
+            )
+            if getattr(spec, "temporal_bounds_widened", False)
+            else int(profile.get("max_lag", 0))
+        ),
+        windows=(
+            tuple(sorted({
+                *(
+                    int(window)
+                    for window in getattr(spec, "windows", ())
+                ),
+                *(
+                    int(window)
+                    for window in profile.get(
+                        "temporal_windows",
+                        (),
+                    )
+                ),
+            }))
+            if getattr(spec, "temporal_bounds_widened", False)
+            else tuple(sorted({
+                int(window)
+                for window in profile.get(
+                    "temporal_windows",
+                    (),
+                )
+            }))
+        ),
+        related_templates=tuple(related_templates),
+        boolean_roles=boolean_roles,
+        role_exclusions=tuple(
+            exclusion
+            for exclusion in getattr(spec, "role_exclusions", ())
+            if set(exclusion) <= set(roles)
+        ),
+        advanced_enabled=(
+            bool(
+                getattr(spec, "advanced_enabled", False)
+                or profile.get("advanced", False)
+            )
+            if getattr(spec, "advanced_bounds_widened", False)
+            else bool(profile.get("advanced", False))
+        ),
+        run_lengths=(
+            tuple(sorted({
+                *(
+                    int(window)
+                    for window in getattr(spec, "run_lengths", ())
+                ),
+                *(
+                    int(window)
+                    for window in profile.get("run_lengths", ())
+                ),
+            }))
+            if getattr(spec, "advanced_bounds_widened", False)
+            else tuple(sorted({
+                int(window)
+                for window in profile.get("run_lengths", ())
+            }))
+        ),
+        max_conjunction_terms=(
+            max(
+                int(getattr(spec, "max_conjunction_terms", 3)),
+                int(profile.get("max_conjunction_terms", 3)),
+            )
+            if getattr(spec, "advanced_bounds_widened", False)
+            else max(
+                2,
+                int(profile.get("max_conjunction_terms", 3)),
+            )
+        ),
+        metadata_columns=metadata_columns,
+        band_enabled=bool(profile.get("band_enabled", False)),
+        max_degree=(
+            max(
+                int(getattr(spec, "max_degree", 1)),
+                max(1, int(profile.get("max_degree", 0))),
+            )
+            if getattr(spec, "degree_widened", False)
+            else max(1, int(profile.get("max_degree", 0)))
+        ),
+    )
 
 
 def run_prepared(ds: Dataset, G: Grammar, *, discovery_cfg: Optional[DiscoveryConfig] = None,
