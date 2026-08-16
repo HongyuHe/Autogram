@@ -34,6 +34,7 @@ from ..dsl.binders import enumerate_bindings, resolve_ref
 from ..dsl.evaluate import (
     eval_term,
     typed_group_key,
+    typed_signature_value,
     typed_sort_key,
 )
 from .loop import DiscoveryResult
@@ -136,13 +137,13 @@ def _base_signature(inv: KnownInvariant):
             cases = tuple(
                 (
                     str(item["when"]),
-                    typed_group_key(item["value"]),
+                    typed_signature_value(item["value"]),
                 )
                 for item in rhs["priority"]
             )
             return (
                 "categorical_definition",
-                (lhs, cases, typed_group_key(rhs.get("default"))),
+                (lhs, cases, typed_signature_value(rhs.get("default"))),
             )
     if (
         op in (">=", "<=", ">", "<")
@@ -225,11 +226,11 @@ def _known_condition_signature(where):
     if key.endswith("_in"):
         column = key[:-3]
         values = tuple(sorted(
-            (typed_group_key(item) for item in value),
-            key=typed_sort_key,
+            (typed_signature_value(item) for item in value),
+            key=lambda item: typed_sort_key(item[1]),
         ))
         return (column, "in", values)
-    return (str(key), "==", (typed_group_key(value),))
+    return (str(key), "==", (typed_signature_value(value),))
 
 
 def _known_temporal_ref(value, form: str):
