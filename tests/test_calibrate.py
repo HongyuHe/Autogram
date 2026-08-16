@@ -1194,6 +1194,133 @@ def test_known_split_groups_later_tier_and_parameterized_bindings():
         } <= validation_names
 
 
+def test_known_split_matches_alternative_roles_and_family_witnesses():
+    frame = pd.DataFrame({
+        "x_n0": np.ones(20),
+        "y_n0": np.ones(20),
+        "x_n1": np.ones(20),
+        "y_n1": np.ones(20),
+        "total_n0": np.full(20, 3.0),
+        "total_n1": np.ones(20),
+        "part_n0_a": np.ones(20),
+        "part_n0_b": np.full(20, 2.0),
+        "part_n1_a": np.ones(20),
+    })
+    spec = GrammarSpec(
+        name="alternative-witnesses",
+        patterns=(
+            ColumnPattern(
+                "x",
+                "regex",
+                "measurement",
+                "x",
+                regex=r"^x_(?P<source>n\d+)$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+            ColumnPattern(
+                "y",
+                "regex",
+                "measurement",
+                "y",
+                regex=r"^y_(?P<source>n\d+)$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+            ColumnPattern(
+                "total",
+                "regex",
+                "measurement",
+                "total",
+                regex=r"^total_(?P<source>n\d+)$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+            ColumnPattern(
+                "part",
+                "regex",
+                "part",
+                "part",
+                regex=r"^part_(?P<source>n\d+)_.+$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("node",),
+            ref_roles={
+                "node": ("x", "y", "x_alias", "total"),
+            },
+            fam_roles={"node": ("parts",)},
+            agg_kinds=("SUM",),
+        ),
+        ref_templates=(
+            RefTemplate("node", "x", "x_{X}"),
+            RefTemplate("node", "y", "y_{X}"),
+            RefTemplate("node", "x_alias", "x_n0"),
+            RefTemplate("node", "total", "total_{X}"),
+        ),
+        family_selectors=(
+            FamilySelector(
+                "node",
+                "parts",
+                "part",
+                predicates=(("source", "==", "X"),),
+            ),
+        ),
+        binder_enumerate={"node": "per_node"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    dataset = build_dataset(
+        frame.columns,
+        frame.to_numpy(dtype=float),
+        compile_spec(spec),
+        name="alternative_witnesses",
+        timestamps=np.arange(len(frame)),
+    )
+    catalogues = (
+        [
+            KnownInvariant("n0", "~=", "x_n0", "y_n0"),
+            KnownInvariant("n1", "==", "x_n1", "y_n1"),
+            KnownInvariant("other", ">=", "total_n0", 0),
+        ],
+        [
+            KnownInvariant(
+                "n0",
+                "==",
+                "total_n0",
+                {"sum": ["part_n0_a", "part_n0_b"]},
+            ),
+            KnownInvariant(
+                "n1",
+                "==",
+                "total_n1",
+                {"sum": ["part_n1_a"]},
+            ),
+            KnownInvariant("other", "==", "x_n0", "y_n1"),
+        ],
+    )
+
+    for known in catalogues:
+        calibration, validation = _split_known(
+            known,
+            frac=0.5,
+            seed=0,
+            frame=dataset.observed,
+            recovery_dataset=dataset,
+        )
+        calibration_names = {item.name for item in calibration}
+        validation_names = {item.name for item in validation}
+        assert {"n0", "n1"} <= calibration_names or {
+            "n0",
+            "n1",
+        } <= validation_names
+
+
 def test_known_split_keeps_singleton_sum_balance_aliases_together():
     known = [
         KnownInvariant(

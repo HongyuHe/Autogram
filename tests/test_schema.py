@@ -105,6 +105,33 @@ def test_compiler_rejects_composite_condition_values_before_proposal():
         compile_spec(spec)
 
 
+def test_compiler_rejects_unrepresentable_related_window():
+    base = _node_template_spec()
+    invalid = GrammarSpec(
+        **{
+            **base.__dict__,
+            "related_templates": (
+                RelatedTemplate(
+                    binder="node",
+                    role="related",
+                    relation="raw",
+                    column="value",
+                    mode="sum_last",
+                    parent_keys=(),
+                    child_keys=(),
+                    partition_keys=(),
+                    parent_time="timestamp",
+                    child_time="timestamp",
+                    window_seconds=10 ** 30,
+                ),
+            ),
+        }
+    )
+
+    with pytest.raises(CompileError, match="datetime64\\[ns\\] range"):
+        compile_spec(invalid)
+
+
 def test_numpy_span_filter_values_compile_and_serialize_as_python_scalars():
     spec = GrammarSpec(
         name="numpy-span-filter",

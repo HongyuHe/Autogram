@@ -367,6 +367,11 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
             f"related template {template.role!r} window_seconds",
             template.window_seconds,
         )
+        if int(template.window_seconds) > (2 ** 63 - 1) // 1_000_000_000:
+            raise CompileError(
+                f"related template {template.role!r}: window_seconds exceeds "
+                "the datetime64[ns] range"
+            )
         if not template.role or not template.relation or not template.column:
             raise CompileError(
                 "related template role, relation, and column must be non-empty"

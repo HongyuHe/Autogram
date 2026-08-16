@@ -1194,6 +1194,7 @@ def _balanced_null_numeric(
     *,
     binary: bool,
     magnitude_ceiling: float = _NULL_MAGNITUDE_CEILING,
+    odd_sign: int = 1,
 ) -> np.ndarray:
     source = np.asarray(values, dtype=float)
     output = np.full(source.shape, np.nan, dtype=float)
@@ -1233,7 +1234,10 @@ def _balanced_null_numeric(
         with np.errstate(over="ignore"):
             magnitudes = scale * multipliers
         signs = np.ones(positions.size, dtype=float)
-        signs[:positions.size // 2] = -1.0
+        negative = positions.size // 2
+        if positions.size % 2 and int(odd_sign) < 0:
+            negative += 1
+        signs[:negative] = -1.0
         rng.shuffle(signs)
         generated = magnitudes * signs
     output[positions] = generated
@@ -1408,7 +1412,7 @@ def _runtime_relation_null(
             ):
                 monotone_columns.setdefault(column, template)
     structural.discard("")
-    for column in output.columns:
+    for column_index, column in enumerate(output.columns):
         if column in structural:
             continue
         values = output[column].to_numpy(copy=True)
@@ -1441,6 +1445,7 @@ def _runtime_relation_null(
                 rng,
                 binary=binary,
                 magnitude_ceiling=magnitude_ceiling,
+                odd_sign=1 if column_index % 2 == 0 else -1,
             )
         else:
             output[column] = rng.permutation(values)
@@ -1635,6 +1640,7 @@ def _runtime_null_dataset(
             rng,
             binary=binary,
             magnitude_ceiling=magnitude_ceiling,
+            odd_sign=1 if index % 2 == 0 else -1,
         )
         if presence_masks and not binary:
             generated = _presence_masked(generated, rng)

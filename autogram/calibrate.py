@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import gc
+import itertools
 import json
 import math
 import os
@@ -454,7 +455,11 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
         if recovery_dataset is None:
             return False
         from .dsl import ast as A
-        from .dsl.binders import enumerate_bindings, resolve_ref
+        from .dsl.binders import (
+            enumerate_bindings,
+            resolve_family,
+            resolve_ref,
+        )
         from .dsl.evaluate import eval_term
 
         name_model = recovery_dataset.name_model
@@ -555,11 +560,19 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
         recovery_dataset is not None
         and hasattr(recovery_dataset, "name_model")
     ):
-        from .dsl.binders import enumerate_bindings, resolve_ref
+        from .dsl.binders import (
+            enumerate_bindings,
+            resolve_family,
+            resolve_ref,
+        )
 
         name_model = recovery_dataset.name_model
         adapter = name_model.adapter
         column_roles: dict[str, set[tuple[str, str]]] = {}
+        family_roles: dict[
+            frozenset[str],
+            set[tuple[str, str]],
+        ] = {}
         for binder in adapter.binders:
             bindings = enumerate_bindings(binder, name_model)
             for role in adapter.refs_for(binder):
@@ -574,41 +587,76 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                         column_roles.setdefault(column, set()).add(
                             (binder, role)
                         )
+            for role in adapter.fams_for(binder):
+                for binding in bindings:
+                    columns = frozenset(resolve_family(
+                        role,
+                        binder,
+                        binding,
+                        name_model,
+                    ))
+                    if columns:
+                        family_roles.setdefault(columns, set()).add(
+                            (binder, role)
+                        )
 
-        def abstract_column(value):
+        def abstract_column_variants(value):
             if not isinstance(value, str):
-                return value
+                return {value}
             roles = column_roles.get(value)
             if roles:
-                return (
-                    "quantified_ref",
-                    tuple(sorted(roles)),
-                )
+                return {
+                    ("quantified_ref", binder, role)
+                    for binder, role in roles
+                }
             semantics = name_model.by_name.get(value)
             if semantics is not None:
-                return (
+                return {(
                     "quantified_semantics",
                     semantics.kind,
                     semantics.direction,
-                )
-            return value
+                )}
+            return {value}
 
-        def quantified_signature(value):
+        def quantified_variants(value):
             if isinstance(value, frozenset):
-                return frozenset(
-                    quantified_signature(item)
+                variants = {
+                    ("quantified_family", binder, role)
+                    for binder, role in family_roles.get(
+                        frozenset(
+                            item
+                            for item in value
+                            if isinstance(item, str)
+                        ),
+                        (),
+                    )
+                }
+                options = [
+                    quantified_variants(item)
                     for item in value
+                ]
+                variants.update(
+                    frozenset(items)
+                    for items in itertools.product(*options)
                 )
+                return variants
             if isinstance(value, tuple):
+                if value[:1] == ("category_value",):
+                    return {value}
                 if (
                     len(value) == 3
                     and value[0] == "one_sided"
                 ):
-                    return (
-                        "quantified_sign",
-                        abstract_column(value[1]),
-                        ">=" if value[2] in (">", ">=") else "<=",
-                    )
+                    return {
+                        (
+                            "quantified_sign",
+                            column,
+                            ">=" if value[2] in (">", ">=") else "<=",
+                        )
+                        for column in abstract_column_variants(
+                            value[1]
+                        )
+                    }
                 if (
                     len(value) == 2
                     and value[0] == "lag_bound"
@@ -621,33 +669,53 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                         frame_satisfies(column, op)
                         and lag_grounds(column, steps)
                     ):
-                        return (
-                            "quantified_sign",
-                            abstract_column(column),
+                        return {
+                            (
+                                "quantified_sign",
+                                abstract,
+                                normalized_op,
+                            )
+                            for abstract in abstract_column_variants(
+                                column
+                            )
+                        }
+                    return {
+                        (
+                            "quantified_lag_sign",
+                            abstract,
+                            int(steps),
                             normalized_op,
                         )
-                    return (
-                        "quantified_lag_sign",
-                        abstract_column(column),
-                        int(steps),
-                        normalized_op,
-                    )
-                return tuple(
-                    quantified_signature(item)
+                        for abstract in abstract_column_variants(column)
+                    }
+                options = [
+                    quantified_variants(item)
                     for item in value
-                )
-            return abstract_column(value)
+                ]
+                return {
+                    tuple(items)
+                    for items in itertools.product(*options)
+                }
+            return abstract_column_variants(value)
 
-        quantified_groups = {}
-        for index, signature in enumerate(signatures):
-            if signature is None:
-                continue
-            key = quantified_signature(signature)
-            previous = quantified_groups.get(key)
-            if previous is None:
-                quantified_groups[key] = index
-            else:
-                union(previous, index)
+        abstracted = []
+        for candidates in expansions:
+            variants = set()
+            if candidates is not None:
+                for candidate in candidates:
+                    variants.update(
+                        sum_balance_recovery_alias(item)
+                        for item in quantified_variants(candidate)
+                    )
+            abstracted.append(variants)
+        for left in range(len(known)):
+            for right in range(left + 1, len(known)):
+                if any(
+                    relation_signature_matches(a, b)
+                    for a in abstracted[left]
+                    for b in abstracted[right]
+                ):
+                    union(left, right)
 
     if recovery_dataset is not None and recovery_rules is not None:
         # A quantified rule is one recovery witness even though each binding emits a different
@@ -1149,9 +1217,17 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     # dataset whose induced codec names a different primary key. The proposal is reused as tier 0,
     # so this costs no extra induction.
     initial_spec = induce_spec(list(df.columns), inducer)
+    tier_specs = [initial_spec]
+    merged_spec = initial_spec
+    for _tier in tiers[1:]:
+        merged_spec = _merge_specs(
+            merged_spec,
+            induce_spec(list(df.columns), inducer),
+        )
+        tier_specs.append(merged_spec)
     split_dataset, _split_grammar = build_dataframe_grammar(
         df,
-        initial_spec,
+        tier_specs[-1],
         search_cfg=scfg,
         name=f"{name}_split",
     )
@@ -1230,13 +1306,9 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             break
         # Tier 0 reuses the proposal already made for the split's cell codec; later tiers
         # (re-)propose the grammar from the columns.
-        spec = initial_spec if ti == 0 else induce_spec(list(df.columns), inducer)
+        spec = tier_specs[ti]
         if ti > 0:
             reinductions += 1
-            # Fold the fresh (non-deterministic) proposal back into the accumulated grammar so a
-            # later tier can never drop a role/pattern an earlier tier already had -- this is what
-            # makes the search space non-shrinking across tiers actually hold (item 2).
-            spec = _merge_specs(accumulated, spec)
         spec = _widen_spec(spec, all_aggs=caps.get("all_aggs", False),
                            max_degree=caps.get("max_degree"),
                            drop_exclusions=caps.get("drop_exclusions", False),

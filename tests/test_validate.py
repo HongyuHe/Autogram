@@ -528,6 +528,52 @@ def test_runtime_numeric_null_avoids_tied_temporal_differences():
     assert 0.45 <= nonnegative_differences <= 0.55
 
 
+def test_odd_sparse_null_columns_balance_pooled_signs():
+    columns = tuple(f"x{index}" for index in range(100))
+    frame = pd.DataFrame({
+        name: [1.0]
+        for name in columns
+    })
+    spec = GrammarSpec(
+        name="odd-sparse-null",
+        patterns=(
+            ColumnPattern(
+                "value",
+                "regex",
+                "measurement",
+                "value",
+                regex=r"^x\d+$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ()},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    dataset = build_dataset(
+        frame.columns,
+        frame.to_numpy(dtype=float),
+        compile_spec(spec),
+        name="odd_sparse_null",
+        timestamps=np.arange(1),
+    )
+
+    null = V._runtime_null_dataset(
+        dataset,
+        seed=0,
+        definition_targets=False,
+    ).observed.matrix
+
+    assert np.count_nonzero(null > 0.0) == 50
+    assert np.count_nonzero(null < 0.0) == 50
+    assert not np.any(null == 0.0)
+
+
 def test_score_recovery_exposes_numeric_one_sided_families(monkeypatch):
     # nonneg/nonpos are surfaced through the same uniform numeric recovery interface joint tuning
     # uses (getattr(rec, shape) >= 0.8), i.e. coverage of the planted one-sided columns.
