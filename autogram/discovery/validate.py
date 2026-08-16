@@ -19,6 +19,8 @@ from ..config import DiscoveryConfig, SearchConfig
 from ..dsl import ast as A
 from ..dsl.binders import enumerate_bindings, resolve_family, resolve_ref
 from ..dsl.evaluate import (
+    _datetime_ns,
+    _saturating_add_ns,
     _typed_object_array,
     eval_term,
     robust_median,
@@ -1213,7 +1215,7 @@ def _runtime_relation_null(
             } - {""}
             if not required <= set(parent_context):
                 continue
-            times = np.asarray(
+            times = _datetime_ns(
                 parent_context[template.parent_time]
             )
             key_arrays = [
@@ -1246,7 +1248,7 @@ def _runtime_relation_null(
                         typed_group_key(filter_value),
                         template.span_start,
                         template.span_end,
-                        times[row],
+                        int(times[row]),
                     )
                     if signature in emitted:
                         continue
@@ -1260,20 +1262,26 @@ def _runtime_relation_null(
                         bucket["raw_key"],
                     ):
                         record[child_key] = value
-                    record[template.span_start] = times[row]
+                    record[template.span_start] = pd.Timestamp(
+                        int(times[row])
+                    )
                     if position + 1 < len(ordered):
-                        span_end = times[ordered[position + 1]]
+                        span_end_ns = int(times[ordered[position + 1]])
                     elif len(ordered) > 1:
-                        span_end = (
-                            times[row]
-                            + (
-                                times[ordered[-1]]
-                                - times[ordered[-2]]
-                            )
+                        step = (
+                            int(times[ordered[-1]])
+                            - int(times[ordered[-2]])
                         )
+                        shifted, _saturated = _saturating_add_ns(
+                            np.asarray([times[row]], dtype=np.int64),
+                            step,
+                        )
+                        span_end_ns = int(shifted[0])
                     else:
-                        span_end = times[row]
-                    record[template.span_end] = span_end
+                        span_end_ns = int(times[row])
+                    record[template.span_end] = pd.Timestamp(
+                        span_end_ns
+                    )
                     if template.filter_column:
                         record[template.filter_column] = filter_value
                     records.append(record)
@@ -1282,6 +1290,19 @@ def _runtime_relation_null(
                 records,
                 columns=relation.columns,
             )
+            identity_columns = tuple(dict.fromkeys(
+                child_key
+                for template in span_templates
+                for child_key in template.child_keys
+            ))
+            for column in identity_columns:
+                values = np.empty(len(records), dtype=object)
+                for index, record in enumerate(records):
+                    values[index] = record[column]
+                span_frame[column] = pd.Series(
+                    values,
+                    dtype=object,
+                )
             if len(span_templates) == len(templates):
                 return span_frame
     output = relation.copy(deep=True)

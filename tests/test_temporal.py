@@ -282,6 +282,44 @@ def test_temporal_cadence_rejects_wide_unit_timestamp_wrap():
         )
 
 
+def test_mixed_timestamp_formats_use_one_chronological_order():
+    groups = 100
+    frame = _profile(pd.DataFrame({
+        "timestamp": np.tile(
+            ["Jan 01 2026", "Jan 02 2026", "01/03/2026"],
+            groups,
+        ),
+        "series_id": np.repeat(
+            [f"series-{index}" for index in range(groups)],
+            3,
+        ),
+        "x": np.tile([10.0, 20.0, -100.0], groups),
+    }))
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="mixed_timestamp_formats",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(
+            A.Diff(A.Ref("x"), 1),
+            ">=",
+            A.Const(0),
+        ),
+    ))
+
+    assert not result.accepted
+    assert result.hold_rate == pytest.approx(0.5)
+
+
 def test_composite_group_keys_survive_stratified_subsampling():
     # Round-22: a composite group key must be bucketed as a 1-D object array of TUPLES. Building it
     # as a 2-D array made ``tolist()`` yield unhashable lists and crashed group-stratified

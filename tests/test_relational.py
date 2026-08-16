@@ -696,9 +696,168 @@ def test_span_runtime_null_preserves_temporal_parent_keys_through_join():
     )
     values = _span_any(template, frame, generated)
 
-    assert generated["consumer_id"].dtype.kind == "M"
+    assert generated["consumer_id"].dtype.kind == "O"
     assert values is not None
     assert values.tolist() == [0.0, 1.0, 0.0, 1.0]
+
+
+def test_span_runtime_null_preserves_python_datetime_keys_and_string_times():
+    first = pd.Timestamp("2026-01-01").to_pydatetime()
+    second = pd.Timestamp("2026-01-02").to_pydatetime()
+    consumers = np.empty(4, dtype=object)
+    consumers[:2] = first
+    consumers[2:] = second
+    times = np.array([
+        "2026-02-01T00:00:00",
+        "2026-02-01T00:01:00",
+        "2026-02-01T00:00:00",
+        "2026-02-01T00:01:00",
+    ], dtype=object)
+    relation = pd.DataFrame({
+        "consumer_id": pd.Series(dtype=object),
+        "span_start": pd.Series(dtype="datetime64[ns]"),
+        "span_end": pd.Series(dtype="datetime64[ns]"),
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="event",
+        relation="events",
+        column="",
+        mode="span_any",
+        parent_keys=("consumer_id",),
+        child_keys=("consumer_id",),
+        partition_keys=(),
+        parent_time="timestamp",
+        child_time="",
+        window_seconds=60,
+        span_start="span_start",
+        span_end="span_end",
+    )
+    context = {
+        "timestamp": times,
+        "consumer_id": consumers,
+    }
+
+    generated = _runtime_relation_null(
+        relation,
+        [template],
+        context,
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+    frame = Frame(
+        np.empty((len(times), 0), dtype=float),
+        [],
+        row_context=context,
+    )
+    values = _span_any(template, frame, generated)
+
+    assert all(
+        type(value).__name__ == "datetime"
+        for value in generated["consumer_id"]
+    )
+    assert values is not None
+    assert values.tolist() == [0.0, 1.0, 0.0, 1.0]
+
+
+def test_span_runtime_null_saturates_extrapolated_end():
+    times = np.array([
+        pd.Timestamp.max.value - pd.Timedelta("1min").value,
+        pd.Timestamp.max.value,
+    ], dtype=np.int64).view("datetime64[ns]")
+    relation = pd.DataFrame({
+        "span_start": pd.Series(dtype="datetime64[ns]"),
+        "span_end": pd.Series(dtype="datetime64[ns]"),
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="event",
+        relation="events",
+        column="",
+        mode="span_any",
+        parent_keys=(),
+        child_keys=(),
+        partition_keys=(),
+        parent_time="timestamp",
+        child_time="",
+        window_seconds=60,
+        span_start="span_start",
+        span_end="span_end",
+    )
+
+    generated = _runtime_relation_null(
+        relation,
+        [template],
+        {"timestamp": times},
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+
+    assert generated["span_start"].iloc[0] == pd.Timestamp.max
+    assert generated["span_end"].iloc[0] == pd.Timestamp.max
+
+
+def test_materialized_and_streaming_use_identical_sum_order():
+    n_minutes = 120
+    parent_times = pd.date_range(
+        "2026-01-01",
+        periods=n_minutes,
+        freq="1min",
+    )
+    rows = []
+    increments = [1e16, *([1.0] * 15)]
+    for shard_index, increment in enumerate(increments):
+        counter = 0.0
+        for timestamp in parent_times + pd.Timedelta("10s"):
+            counter += increment
+            rows.append({
+                "timestamp": timestamp,
+                "consumer_id": "consumer",
+                "shard_id": f"shard-{shard_index:02d}",
+                "collector_input_counted": counter,
+                "presenter_output_counted": counter,
+                "reset_flag": False,
+            })
+    raw = pd.DataFrame(rows)
+    derived = pd.DataFrame({
+        "timestamp": parent_times,
+        "consumer_id": "consumer",
+        "minute_index": np.arange(n_minutes),
+        "input_rate_bytes_per_min": np.nan,
+    })
+    prepared = prepare_gtib(derived, raw)
+    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]
+    materialized_dataset, _grammar = build_dataframe_grammar(
+        prepared,
+        _base_spec(),
+        name="ordered_materialized_sum",
+    )
+    materialized = eval_term(
+        A.Agg("SUM", "shard_input_increment"),
+        "record",
+        {},
+        materialized_dataset.observed,
+        materialized_dataset.name_model,
+    )
+    streaming_frame = prepared.drop(columns=family)
+    streaming_frame.attrs = prepared.attrs
+    streaming_dataset, _grammar = build_dataframe_grammar(
+        streaming_frame,
+        _base_spec(),
+        name="ordered_streaming_sum",
+    )
+    streaming = eval_term(
+        A.RelatedAgg("raw_input_rate"),
+        "record",
+        {},
+        streaming_dataset.observed,
+        streaming_dataset.name_model,
+    )
+
+    assert materialized is not None and streaming is not None
+    assert np.array_equal(materialized, streaming, equal_nan=True)
 
 
 def test_related_aggregates_scale_to_multi_day_child_history():

@@ -150,6 +150,16 @@ def _blowup(result, *inputs):
     return bad
 
 
+def _pairwise_row_sum(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
+    """Use NumPy's deterministic row reduction and report finite-member overflow."""
+    matrix = np.asarray(matrix, dtype=float)
+    with np.errstate(over="ignore", invalid="ignore"):
+        output = matrix.sum(axis=1)
+    finite_members = np.all(np.isfinite(matrix), axis=1)
+    overflow = ~np.isfinite(output) & finite_members
+    return output, (overflow if overflow.any() else None)
+
+
 def _shift_overflow(mask, steps: int, frame: Frame, nm: NameModel):
     """Carry an overflow mask through a lag, so a blown-up row still taints its shifted reader."""
     if mask is None:
@@ -241,20 +251,26 @@ def _eval_term_uncached(term: A.Term, binder: str, binding: dict, frame: Frame,
         finite_members = np.all(np.isfinite(mat), axis=1)
         with np.errstate(over="ignore", invalid="ignore"):
             if term.kind == "SUM":
-                out = mat.sum(axis=1)
+                out, reduction_overflow = _pairwise_row_sum(mat)
             elif term.kind == "AVG":
                 out = mat.mean(axis=1)
+                reduction_overflow = None
             elif term.kind == "MIN":
                 out = mat.min(axis=1)
+                reduction_overflow = None
             else:
                 out = mat.max(axis=1)
+                reduction_overflow = None
         # SUM and AVG can return ``NaN`` from finite members when an intermediate partial sum
         # overflows and then cancels, so every non-finite result counts; MIN and MAX cannot.
         blown = (
             ~np.isfinite(out) if term.kind in ("SUM", "AVG") else np.isinf(out)
         )
-        overflow = blown & finite_members
-        return out, (overflow if overflow.any() else None)
+        overflow = _union_overflow(
+            reduction_overflow,
+            blown & finite_members,
+        )
+        return out, overflow
     if isinstance(term, A.Mul):
         left, left_overflow = eval_term_overflow(term.left, binder, binding, frame, nm)
         right, right_overflow = eval_term_overflow(term.right, binder, binding, frame, nm)
@@ -325,19 +341,8 @@ def _eval_term_uncached(term: A.Term, binder: str, binding: dict, frame: Frame,
 
 
 def _time_vector(frame: Frame, time_index: str) -> np.ndarray:
-    """Return the time column as a sortable vector, parsing string dates to datetimes.
-
-    Generic string timestamps (e.g. non-ISO ``MM/DD/YYYY``) would otherwise sort lexicographically
-    and corrupt lag/rolling order; coercing to datetime restores chronological order, and a value
-    that cannot be parsed falls back to its raw form so nothing is worse than before.
-    """
-    times = np.asarray(frame.row_context[time_index])
-    if times.dtype == object or times.dtype.kind in ("U", "S"):
-        try:
-            times = pd.to_datetime(times).to_numpy()
-        except (ValueError, TypeError):
-            pass
-    return times
+    """Return checked nanoseconds so ordering and cadence share one interpretation."""
+    return _datetime_ns(frame.row_context[time_index])
 
 
 _MISSING_GROUP = "__missing__"
@@ -1039,7 +1044,7 @@ def _child_partition_index(template, frame: Frame, child):
     else:
         grouped = [((), np.arange(len(child), dtype=int))]
     by_parent: dict[tuple, list[dict]] = {}
-    for raw_key, raw_positions in grouped:
+    for sum_index, (raw_key, raw_positions) in enumerate(grouped):
         parent_key = tuple(raw_key[:len(template.child_keys)])
         positions = np.asarray(raw_positions, dtype=int)
         times = child_times[positions]
@@ -1052,6 +1057,7 @@ def _child_partition_index(template, frame: Frame, child):
             "times": times[order],
             "values": {},
             "reset_prefix": {},
+            "sum_index": sum_index,
         })
     frame.related_index_cache[cache_key] = by_parent
     return by_parent
@@ -1161,6 +1167,10 @@ def _related_aggregate(template, frame: Frame):
 
     parent_times, parent_groups = _parent_time_index(template, frame)
     child_partitions = _child_partition_index(template, frame, child)
+    total_partitions = sum(
+        len(partitions)
+        for partitions in child_partitions.values()
+    )
     output = np.full(frame.n_rows, np.nan, dtype=float)
     overflow = np.zeros(frame.n_rows, dtype=bool)
     window_ns = int(pd.Timedelta(seconds=int(template.window_seconds)).value)
@@ -1182,7 +1192,10 @@ def _related_aggregate(template, frame: Frame):
             continue
         starts = parent_times[ordered_parent]
         ends, ends_saturated = _saturating_add_ns(starts, window_ns)
-        totals = np.zeros(len(ordered_parent), dtype=float)
+        contribution_matrix = np.zeros(
+            (len(ordered_parent), total_partitions),
+            dtype=float,
+        )
         complete = np.ones(len(ordered_parent), dtype=bool)
         any_valid = np.zeros(len(ordered_parent), dtype=bool)
         blown = np.zeros(len(ordered_parent), dtype=bool)
@@ -1221,10 +1234,10 @@ def _related_aggregate(template, frame: Frame):
                 # then looked complete while quietly under-counting.
                 complete &= partition_valid
                 any_valid |= partition_valid
-                with np.errstate(over="ignore", invalid="ignore"):
-                    accumulated = totals + contribution
-                blown |= ~np.isfinite(accumulated) & np.isfinite(totals) & np.isfinite(contribution)
-                totals = accumulated
+                contribution_matrix[
+                    :,
+                    int(partition["sum_index"]),
+                ] = contribution
                 continue
             prior_boundaries = (
                 np.searchsorted(times, starts, side="left") - 1
@@ -1290,10 +1303,18 @@ def _related_aggregate(template, frame: Frame):
             # branch is all-or-nothing.
             complete &= coverage
             any_valid |= partition_valid
-            with np.errstate(over="ignore", invalid="ignore"):
-                accumulated = totals + contribution
-            blown |= ~np.isfinite(accumulated) & np.isfinite(totals) & np.isfinite(contribution)
-            totals = accumulated
+            contribution_matrix[
+                :,
+                int(partition["sum_index"]),
+            ] = contribution
+        if total_partitions:
+            totals, reduction_overflow = _pairwise_row_sum(
+                contribution_matrix
+            )
+            if reduction_overflow is not None:
+                blown |= reduction_overflow
+        else:
+            totals = np.zeros(len(ordered_parent), dtype=float)
         accepted = complete & any_valid
         output[ordered_parent[accepted]] = totals[accepted]
         overflow[ordered_parent[blown]] = True
