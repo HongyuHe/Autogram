@@ -16,10 +16,11 @@ from autogram.discovery.validate import (
 from autogram.discovery import synth
 from autogram.discovery.propose import EnumerationProposer, normalize_rule
 from autogram.dsl import ast as A
-from autogram.dsl.evaluate import eval_term
+from autogram.dsl.evaluate import _span_any, eval_term, typed_group_key
 from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
 from autogram.loader.gtib import AUTOGRAM_PROFILE_ATTR, prepare_gtib, profile_dataframe
+from autogram.loader.loader import Frame
 from autogram.logic.solver import atom_expr
 from autogram.schema.spec import (
     CellCodec,
@@ -339,6 +340,118 @@ def test_empty_event_filter_matches_no_spans():
     )
 
     assert values.tolist() == [0.0, 0.0]
+
+
+def test_span_filters_and_cache_keys_preserve_typed_identity():
+    parent_times = pd.to_datetime([
+        "2026-01-01 00:00:00",
+        "2026-01-01 00:02:00",
+    ])
+    frame = Frame(
+        np.empty((2, 0), dtype=float),
+        [],
+        row_context={
+            "timestamp": parent_times.to_numpy(),
+            "consumer_id": np.array(["c", "c"], dtype=object),
+        },
+    )
+    filter_values = np.empty(2, dtype=object)
+    filter_values[0] = True
+    filter_values[1] = 1
+    child = pd.DataFrame({
+        "consumer_id": ["c", "c"],
+        "type": pd.Series(filter_values, dtype=object),
+        "span_start": pd.to_datetime([
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:02:00",
+        ]),
+        "span_end": pd.to_datetime([
+            "2026-01-01 00:01:00",
+            "2026-01-01 00:03:00",
+        ]),
+    })
+
+    def template(value):
+        return RelatedTemplate(
+            binder="record",
+            role=f"event_{type(value).__name__}",
+            relation="events",
+            column="",
+            mode="span_any",
+            parent_keys=("consumer_id",),
+            child_keys=("consumer_id",),
+            partition_keys=(),
+            parent_time="timestamp",
+            child_time="",
+            window_seconds=60,
+            span_start="span_start",
+            span_end="span_end",
+            filter_column="type",
+            filter_values=(value,),
+        )
+
+    true_values = _span_any(template(True), frame, child)
+    one_values = _span_any(template(1), frame, child)
+
+    assert true_values is not None and one_values is not None
+    assert true_values.tolist() == [1.0, 0.0]
+    assert one_values.tolist() == [0.0, 1.0]
+
+
+def test_span_runtime_null_preserves_typed_consumers():
+    consumers = np.empty(4, dtype=object)
+    consumers[:2] = True
+    consumers[2:] = 1
+    times = pd.to_datetime([
+        "2026-01-01 00:00:00",
+        "2026-01-01 00:01:00",
+        "2026-01-01 00:00:00",
+        "2026-01-01 00:01:00",
+    ]).to_numpy()
+    relation = pd.DataFrame({
+        "consumer_id": pd.Series(dtype=object),
+        "type": pd.Series(dtype=object),
+        "span_start": pd.Series(dtype="datetime64[ns]"),
+        "span_end": pd.Series(dtype="datetime64[ns]"),
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="event",
+        relation="events",
+        column="",
+        mode="span_any",
+        parent_keys=("consumer_id",),
+        child_keys=("consumer_id",),
+        partition_keys=(),
+        parent_time="timestamp",
+        child_time="",
+        window_seconds=60,
+        span_start="span_start",
+        span_end="span_end",
+        filter_column="type",
+        filter_values=("event",),
+    )
+
+    generated = _runtime_relation_null(
+        relation,
+        [template],
+        {
+            "timestamp": times,
+            "consumer_id": consumers,
+        },
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+
+    identities = {
+        typed_group_key(value)
+        for value in generated["consumer_id"].tolist()
+    }
+    assert identities == {
+        typed_group_key(True),
+        typed_group_key(1),
+    }
+    assert len(generated) == 2
 
 
 def test_related_aggregates_scale_to_multi_day_child_history():

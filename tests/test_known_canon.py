@@ -4,8 +4,18 @@ from __future__ import annotations
 
 import numpy as np
 
+from autogram.dsl import ast as A
+from autogram.dsl.evaluate import typed_group_key
 from autogram.loader.loader import Frame
-from autogram.discovery.known import _canonicalize, _drop_negligible
+from autogram.discovery.known import (
+    _canonicalize,
+    _drop_negligible,
+    _known_condition_signature,
+)
+from autogram.discovery.validate import (
+    _condition_signature,
+    relation_signature_matches,
+)
 
 
 def _frame():
@@ -60,6 +70,40 @@ def test_non_sum_signatures_pass_through_unchanged():
     f = _frame()
     for sig in [("pair", frozenset({"a", "b"})), ("zero", "a"), ("one_sided", "a", ">=")]:
         assert _canonicalize(sig, f, 1e-4) == sig
+
+
+def test_typed_categorical_signatures_are_stable_and_distinct():
+    known_true = _known_condition_signature({"kind": True})
+    known_one = _known_condition_signature({"kind": 1})
+    learned_true = _condition_signature(
+        A.Condition("kind", "==", (True,))
+    )
+    learned_one = _condition_signature(
+        A.Condition("kind", "==", (1,))
+    )
+
+    assert known_true == learned_true
+    assert known_one == learned_one
+    assert known_true != known_one
+    assert len({known_true, known_one}) == 2
+
+    known_membership = _known_condition_signature({
+        "kind_in": ["1", 1],
+    })
+    learned_membership = _condition_signature(
+        A.Condition("kind", "in", (1, "1"))
+    )
+    assert known_membership == learned_membership
+
+    float_category = (
+        "categorical_definition",
+        ("label", (("flag", typed_group_key(1.0)),), typed_group_key("none")),
+    )
+    int_category = (
+        "categorical_definition",
+        ("label", (("flag", typed_group_key(1)),), typed_group_key("none")),
+    )
+    assert not relation_signature_matches(float_category, int_category)
 
 
 def _bimodal_frame():

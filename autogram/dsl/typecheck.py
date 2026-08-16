@@ -19,6 +19,7 @@ role table -- this is what lets genuinely new roles (invented for a fresh datase
 from __future__ import annotations
 
 from . import ast as A
+from .evaluate import typed_binary_domain, typed_group_key
 
 
 def _roles_ok(term: A.Term, binder: str, G) -> bool:
@@ -231,13 +232,20 @@ def is_admissible(rule: A.Rule, G) -> tuple:
                 return False, "condition must contain at least one value"
             if len(condition.values) > int(getattr(G, "max_condition_values", 4)):
                 return False, "condition exceeds the value cap"
-            allowed_values = set(allowed[condition.column])
-            if any(value not in allowed_values for value in condition.values):
+            allowed_values = {
+                typed_group_key(value)
+                for value in allowed[condition.column]
+            }
+            condition_values = {
+                typed_group_key(value)
+                for value in condition.values
+            }
+            if not condition_values <= allowed_values:
                 return False, "condition value is not observed for the declared column"
             if condition.op == "==" and len(condition.values) != 1:
                 return False, "equality condition requires exactly one value"
             if condition.op == "in" and not (
-                2 <= len(condition.values) < len(allowed_values)
+                2 <= len(condition_values) < len(allowed_values)
             ):
                 return False, "membership condition requires a proper multi-value subset"
     if isinstance(atom, A.BooleanDefinition):
@@ -263,14 +271,18 @@ def is_admissible(rule: A.Rule, G) -> tuple:
         columns = getattr(G, "condition_columns", {})
         if atom.target_column not in columns:
             return False, "categorical target column is not declared"
-        if atom.default not in set(columns[atom.target_column]):
+        target_values = {
+            typed_group_key(value)
+            for value in columns[atom.target_column]
+        }
+        if typed_group_key(atom.default) not in target_values:
             return False, "categorical default is not an observed target value"
         if not atom.cases:
             return False, "categorical definition needs at least one case"
         for column, value in atom.cases:
-            if column not in columns or set(columns[column]) - {False, True, 0, 1}:
+            if column not in columns or not typed_binary_domain(columns[column]):
                 return False, "categorical cases must use declared Boolean columns"
-            if value not in set(columns[atom.target_column]):
+            if typed_group_key(value) not in target_values:
                 return False, "categorical case emits an unknown target value"
         if rule.complexity() > G.complexity_cap(rule.binder):
             return False, "exceeds max complexity"

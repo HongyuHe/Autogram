@@ -13,6 +13,7 @@ tolerance band, reads the operating coverage, and runs the acceptance tests.
 from __future__ import annotations
 
 import math
+import numbers
 from dataclasses import dataclass
 
 import numpy as np
@@ -338,6 +339,23 @@ def _time_vector(frame: Frame, time_index: str) -> np.ndarray:
 _MISSING_GROUP = "__missing__"
 
 
+def is_missing_scalar(value) -> bool:
+    """Whether one scalar is a missing categorical/group value.
+
+    Covers Python/NumPy NaNs, ``pd.NA``, ``NaT``, and ``None`` without treating a tuple/composite
+    key as a vector of missingness flags.
+    """
+    if value is None:
+        return True
+    if isinstance(value, tuple):
+        return False
+    try:
+        result = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(result, (bool, np.bool_)) and bool(result)
+
+
 def typed_group_key(label):
     """Identity of a group label that Python's ``==``/hashing does not collapse.
 
@@ -352,9 +370,7 @@ def typed_group_key(label):
     """
     if isinstance(label, tuple):
         return ("tuple", tuple(typed_group_key(item) for item in label))
-    if label is None:
-        return ("missing", _MISSING_GROUP)
-    if isinstance(label, float) and label != label:
+    if is_missing_scalar(label):
         return ("missing", _MISSING_GROUP)
     return (type(label).__name__, label)
 
@@ -382,6 +398,44 @@ def typed_unique(values, *, drop_missing: bool = False) -> tuple:
 def typed_equal(left, right) -> bool:
     """Type-sensitive scalar equality, recursive through tuple values."""
     return typed_group_key(left) == typed_group_key(right)
+
+
+def typed_binary_domain(values) -> bool:
+    """Whether a typed domain is one Boolean/numeric-binary scalar type."""
+    unique = typed_unique(values, drop_missing=True)
+    if not unique:
+        return False
+    kinds = {typed_group_key(value)[0] for value in unique}
+    if len(kinds) != 1:
+        return False
+    return all(
+        isinstance(value, numbers.Real)
+        and float(value) in (0.0, 1.0)
+        for value in unique
+    )
+
+
+def typed_condition_key(condition: A.Condition | None):
+    """Canonical condition identity for solver, archive, and signatures."""
+    if condition is None:
+        return None
+    if condition.op == "all":
+        children = tuple(sorted(
+            (
+                typed_condition_key(child)
+                for child in condition.values
+                if isinstance(child, A.Condition)
+            ),
+            key=str,
+        ))
+        return ("all", children)
+    values = tuple(
+        sorted(
+            (typed_group_key(value) for value in condition.values),
+            key=typed_sort_key,
+        )
+    )
+    return (condition.column, condition.op, values)
 
 
 def typed_sort_key(typed):
@@ -1223,13 +1277,27 @@ def _span_child_index(template, frame: Frame, child):
 def _span_prefix_max_end(group: dict, template, child) -> np.ndarray:
     cache_key = (
         template.filter_column,
-        tuple(template.filter_values),
+        tuple(
+            sorted(
+                (typed_group_key(value) for value in template.filter_values),
+                key=typed_sort_key,
+            )
+        ),
     )
     if cache_key not in group["prefix_max_end"]:
         if template.filter_column:
-            eligible = child.iloc[group["positions"]][
+            allowed = set(cache_key[1])
+            filter_values = child.iloc[group["positions"]][
                 template.filter_column
-            ].isin(template.filter_values).to_numpy(dtype=bool)
+            ].to_numpy(dtype=object)
+            eligible = np.fromiter(
+                (
+                    typed_group_key(value) in allowed
+                    for value in filter_values
+                ),
+                dtype=bool,
+                count=filter_values.size,
+            )
         else:
             eligible = np.ones(len(group["positions"]), dtype=bool)
         filtered_ends = np.where(eligible, group["ends"], _NAT_NS)

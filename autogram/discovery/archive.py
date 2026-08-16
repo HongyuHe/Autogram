@@ -11,6 +11,7 @@ from typing import Dict, List
 
 from .evaluate import Evaluation
 from ..dsl import ast as A
+from ..dsl.evaluate import typed_condition_key
 from ..logic.solver import (
     equivalent,
     legacy_equivalent,
@@ -127,7 +128,10 @@ def _cross_condition_subsumption_ok(keeper: Evaluation, candidate: Evaluation) -
     conditioned refinement, which carries strictly more information. When the conditions match this
     guard is irrelevant and ordinary same-condition subsumption applies.
     """
-    if keeper.rule.condition == candidate.rule.condition:
+    if (
+        typed_condition_key(keeper.rule.condition)
+        == typed_condition_key(candidate.rule.condition)
+    ):
         return True
     if keeper.rule.condition is not None:
         # A conditioned keeper cannot tautologically subsume a rule with a different condition.
@@ -372,7 +376,10 @@ class ParetoArchive:
         for sig, cur in list(
             self.cell_index.get(cell_key, {}).items()
         ):
-            if cur.rule.condition != ev.rule.condition:
+            if (
+                typed_condition_key(cur.rule.condition)
+                != typed_condition_key(ev.rule.condition)
+            ):
                 # An unconditional law logically subsumes a conditioned law with the same
                 # atom + fitted semantics ONLY when it holds at least as strongly: if the
                 # unconditional rule holds everywhere (hold-rate >= the conditioned rule's),
@@ -402,7 +409,10 @@ class ParetoArchive:
                 cur_bound is not None
                 and ev_bound is not None
                 and cur_bound[0] == ev_bound[0]
-                and cur.rule.condition == ev.rule.condition
+                and (
+                    typed_condition_key(cur.rule.condition)
+                    == typed_condition_key(ev.rule.condition)
+                )
             ):
                 # Between a strict (``x > 0``) and a non-strict (``x >= 0``) bound in the same
                 # direction, keep the STRICT one: it entails the non-strict, so the survivor covers

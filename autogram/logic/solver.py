@@ -178,7 +178,9 @@ def _valid(expr: z3.BoolRef) -> bool:
 
 
 def _condition_expr(condition: A.Condition, env: Dict[Tuple, z3.ArithRef]) -> z3.BoolRef:
-    key = ("condition", condition.column, condition.op, tuple(condition.values))
+    from ..dsl.evaluate import typed_condition_key
+
+    key = ("condition", typed_condition_key(condition))
     if key not in env:
         env[key] = z3.Bool(_var_name(key))
     return env[key]

@@ -25,6 +25,7 @@ from ..dsl.evaluate import (
     eval_term_overflow,
     ground,
     robust_median,
+    typed_group_key,
 )
 from ..dsl.typecheck import _has_boolean_ref
 from ..evaluator.band import fit_band_auto, violation_magnitude
@@ -145,25 +146,8 @@ GLOBAL_GROUP = _GlobalGroup()
 
 
 def _typed_label(label):
-    """Identity of a group label that Python's ``==``/hashing does not collapse.
-
-    ``True == 1`` and ``hash(True) == hash(1)``, so a plain dict keyed by group label silently
-    merges two genuinely different groups: one group's fitted coefficient replaces the other's, and
-    the accepted per-group law can no longer be audited. Qualifying by type keeps them apart while
-    leaving the label itself available for display.
-
-    Applied RECURSIVELY through tuples, because a composite group key ``(True, "x")`` and
-    ``(1, "x")`` compare equal and hash alike for exactly the same reason.
-    """
-    if isinstance(label, tuple):
-        return ("tuple", tuple(_typed_label(item) for item in label))
-    if label is None:
-        return ("missing", "__missing__")
-    if isinstance(label, float) and label != label:
-        # ``NaN != NaN``: keeping the raw value would fragment every missing-labelled row into a
-        # group of its own, and a group of one is split entirely into the evaluation half.
-        return ("missing", "__missing__")
-    return (type(label).__name__, label)
+    """Backward-compatible alias for the one shared recursive typed identity."""
+    return typed_group_key(label)
 
 
 def _typed_equal_array(left, right) -> np.ndarray:

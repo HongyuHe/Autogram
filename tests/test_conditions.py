@@ -22,6 +22,7 @@ from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
 from autogram.loader.gtib import profile_dataframe
 from autogram.logic.solver import is_trivial
+from autogram.logic.solver import equivalent
 from autogram.schema.spec import CellCodec, ColumnPattern, GrammarSpec, RoleOntology
 
 
@@ -123,6 +124,60 @@ def test_condition_domains_and_masks_preserve_typed_identity():
     assert in_mask is not None
     assert int(np.count_nonzero(in_mask)) == 80
     assert not np.any(in_mask & masks[1])
+
+
+def test_nullable_string_condition_domain_drops_all_missing_scalars():
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "kind": pd.Series(["a", pd.NA, "b", None], dtype="string"),
+            "x": np.arange(4, dtype=float),
+        }),
+        condition_columns=("kind",),
+    )
+    _dataset, grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="nullable_string_condition",
+    )
+
+    assert grammar.condition_columns["kind"] == ("a", "b")
+    # Most importantly, proposal does not try to hash/sort pd.NA.
+    list(EnumerationProposer(grammar).propose())
+
+
+def test_solver_and_membership_enumeration_preserve_typed_conditions():
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=",),
+        ref_roles={"record": ("x", "y")},
+        fam_roles={"record": ()},
+        condition_columns={"kind": (True, 1, "1")},
+        max_condition_values=3,
+        conditional_enabled=True,
+    )
+    true_rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("x"), "~=", A.Ref("y")),
+        condition=A.Condition("kind", "==", (True,)),
+    )
+    one_rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("x"), "~=", A.Ref("y")),
+        condition=A.Condition("kind", "==", (1,)),
+    )
+    membership = A.Rule(
+        "record",
+        A.Compare(A.Ref("x"), "~=", A.Ref("y")),
+        condition=A.Condition("kind", "in", (True, 1)),
+    )
+
+    assert not equivalent(true_rule, one_rule)
+    assert is_admissible(membership, grammar)[0]
+    proposed = {
+        normalize_rule(rule).signature()
+        for rule in EnumerationProposer(grammar).propose()
+    }
+    assert normalize_rule(membership).signature() in proposed
 
 
 def test_condition_round_trip_typecheck_and_solver_antecedent():
@@ -631,7 +686,7 @@ def test_conditional_known_membership_preserves_scalar_types():
     assert _known_condition_signature({"code_in": [1, 2]}) == (
         "code",
         "in",
-        (1, 2),
+        (typed_group_key(1), typed_group_key(2)),
     )
 
     known = [
@@ -646,7 +701,11 @@ def test_conditional_known_membership_preserves_scalar_types():
     assert _signature(known[0]) == (
         "conditional",
         (
-            ("code", "in", (1, 2)),
+            (
+                "code",
+                "in",
+                (typed_group_key(1), typed_group_key(2)),
+            ),
             ("delta_bound", ("loss", 1, ">=")),
         ),
     )
@@ -658,7 +717,11 @@ def test_conditional_known_membership_preserves_scalar_types():
     learned = (
         "conditional",
         (
-            ("code", "in", (1, 2)),
+            (
+                "code",
+                "in",
+                (typed_group_key(1), typed_group_key(2)),
+            ),
             ("delta_bound", ("loss", 1, ">=")),
         ),
     )

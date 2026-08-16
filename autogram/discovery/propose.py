@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import itertools
-import numbers
 from typing import Dict, List, Sequence
 
 from ..dsl import ast as A
-from ..dsl.evaluate import typed_group_key, typed_unique
+from ..dsl.evaluate import (
+    typed_binary_domain,
+    typed_group_key,
+    typed_sort_key,
+    typed_unique,
+)
 from ..dsl.grammar import Grammar
 from ..dsl.typecheck import is_admissible
 from ..logic.solver import is_trivial, legacy_is_trivial
@@ -24,27 +28,6 @@ class SearchSpaceTruncatedError(RuntimeError):
 # columns are categorical/Boolean with small domains; a candidate space beyond this is a declaration
 # error (a continuous column mislabelled as a condition), so fail loud rather than exhaust memory.
 _MAX_CONDITION_CANDIDATES = 1_000_000
-
-
-def _binary_condition_domain(values) -> bool:
-    """Whether one typed condition domain represents a Boolean/binary column.
-
-    A mixed domain such as ``(True, 1)`` is categorical: the values compare equal in Python but are
-    distinct under Autogram's categorical identity, and classifying it as Boolean would erase that
-    distinction before category-definition enumeration.
-    """
-    unique = typed_unique(values)
-    if not unique:
-        return False
-    kinds = {typed_group_key(value)[0] for value in unique}
-    if len(kinds) != 1:
-        return False
-    return all(
-        isinstance(value, numbers.Real)
-        and not isinstance(value, complex)
-        and float(value) in (0.0, 1.0)
-        for value in unique
-    )
 
 
 def _term_key(t: A.Term) -> str:
@@ -131,7 +114,10 @@ def _normalize_condition(condition):
         return A.Condition(
             condition.column,
             condition.op,
-            tuple(sorted(condition.values, key=str)),
+            tuple(sorted(
+                condition.values,
+                key=lambda value: typed_sort_key(typed_group_key(value)),
+            )),
         )
     if condition.op != "all":
         return condition
@@ -788,12 +774,12 @@ class EnumerationProposer:
         bool_columns = [
             column
             for column, values in conditions.items()
-            if _binary_condition_domain(values)
+            if typed_binary_domain(values)
         ]
         category_columns = [
             column
             for column, values in conditions.items()
-            if values and not _binary_condition_domain(values)
+            if values and not typed_binary_domain(values)
         ]
         for target_column in category_columns:
             target_values = tuple(conditions[target_column])
@@ -833,7 +819,7 @@ class EnumerationProposer:
         categorical_columns = {
             column
             for column, values in self.G.condition_columns.items()
-            if values and not _binary_condition_domain(values)
+            if values and not typed_binary_domain(values)
         }
         total = 0
         simple_per_column = []
@@ -876,7 +862,12 @@ class EnumerationProposer:
                     out.append(A.Condition(
                         column,
                         "in",
-                        tuple(sorted(subset, key=str)),
+                        tuple(sorted(
+                            subset,
+                            key=lambda value: typed_sort_key(
+                                typed_group_key(value)
+                            ),
+                        )),
                     ))
         simple = [
             condition for condition in out

@@ -31,7 +31,11 @@ import numpy as np
 
 from ..dsl import ast as A
 from ..dsl.binders import enumerate_bindings, resolve_ref
-from ..dsl.evaluate import eval_term
+from ..dsl.evaluate import (
+    eval_term,
+    typed_group_key,
+    typed_sort_key,
+)
 from .loop import DiscoveryResult
 from .validate import (
     _equality_relation,
@@ -130,12 +134,15 @@ def _base_signature(inv: KnownInvariant):
                 return ("conjunction_definition", (lhs, predicates))
         if "priority" in rhs:
             cases = tuple(
-                (str(item["when"]), item["value"])
+                (
+                    str(item["when"]),
+                    typed_group_key(item["value"]),
+                )
                 for item in rhs["priority"]
             )
             return (
                 "categorical_definition",
-                (lhs, cases, rhs.get("default")),
+                (lhs, cases, typed_group_key(rhs.get("default"))),
             )
     if (
         op in (">=", "<=", ">", "<")
@@ -217,12 +224,12 @@ def _known_condition_signature(where):
         return None if any(child is None for child in children) else ("all", children)
     if key.endswith("_in"):
         column = key[:-3]
-        # Preserve the declared scalar types (e.g. integer category codes): the learned rule's
-        # membership values keep their observed dtype, so stringifying here would prevent a valid
-        # int/float membership known from ever matching. Sort by string only for a stable order.
-        values = tuple(sorted(value, key=str))
+        values = tuple(sorted(
+            (typed_group_key(item) for item in value),
+            key=typed_sort_key,
+        ))
         return (column, "in", values)
-    return (str(key), "==", (value,))
+    return (str(key), "==", (typed_group_key(value),))
 
 
 def _known_temporal_ref(value, form: str):

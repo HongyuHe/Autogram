@@ -18,7 +18,13 @@ import pandas as pd
 from ..config import DiscoveryConfig, SearchConfig
 from ..dsl import ast as A
 from ..dsl.binders import enumerate_bindings, resolve_family, resolve_ref
-from ..dsl.evaluate import robust_median, typed_unique
+from ..dsl.evaluate import (
+    robust_median,
+    typed_binary_domain,
+    typed_condition_key,
+    typed_group_key,
+    typed_unique,
+)
 from ..loader.loader import Dataset, Frame
 from ..schema.spec import RelatedTemplate
 from . import synth as S
@@ -88,8 +94,11 @@ def _operand_sig(rule, binder, binding, nm, parameters=None):
                 "categorical_definition",
                 (
                     rule.atom.target_column,
-                    tuple(rule.atom.cases),
-                    rule.atom.default,
+                    tuple(
+                        (column, typed_group_key(value))
+                        for column, value in rule.atom.cases
+                    ),
+                    typed_group_key(rule.atom.default),
                 ),
             ),
         )
@@ -113,20 +122,7 @@ def _operand_sig(rule, binder, binding, nm, parameters=None):
 
 
 def _condition_signature(condition: A.Condition):
-    if condition.op == "all":
-        return (
-            "all",
-            tuple(sorted((
-                _condition_signature(child)
-                for child in condition.values
-                if isinstance(child, A.Condition)
-            ), key=str)),
-        )
-    return (
-        condition.column,
-        condition.op,
-        tuple(sorted(condition.values, key=str)),
-    )
+    return typed_condition_key(condition)
 
 
 def _operand_sig_base(rule, binder, binding, nm):
@@ -966,14 +962,20 @@ def _runtime_relation_null(
             ]
             groups = {}
             for row in range(times.size):
-                key = tuple(array[row] for array in key_arrays)
-                groups.setdefault(key, []).append(row)
+                raw_key = tuple(array[row] for array in key_arrays)
+                key = tuple(typed_group_key(value) for value in raw_key)
+                bucket = groups.setdefault(
+                    key,
+                    {"raw_key": raw_key, "rows": []},
+                )
+                bucket["rows"].append(row)
             filter_value = (
                 template.filter_values[0]
                 if template.filter_values
                 else "__null__"
             )
-            for key, rows in groups.items():
+            for key, bucket in groups.items():
+                rows = bucket["rows"]
                 ordered = sorted(rows, key=lambda row: times[row])
                 for position, row in enumerate(ordered):
                     if not ((position >> template_index) & 1):
@@ -981,7 +983,7 @@ def _runtime_relation_null(
                     signature = (
                         tuple(key),
                         template.filter_column,
-                        filter_value,
+                        typed_group_key(filter_value),
                         template.span_start,
                         template.span_end,
                         times[row],
@@ -995,7 +997,7 @@ def _runtime_relation_null(
                     }
                     for child_key, value in zip(
                         template.child_keys,
-                        key,
+                        bucket["raw_key"],
                     ):
                         record[child_key] = value
                     record[template.span_start] = times[row]
@@ -1085,9 +1087,7 @@ def _runtime_condition_context(
     ordered = sorted(
         domains,
         key=lambda name: (
-            0
-            if set(domains[name]) - {False, True, 0, 1}
-            else 1,
+            0 if not typed_binary_domain(domains[name]) else 1,
             name,
         ),
     )
@@ -1097,9 +1097,7 @@ def _runtime_condition_context(
     rows = np.arange(n_rows, dtype=np.int64)
     for name in ordered:
         values = np.asarray(domains[name], dtype=object)
-        categorical = bool(
-            set(domains[name]) - {False, True, 0, 1}
-        )
+        categorical = not typed_binary_domain(domains[name])
         if categorical:
             indexes = (rows // stride) % len(values)
             stride *= len(values)

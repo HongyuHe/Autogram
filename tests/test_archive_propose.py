@@ -37,6 +37,45 @@ def test_front_is_non_dominated(dataset):
     assert front and all(f.accepted for f in front)
 
 
+def test_archive_keeps_rules_with_typed_distinct_conditions(monkeypatch):
+    """`kind == True` and `kind == 1` are different conditioned laws."""
+    import autogram.discovery.archive as archive_module
+
+    # The condition identity must short-circuit semantic comparison. Patching this seam to report
+    # atom equivalence proves the archive itself does not rely solely on the solver doing the right
+    # thing; raw dataclass equality would enter this branch and discard the second rule.
+    monkeypatch.setattr(archive_module, "equivalent", lambda _left, _right: True)
+
+    def evaluation(condition):
+        return Evaluation(
+            rule=A.Rule(
+                "record",
+                A.Compare(A.Ref("x"), "~=", A.Ref("y")),
+                condition=condition,
+            ),
+            accepted=True,
+            reason="test",
+            eps=0.01,
+            hold_rate=1.0,
+            hold_rate_lo=0.99,
+            hold_rate_hi=1.0,
+            statistic="hold_rate",
+            support=0.5,
+            n_points=100,
+            n_bindings=1,
+            mdl_gain=1.0,
+            strictness="approx",
+            descriptor=("record", 2),
+        )
+
+    archive = ParetoArchive()
+    assert archive.add(evaluation(A.Condition("kind", "==", (True,))))
+    assert archive.add(evaluation(A.Condition("kind", "==", (1,))))
+
+    kept = archive.portfolio(non_redundant=False)
+    assert len(kept) == 2
+
+
 def test_archive_retains_lag_shadow_unless_exact_atomic_suppresses_it(dataset):
     # A lag one-sided sign bound is RETAINED as an independent temporal law unless an EXACT atomic
     # (hold-rate 1.0) proves it redundant: an exact ``x >= 0`` evicts ``LAG_k(x) >= 0`` (which keeps

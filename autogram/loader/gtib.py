@@ -453,14 +453,22 @@ def _materialize_raw(
         for text in plain.values():
             counts[text] = counts.get(text, 0) + 1
         result = {}
-        used = set()
+        # Reserve every ordinary unambiguous spelling first. Otherwise an integer `1` may claim
+        # the qualified name `int:1` before the literal string shard `"int:1"` is visited, forcing
+        # the ordinary string to move even though its spelling was already unique.
+        used = {
+            plain[key]
+            for key in ordered
+            if counts[plain[key]] == 1
+        }
         for key in ordered:
+            if counts[plain[key]] == 1:
+                result[key] = plain[key]
+        for key in ordered:
+            if key in result:
+                continue
             raw_value = raw_by_key[key]
-            base = (
-                plain[key]
-                if counts[plain[key]] == 1
-                else f"{type(raw_value).__name__}:{raw_value!r}"
-            )
+            base = f"{type(raw_value).__name__}:{raw_value!r}"
             candidate = base
             suffix = 2
             while candidate in used:
@@ -551,6 +559,19 @@ def _materialize_raw(
         )
 
     materialized: dict[str, np.ndarray] = {}
+    reserved_columns = {str(column) for column in derived.columns}
+    allocated_columns = set()
+
+    def allocate_column_name(preferred: str) -> str:
+        """A generated column may neither alias another shard nor overwrite source data."""
+        candidate = preferred
+        suffix = 2
+        while candidate in reserved_columns or candidate in allocated_columns:
+            candidate = f"{preferred}#{suffix}"
+            suffix += 1
+        allocated_columns.add(candidate)
+        return candidate
+
     families = {
         "shard_input_increment": [],
         "shard_output_increment": [],
@@ -627,10 +648,26 @@ def _materialize_raw(
                 .reindex(minute_ids)
                 .to_numpy(dtype=float)
             )
-        increments = {
-            counter: np.diff(values, prepend=values[:1])
-            for counter, values in counter_boundaries.items()
-        }
+        increments = {}
+        for counter, values in counter_boundaries.items():
+            previous = np.concatenate((values[:1], values[:-1]))
+            with np.errstate(over="ignore", invalid="ignore"):
+                delta = values - previous
+            overflow = (
+                ~np.isfinite(delta)
+                & np.isfinite(values)
+                & np.isfinite(previous)
+            )
+            if np.any(overflow):
+                raw_consumer = raw_consumer_by_key[consumer_key]
+                raw_shard = raw_shard_by_key[shard_key]
+                minute = int(minute_ids[int(np.flatnonzero(overflow)[0])])
+                raise ValueError(
+                    "GTIB counter subtraction overflowed float64 for "
+                    f"consumer {raw_consumer!r}, shard {raw_shard!r}, "
+                    f"counter {counter!r}, minute {minute}"
+                )
+            increments[counter] = delta
         valid = ~reset_by_minute
         for values in increments.values():
             valid &= np.isfinite(values) & (values >= 0.0)
@@ -647,7 +684,7 @@ def _materialize_raw(
 
         safe_shard = safe_group_names[(consumer_key, shard_key)]
         for counter, suffix in _COUNTERS.items():
-            name = f"{safe_shard}_{suffix}"
+            name = allocate_column_name(f"{safe_shard}_{suffix}")
             # Three-way, mirroring the streaming join. Other consumers' rows stay 0 (this shard
             # contributes nothing there). This consumer's minutes start NaN -- no coverage -- so a
             # minute the shard never reported, or one with no adjacent prior boundary, leaves the
@@ -674,7 +711,7 @@ def _materialize_raw(
         for boundary_col in _BOUNDARY_COLUMNS:
             if boundary_col not in boundaries.columns:
                 continue
-            name = f"{safe_shard}_{boundary_col}"
+            name = allocate_column_name(f"{safe_shard}_{boundary_col}")
             # Rows belonging to OTHER consumers stay 0: this shard genuinely contributes nothing
             # there, which is what makes the family sum per row a sum over that consumer's shards.
             # This consumer's own rows start as NaN -- "no reading" -- so a minute the shard never

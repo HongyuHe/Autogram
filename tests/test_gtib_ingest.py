@@ -263,6 +263,97 @@ def test_materialized_and_streaming_joins_preserve_typed_shard_identity(
     assert np.allclose(streaming[1:], [180.0, 180.0])
 
 
+def test_materialized_names_reserve_literal_ids_and_existing_columns():
+    """Qualified typed names may not steal a literal string ID or overwrite source data."""
+    derived, raw = _tables()
+    first = raw["shard_id"] == "shard_000_0"
+    integer = raw.loc[first].copy()
+    integer["shard_id"] = pd.Series(
+        np.full(len(integer), 1, dtype=object),
+        index=integer.index,
+        dtype=object,
+    )
+    string_one = raw.loc[~first].copy()
+    string_one["shard_id"] = pd.Series(
+        np.full(len(string_one), "1", dtype=object),
+        index=string_one.index,
+        dtype=object,
+    )
+    literal = raw.loc[first].copy()
+    literal["shard_id"] = "int:1"
+    literal[["collector_input_counted", "presenter_output_counted"]] *= 3.0
+    raw = pd.concat([integer, string_one, literal], ignore_index=True)
+    derived = derived.copy()
+    derived["int:1_input_increment"] = 777.0
+    derived["input_rate_bytes_per_min"] = [np.nan, 360.0, 360.0]
+
+    prepared = prepare_gtib(derived, raw)
+    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]
+
+    assert prepared["int:1_input_increment"].tolist() == [777.0] * 3
+    assert "int:1_input_increment" not in family
+    assert len(family) == len(set(family)) == 3
+    assert any(name.startswith("int:1_input_increment#") for name in family)
+    total = prepared[family].sum(axis=1, min_count=3).to_numpy(dtype=float)
+    assert np.allclose(total[1:], [360.0, 360.0])
+
+
+def test_missing_consumer_identity_agrees_between_materialized_and_streaming():
+    """``pd.NA`` and ``None`` denote the same missing consumer on both join paths."""
+    derived, raw = _tables()
+    derived = derived.copy()
+    raw = raw.copy()
+    derived["consumer_id"] = pd.Series(
+        [pd.NA] * len(derived),
+        dtype=object,
+    )
+    raw["consumer_id"] = pd.Series(
+        [None] * len(raw),
+        dtype=object,
+    )
+
+    prepared = prepare_gtib(derived, raw)
+    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]
+    materialized = prepared[family].sum(
+        axis=1,
+        min_count=len(family),
+    ).to_numpy(dtype=float)
+    streaming_frame = prepared.drop(columns=family)
+    streaming_frame.attrs = prepared.attrs
+    dataset, _grammar = build_dataframe_grammar(
+        streaming_frame,
+        _base_spec(),
+        name="missing_consumer_streaming",
+    )
+    streaming = eval_term(
+        A.RelatedAgg("raw_input_rate"),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert streaming is not None
+    assert np.array_equal(materialized, streaming, equal_nan=True)
+
+
+def test_materialization_fails_loudly_on_finite_counter_subtraction_overflow():
+    """A finite subtraction overflow cannot be hidden as an invalid zero contribution."""
+    derived, raw = _tables()
+    raw = raw.copy()
+    shard = raw["shard_id"] == "shard_000_0"
+    minute_zero = raw["timestamp"] < pd.Timestamp("2026-01-01 00:01:00")
+    raw.loc[shard & minute_zero, "collector_input_counted"] = -1.5e308
+    raw.loc[shard & ~minute_zero, "collector_input_counted"] = 1.5e308
+
+    with pytest.raises(ValueError, match="counter subtraction overflowed"):
+        prepare_gtib(derived, raw)
+
+
 def test_materialization_preserves_original_minute_indices_after_slice():
     derived, raw = _tables()
     sliced = derived.loc[derived["minute_index"].isin([1, 2])].copy()
