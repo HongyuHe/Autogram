@@ -124,6 +124,8 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
     # intentionally planted; row/column sums below always use off-diagonal demand, matching the
     # induced family selectors and avoiding accidental self-zero recovery in single-family runs.
     D = rng.gamma(shape=2.0, scale=10.0, size=(T, N, N))
+    if "sum_balance" in enabled:
+        D = 0.5 * (D + np.swapaxes(D, 1, 2))
     if "self_zero" in enabled:
         for i in range(N):
             D[:, i, i] = 0.0
@@ -138,6 +140,21 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
         L[:, i, i] = 0.0
     if "two_end" in enabled:
         Lfrm = L.copy()
+    elif "conditional_pair" in enabled:
+        pair_regime = np.resize(
+            np.array(["paired", "other"], dtype=object),
+            T,
+        )
+        independent_links = rng.gamma(
+            shape=2.0,
+            scale=8.0,
+            size=(T, N, N),
+        )
+        Lfrm = np.where(
+            (pair_regime == "paired")[:, None, None],
+            L,
+            independent_links,
+        )
     elif "offset_pair" in enabled:
         Lfrm = L.copy()
         n_clean = int(round(min(max(offset_hold_rate, 0.0), 1.0) * T))
@@ -199,6 +216,13 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
             1.7 * term,
             independent,
         )
+    if "conditional_pair" in enabled:
+        independent = rng.gamma(shape=2.0, scale=10.0, size=(T, N))
+        orig = np.where(
+            (pair_regime == "paired")[:, None],
+            term,
+            independent,
+        )
     if "monotone" in enabled:
         orig = np.cumsum(rng.uniform(1.0, 3.0, size=(T, N)), axis=0)
     if "windowed_ratio" in enabled:
@@ -218,6 +242,8 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
     proxy_timestamps = None
     if "conditional_proportional" in enabled:
         row_context["regime"] = regime
+    if "conditional_pair" in enabled:
+        row_context["regime"] = pair_regime
     if enabled & {"conditional_positive", "conditional_zero"}:
         regime = np.resize(
             np.array(["positive", "zero", "other"], dtype=object),
@@ -578,6 +604,7 @@ def _planted(vocab: Vocab, ents, N, temporal_window: int = 5) -> Dict[str, objec
     conditional_positive = set()
     conditional_zero = set()
     conditional_proportional = set()
+    conditional_pair = set()
     sustained = set()
     conjunction = set()
     cross_grain = set()
@@ -607,12 +634,7 @@ def _planted(vocab: Vocab, ents, N, temporal_window: int = 5) -> Dict[str, objec
             1,
             ">=",
         ))
-        sum_balance.add(frozenset({
-            frozenset({
-                f"{vocab.measurement}_{ents[i]}_{vocab.source}",
-            }),
-            frozenset(row),
-        }))
+        sum_balance.add(frozenset({row, col}))
         windowed_ratios.add((
             f"{vocab.measurement}_{ents[i]}_{vocab.source}",
             f"{vocab.measurement}_{ents[i]}_{vocab.destination}",
@@ -653,6 +675,20 @@ def _planted(vocab: Vocab, ents, N, temporal_window: int = 5) -> Dict[str, objec
                     f"{vocab.measurement}_{ents[i]}_{vocab.source}",
                     f"{vocab.measurement}_{ents[i]}_{vocab.destination}",
                 ),
+            ),
+        ))
+        conditional_pair.add((
+            (
+                "regime",
+                "==",
+                (typed_signature_value("paired"),),
+            ),
+            (
+                "pair",
+                frozenset({
+                    f"{vocab.measurement}_{ents[i]}_{vocab.source}",
+                    f"{vocab.measurement}_{ents[i]}_{vocab.destination}",
+                }),
             ),
         ))
         source = f"{vocab.measurement}_{ents[i]}_{vocab.source}"
@@ -744,6 +780,7 @@ def _planted(vocab: Vocab, ents, N, temporal_window: int = 5) -> Dict[str, objec
         "conditional_positive": conditional_positive,
         "conditional_zero": conditional_zero,
         "conditional_proportional": conditional_proportional,
+        "conditional_pair": conditional_pair,
         "sustained": sustained,
         "conjunction": conjunction,
         "categorical": {

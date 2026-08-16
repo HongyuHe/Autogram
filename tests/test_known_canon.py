@@ -487,6 +487,38 @@ def test_exact_learned_sum_recovers_the_approximate_known_it_satisfies():
     )
 
 
+def test_singleton_sum_balance_canonicalizes_to_ref_sum_alias():
+    names = ["total", "a", "b"]
+    matrix = np.column_stack((
+        np.full(40, 10.0),
+        np.full(40, 4.0),
+        np.full(40, 6.0),
+    ))
+    frame = Frame(matrix, names)
+    learned_add = (
+        "equality",
+        "exact",
+        (
+            "sum_balance",
+            frozenset({
+                frozenset({"total"}),
+                frozenset({"a", "b"}),
+            }),
+        ),
+    )
+    known_ref_sum = (
+        "equality",
+        "exact",
+        ("ref_sum", ("total", frozenset({"a", "b"}))),
+    )
+
+    assert _canonicalize(learned_add, frame, 1e-4) == _canonicalize(
+        known_ref_sum,
+        frame,
+        1e-4,
+    )
+
+
 def test_conditional_exactness_is_detected_through_the_nesting():
     """Round-36 review: a conditioned exact equality is still exact.
 

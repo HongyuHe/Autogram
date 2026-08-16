@@ -453,6 +453,8 @@ def shapes_for_invariant(inv: KnownInvariant) -> List[str]:
     op, rhs = inv.op, inv.rhs
     _strength, base = _unwrap_equality_relation(_base_signature(inv))
     if inv.where is not None and base is not None:
+        if base[0] == "pair":
+            return ["conditional_pair"]
         if base[0] == "delta_bound" and op in (">=", ">"):
             return ["conditional_positive"]
         if base[0] == "delta_zero":
@@ -814,8 +816,8 @@ def _canonicalize(sig, frame, zero_tol: float, exact: bool | None = None):
                 exact=bool(exact),
             )
             return (
-                "sum_balance",
-                frozenset({singleton, canonical_other}),
+                "ref_sum",
+                (anchor, canonical_other),
             )
         return sig
     if sig[0] == "agg_ref_balance":
@@ -839,26 +841,40 @@ def _lag_grounds_any_row(result: DiscoveryResult, column: str, steps: int) -> bo
     recall figure honest.
     """
     dataset = result.dataset
-    try:
-        values = eval_term(
-            A.Lag(A.Ref(column), int(steps)),
-            _binder_for_column(result, column),
-            {},
-            dataset.observed,
-            dataset.name_model,
-        )
-    except Exception:
-        return False
-    if values is None:
-        return False
-    return bool(np.any(np.isfinite(np.asarray(values, dtype=float))))
-
-
-def _binder_for_column(result: DiscoveryResult, column: str) -> str:
+    name_model = dataset.name_model
     for ev in result.portfolio:
-        if column in ev.rule.unparse():
-            return ev.rule.binder
-    return "record"
+        atom = ev.rule.atom
+        if (
+            ev.rule.condition is not None
+            or not isinstance(atom, A.Compare)
+            or not isinstance(atom.left, A.Ref)
+        ):
+            continue
+        for binding in enumerate_bindings(ev.rule.binder, name_model):
+            resolved = resolve_ref(
+                atom.left.role,
+                ev.rule.binder,
+                binding,
+                name_model,
+            )
+            if resolved != column:
+                continue
+            try:
+                values = eval_term(
+                    A.Lag(A.Ref(atom.left.role), int(steps)),
+                    ev.rule.binder,
+                    binding,
+                    dataset.observed,
+                    name_model,
+                )
+            except Exception:
+                continue
+            if (
+                values is not None
+                and np.any(np.isfinite(np.asarray(values, dtype=float)))
+            ):
+                return True
+    return False
 
 
 def _matching_signatures(sig):

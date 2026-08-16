@@ -424,22 +424,43 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
 
     def atomic_sign_recovery_key(signature):
         """Entries one exact atomic sign law can recover together."""
-        def direction(op):
-            if op in (">", ">="):
-                return "positive"
-            if op in ("<", "<="):
-                return "negative"
-            return op
-
         if not isinstance(signature, tuple) or not signature:
             return None
         if signature[0] == "one_sided" and len(signature) == 3:
             _tag, column, op = signature
-            return ("atomic_sign_family", column, direction(op))
+            return ("atomic_sign_family", column, op)
         if signature[0] == "lag_bound" and len(signature) == 2:
             column, _steps, op = signature[1]
-            return ("atomic_sign_family", column, direction(op))
+            return ("atomic_sign_family", column, op)
         return None
+
+    def frame_satisfies(column, op) -> bool:
+        if frame is None or not frame.has(column):
+            return False
+        values = np.asarray(frame.col(column), dtype=float)
+        values = values[np.isfinite(values)]
+        if not values.size:
+            return False
+        return {
+            ">=": lambda: np.all(values >= 0.0),
+            ">": lambda: np.all(values > 0.0),
+            "<=": lambda: np.all(values <= 0.0),
+            "<": lambda: np.all(values < 0.0),
+        }.get(op, lambda: False)()
+
+    def sign_aliases(left_signature, right_signature) -> bool:
+        left = atomic_sign_recovery_key(left_signature)
+        right = atomic_sign_recovery_key(right_signature)
+        if left is None or right is None or left[1] != right[1]:
+            return False
+        if left[2] == right[2]:
+            return True
+        positive = left[2] in (">", ">=") and right[2] in (">", ">=")
+        negative = left[2] in ("<", "<=") and right[2] in ("<", "<=")
+        if not (positive or negative):
+            return False
+        stricter = ">" if positive else "<"
+        return frame_satisfies(left[1], stricter)
 
     def sum_balance_recovery_alias(signature):
         """Canonical spelling shared by ref-vs-sum and singleton-sum balance relations."""
@@ -484,9 +505,7 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
         for j in range(i + 1, len(known)):
             if expansions[j] is None:
                 continue
-            left_sign = atomic_sign_recovery_key(signatures[i])
-            right_sign = atomic_sign_recovery_key(signatures[j])
-            if left_sign is not None and left_sign == right_sign:
+            if sign_aliases(signatures[i], signatures[j]):
                 # `recover_known` credits every grounded lag from one tolerance-free exact atomic
                 # sign law. Splitting those catalogue entries would put the calibration evidence
                 # itself in validation even though their structural signatures differ by lag.

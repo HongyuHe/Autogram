@@ -1426,7 +1426,7 @@ def _spec_from_json(payload) -> GrammarSpec:
         zero_means_default: bool = False,
     ) -> int:
         value = payload.get(name, default)
-        if zero_means_default and value == 0 and not isinstance(value, bool):
+        if zero_means_default and type(value) is int and value == 0:
             value = default
         return positive_int(
             value,
@@ -1435,7 +1435,9 @@ def _spec_from_json(payload) -> GrammarSpec:
         )
 
     def json_ints(name: str, *, minimum: int) -> tuple[int, ...]:
-        values = payload.get(name, ()) or ()
+        values = payload.get(name, ())
+        if values is None:
+            values = ()
         if not isinstance(values, (list, tuple)):
             raise ValueError(
                 f"induced schema field {name!r} must be a list of integers"
@@ -1558,6 +1560,7 @@ def _spec_from_json(payload) -> GrammarSpec:
             "max_conjunction_terms",
             3,
             minimum=2,
+            zero_means_default=True,
         ),
         metadata_columns=tuple(
             str(column) for column in (payload.get("metadata_columns", ()) or ())

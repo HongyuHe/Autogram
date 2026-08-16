@@ -46,6 +46,15 @@ def test_shapes_for_invariant_maps_each_relation_form():
             where={"regime": "proportional"},
         )
     ) == ["conditional_proportional"]
+    assert shapes_for_invariant(
+        KnownInvariant(
+            "guarded_pair",
+            "==",
+            "x",
+            "y",
+            where={"regime": "paired"},
+        )
+    ) == ["conditional_pair"]
     # a reference-vs-sum never abstracts to agg_ref_balance (the file format cannot express it)
     assert "agg_ref_balance" not in shapes_for_invariant(
         KnownInvariant("a", "==", "x", {"sum": ["y", "z"]}))

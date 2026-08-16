@@ -486,16 +486,12 @@ def test_proxy_temporal_window_controls_positive_and_null_grammars():
 
 @pytest.mark.parametrize("shape", [
     "ratio", "proportional", "monotone", "lag_bound", "sum_balance",
-    "conditional_proportional", "windowed_ratio", "conditional_positive",
+    "conditional_proportional", "conditional_pair",
+    "windowed_ratio", "conditional_positive",
     "conditional_zero", "sustained", "conjunction", "categorical",
     "cross_grain", "healthy_band",
 ])
 def test_joint_grid_scores_new_proxy_compactly_and_safely(shape):
-    inducer = (
-        _WideSyntheticInducer()
-        if shape == "sum_balance"
-        else _SyntheticInducer()
-    )
     suite = prepare_proxy_suite(
         RegimeSpec(entries=[
             ProxyEntry(
@@ -507,7 +503,7 @@ def test_joint_grid_scores_new_proxy_compactly_and_safely(shape):
             ),
         ]),
         seed=0,
-        inducer=inducer,
+        inducer=_SyntheticInducer(),
     )
     candidate = evaluate_grid_candidate(
         suite,
@@ -534,6 +530,7 @@ def test_all_new_shapes_jointly_tune_under_all_null_guards():
         "lag_bound",
         "sum_balance",
         "conditional_proportional",
+        "conditional_pair",
         "windowed_ratio",
         "conditional_positive",
         "conditional_zero",
@@ -555,7 +552,7 @@ def test_all_new_shapes_jointly_tune_under_all_null_guards():
             for shape in shapes
         ]),
         seed=0,
-        inducer=_WideSyntheticInducer(),
+        inducer=_SyntheticInducer(),
     )
     tuned = tune_joint(
         suite,

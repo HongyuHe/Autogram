@@ -224,6 +224,71 @@ def test_induced_zero_condition_value_cap_uses_protocol_default():
     assert restored.max_condition_values == 4
 
 
+def test_induced_zero_conjunction_cap_uses_protocol_default():
+    spec = GrammarSpec(
+        name="conjunction-default",
+        patterns=(
+            ColumnPattern(
+                name="placeholder",
+                matcher="regex",
+                kind="unused",
+                direction="unused",
+                regex=r"^does_not_match$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ()},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    payload = _spec_to_json(spec)
+    payload["max_conjunction_terms"] = 0
+
+    assert _spec_from_json(payload).max_conjunction_terms == 3
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("windows", 0),
+        ("run_lengths", False),
+        ("max_condition_values", 0.0),
+    ],
+)
+def test_induced_schema_rejects_falsy_wrong_typed_bounds(field, value):
+    spec = GrammarSpec(
+        name="wrong-type-bounds",
+        patterns=(
+            ColumnPattern(
+                name="placeholder",
+                matcher="regex",
+                kind="unused",
+                direction="unused",
+                regex=r"^does_not_match$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ()},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    payload = _spec_to_json(spec)
+    payload[field] = value
+
+    with pytest.raises(ValueError, match="must"):
+        _spec_from_json(payload)
+
+
 def test_infer_tokens_requires_full_column_match():
     # A regex token pattern must match the whole column name; a column that merely contains the
     # pattern as a prefix (with trailing junk) must not inject a spurious node token (I4).

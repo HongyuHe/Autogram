@@ -826,7 +826,6 @@ def test_known_split_keeps_atomic_and_lag_sign_aliases_together():
         KnownInvariant("atomic", ">=", "x", 0),
         KnownInvariant("lag_1", ">=", {"lag": ["x", 1]}, 0),
         KnownInvariant("lag_2", ">=", {"lag": ["x", 2]}, 0),
-        KnownInvariant("lag_strict", ">", {"lag": ["x", 3]}, 0),
         KnownInvariant("other", "==", "a", "b"),
         KnownInvariant("third", ">=", "y", 0),
     ]
@@ -842,9 +841,53 @@ def test_known_split_keeps_atomic_and_lag_sign_aliases_together():
         assert calibration_names.isdisjoint(validation_names)
         locations = {
             name: name in calibration_names
-            for name in ("atomic", "lag_1", "lag_2", "lag_strict")
+            for name in ("atomic", "lag_1", "lag_2")
         }
         assert len(set(locations.values())) == 1, (seed, locations)
+
+
+def test_known_split_only_merges_strict_lag_when_data_is_strictly_signed():
+    from autogram.calibrate import _ColumnScaleView
+
+    known = [
+        KnownInvariant("atomic", ">=", "x", 0),
+        KnownInvariant("lag_strict", ">", {"lag": ["x", 2]}, 0),
+        KnownInvariant("other", "==", "a", "b"),
+        KnownInvariant("third", ">=", "y", 0),
+    ]
+    with_zero = pd.DataFrame({
+        "x": [1.0, 1.0, 0.0],
+        "a": [1.0, 2.0, 3.0],
+        "b": [3.0, 2.0, 1.0],
+        "y": [1.0, 2.0, 3.0],
+    })
+    positive = with_zero.copy()
+    positive["x"] = [1.0, 2.0, 3.0]
+
+    split_with_zero = _split_known(
+        known,
+        frac=0.5,
+        seed=0,
+        frame=_ColumnScaleView(with_zero),
+    )
+    calibration_zero = {item.name for item in split_with_zero[0]}
+    assert (
+        ("atomic" in calibration_zero)
+        != ("lag_strict" in calibration_zero)
+    )
+
+    for seed in range(10):
+        calibration, _validation = _split_known(
+            known,
+            frac=0.5,
+            seed=seed,
+            frame=_ColumnScaleView(positive),
+        )
+        names = {item.name for item in calibration}
+        assert (
+            ("atomic" in names)
+            == ("lag_strict" in names)
+        ), seed
 
 
 def test_known_split_keeps_singleton_sum_balance_aliases_together():

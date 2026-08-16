@@ -19,6 +19,7 @@ from ..config import DiscoveryConfig, SearchConfig
 from ..dsl import ast as A
 from ..dsl.binders import enumerate_bindings, resolve_family, resolve_ref
 from ..dsl.evaluate import (
+    eval_term,
     robust_median,
     typed_binary_domain,
     typed_group_key,
@@ -27,7 +28,7 @@ from ..dsl.evaluate import (
     typed_unique,
 )
 from ..loader.loader import Dataset, Frame
-from ..schema.spec import RelatedTemplate
+from ..schema.spec import FamilySelector, RelatedTemplate
 from . import synth as S
 from .induce import SchemaInducer, make_inducer
 from .loop import DiscoveryResult, discover, prepare_columns, run_prepared
@@ -453,6 +454,7 @@ class Recovery:
     conditional_positive: float = 0.0
     conditional_zero: float = 0.0
     conditional_proportional: float = 0.0
+    conditional_pair: float = 0.0
     cross_grain: float = 0.0
     sustained: float = 0.0
     conjunction: float = 0.0
@@ -698,6 +700,10 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
         rels,
         "proportional",
     )
+    conditional_pair_found = _conditionals(
+        rels,
+        "pair",
+    )
     related_found = _relation_payloads(
         rels,
         "related_aggregate",
@@ -740,7 +746,7 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
         target = set(target)
         if not target:
             return 0.0
-        exact_atomic = set()
+        exact_atomic = []
         dataset = result.dataset
         for evaluation in result.portfolio:
             if (
@@ -763,27 +769,60 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
                     dataset.name_model,
                 )
                 if column is not None:
-                    exact_atomic.add((
+                    exact_atomic.append((
                         column,
                         evaluation.rule.atom.op,
+                        evaluation.rule.binder,
+                        evaluation.rule.atom.left.role,
+                        binding,
                     ))
 
-        def atomic_implies(column, target_op):
+        def atomic_implies(column, steps, target_op):
             allowed = {
                 ">=": {">=", ">"},
                 ">": {">"},
                 "<=": {"<=", "<"},
                 "<": {"<"},
             }.get(target_op, {target_op})
-            return any(
-                atomic_column == column and atomic_op in allowed
-                for atomic_column, atomic_op in exact_atomic
-            )
+            for (
+                atomic_column,
+                atomic_op,
+                binder,
+                role,
+                binding,
+            ) in exact_atomic:
+                if atomic_column != column or atomic_op not in allowed:
+                    continue
+                raw = result.dataset.observed.col(column)
+                finite = raw[np.isfinite(raw)]
+                if not finite.size:
+                    continue
+                exact = {
+                    ">=": np.all(finite >= 0.0),
+                    ">": np.all(finite > 0.0),
+                    "<=": np.all(finite <= 0.0),
+                    "<": np.all(finite < 0.0),
+                }[target_op]
+                if not exact:
+                    continue
+                lagged = eval_term(
+                    A.Lag(A.Ref(role), int(steps)),
+                    binder,
+                    binding,
+                    result.dataset.observed,
+                    result.dataset.name_model,
+                )
+                if (
+                    lagged is not None
+                    and np.any(np.isfinite(lagged))
+                ):
+                    return True
+            return False
 
         recovered = sum(
             (
                 item in found
-                or atomic_implies(item[0], item[2])
+                or atomic_implies(item[0], item[1], item[2])
             )
             for item in target
         )
@@ -835,6 +874,10 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
         conditional_proportional_found,
         set(planted.get("conditional_proportional", set())),
     )
+    conditional_pair = cov(
+        conditional_pair_found,
+        set(planted.get("conditional_pair", set())),
+    )
     cross_grain = cov(related_found, set(planted.get("cross_grain", set())))
     sustained = cov(
         sustained_found,
@@ -870,6 +913,7 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
             conditional_positive,
             conditional_zero,
             conditional_proportional,
+            conditional_pair,
             cross_grain,
             sustained,
             conjunction,
@@ -897,6 +941,7 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
         conditional_positive=conditional_positive,
         conditional_zero=conditional_zero,
         conditional_proportional=conditional_proportional,
+        conditional_pair=conditional_pair,
         cross_grain=cross_grain,
         sustained=sustained,
         conjunction=conjunction,
@@ -1694,6 +1739,7 @@ def prepare_proxy_suite(regime, seed: int = 0,
             control_shapes & {
                 "healthy_band",
                 "conditional_proportional",
+                "conditional_pair",
             }
         ),
         related="cross_grain" in control_shapes,
@@ -1707,6 +1753,7 @@ def prepare_proxy_suite(regime, seed: int = 0,
             "ratio",
             "proportional",
             "conditional_proportional",
+            "conditional_pair",
             "healthy_band",
             "cross_grain",
         }
@@ -2156,6 +2203,42 @@ def _enable_shape_capabilities(
             binder: max(2, degree)
             for binder, degree in grammar.max_degree_by_binder.items()
         }
+    if family == "sum_balance" and dataset is not None:
+        adapter = dataset.name_model.adapter
+        binder = "node" if "node" in grammar.binders else grammar.binders[0]
+        row_role = "demand_row"
+        col_role = "demand_col"
+        grammar.fam_roles[binder] = tuple(dict.fromkeys((
+            *grammar.fam_roles.get(binder, ()),
+            row_role,
+            col_role,
+        )))
+        adapter.fam_roles[binder] = grammar.fam_roles[binder]
+        adapter.family_selectors[(binder, row_role)] = FamilySelector(
+            binder,
+            row_role,
+            adapter.demand_kind,
+            "demand",
+            (
+                ("source", "==", "X"),
+                ("destination", "!=", "X"),
+            ),
+        )
+        adapter.family_selectors[(binder, col_role)] = FamilySelector(
+            binder,
+            col_role,
+            adapter.demand_kind,
+            "demand",
+            (
+                ("destination", "==", "X"),
+                ("source", "!=", "X"),
+            ),
+        )
+        grammar.agg_kinds = tuple(dict.fromkeys((
+            *grammar.agg_kinds,
+            "SUM",
+        )))
+        adapter.agg_kinds = grammar.agg_kinds
     if family in {"proportional", "conditional_proportional"} and "~∝" not in grammar.ops:
         grammar.ops = tuple(grammar.ops) + ("~∝",)
     if family in {
@@ -2195,16 +2278,30 @@ def _enable_shape_capabilities(
         "conditional_positive",
         "conditional_zero",
         "conditional_proportional",
+        "conditional_pair",
     }:
+        family_domains = {
+            "conditional_positive": ("positive", "zero", "other"),
+            "conditional_zero": ("positive", "zero", "other"),
+            "conditional_proportional": ("proportional", "other"),
+            "conditional_pair": ("paired", "other"),
+        }
+        current = grammar.condition_columns.get("regime", ())
+        regime_values = typed_unique((
+            *current,
+            *family_domains[family],
+        ))
         grammar.conditional_enabled = True
         grammar.condition_columns = {
-            "regime": ("positive", "zero", "proportional", "other"),
+            **grammar.condition_columns,
+            "regime": regime_values,
         }
         if dataset is not None:
             adapter = dataset.name_model.adapter
             adapter.conditional_enabled = True
             adapter.condition_columns = {
-                "regime": ("positive", "zero", "proportional", "other"),
+                **adapter.condition_columns,
+                "regime": regime_values,
             }
     if family in {"sustained", "conjunction", "categorical", "definition_null"}:
         grammar.advanced_enabled = True
