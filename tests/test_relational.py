@@ -17,7 +17,12 @@ from autogram.discovery.validate import (
 from autogram.discovery import synth
 from autogram.discovery.propose import EnumerationProposer, normalize_rule
 from autogram.dsl import ast as A
-from autogram.dsl.evaluate import _span_any, eval_term, typed_group_key
+from autogram.dsl.evaluate import (
+    _span_any,
+    eval_term,
+    eval_term_overflow,
+    typed_group_key,
+)
 from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
 from autogram.loader.gtib import AUTOGRAM_PROFILE_ATTR, prepare_gtib, profile_dataframe
@@ -139,6 +144,51 @@ def test_runtime_relation_null_preserves_all_false_reset_support():
     counter = output["counter"].to_numpy(dtype=float)
     assert np.all(np.isfinite(counter))
     assert np.all(np.diff(counter) >= 0.0)
+
+
+def test_runtime_relation_null_orders_mixed_timestamp_formats_chronologically():
+    relation = pd.DataFrame({
+        "timestamp": [
+            "01/01/2026 00:01:10",
+            "Jan 01 2026 00:00:10",
+        ],
+        "shard_id": ["s0", "s0"],
+        "counter": [20.0, 10.0],
+        "reset_flag": [False, False],
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="delta",
+        relation="raw",
+        column="counter",
+        mode="sum_delta",
+        parent_keys=(),
+        child_keys=(),
+        partition_keys=("shard_id",),
+        parent_time="timestamp",
+        child_time="timestamp",
+        window_seconds=60,
+        reset_column="reset_flag",
+        validity_columns=("counter",),
+    )
+
+    output = _runtime_relation_null(
+        relation,
+        [template],
+        {},
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+
+    earlier = output.loc[
+        output["timestamp"] == "Jan 01 2026 00:00:10",
+        "counter",
+    ].item()
+    later = output.loc[
+        output["timestamp"] == "01/01/2026 00:01:10",
+        "counter",
+    ].item()
+    assert earlier < later
 
 
 def test_mixed_span_and_delta_null_retains_both_relation_families():
@@ -698,7 +748,8 @@ def test_span_runtime_null_preserves_temporal_parent_keys_through_join():
 
     assert generated["consumer_id"].dtype.kind == "O"
     assert values is not None
-    assert values.tolist() == [0.0, 1.0, 0.0, 1.0]
+    assert values[:2].sum() == 1.0
+    assert values[2:].sum() == 1.0
 
 
 def test_span_runtime_null_preserves_python_datetime_keys_and_string_times():
@@ -757,7 +808,89 @@ def test_span_runtime_null_preserves_python_datetime_keys_and_string_times():
         for value in generated["consumer_id"]
     )
     assert values is not None
-    assert values.tolist() == [0.0, 1.0, 0.0, 1.0]
+    assert values[:2].sum() == 1.0
+    assert values[2:].sum() == 1.0
+
+
+def test_span_runtime_null_varies_typed_filter_roles_on_short_groups():
+    groups = 100
+    consumers = np.repeat(
+        [f"consumer-{index}" for index in range(groups)],
+        2,
+    )
+    times = np.tile(
+        pd.to_datetime([
+            "2026-02-01 00:00:00",
+            "2026-02-01 00:01:00",
+        ]).to_numpy(),
+        groups,
+    )
+    relation = pd.DataFrame({
+        "consumer_id": pd.Series(dtype=object),
+        "type": pd.Series(dtype=object),
+        "span_start": pd.Series(dtype="datetime64[ns]"),
+        "span_end": pd.Series(dtype="datetime64[ns]"),
+    })
+
+    def template(index, value):
+        return RelatedTemplate(
+            binder="record",
+            role=f"event_{index}",
+            relation="events",
+            column="",
+            mode="span_any",
+            parent_keys=("consumer_id",),
+            child_keys=("consumer_id",),
+            partition_keys=(),
+            parent_time="timestamp",
+            child_time="",
+            window_seconds=60,
+            span_start="span_start",
+            span_end="span_end",
+            filter_column="type",
+            filter_values=(value,),
+        )
+
+    templates = [
+        template(0, 1),
+        template(1, 2),
+        template(2, 3.0),
+    ]
+    context = {
+        "timestamp": times,
+        "consumer_id": consumers,
+    }
+    generated = _runtime_relation_null(
+        relation,
+        templates,
+        context,
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+    frame = Frame(
+        np.empty((len(times), 0), dtype=float),
+        [],
+        row_context=context,
+    )
+    masks = [
+        _span_any(item, frame, generated)
+        for item in templates
+    ]
+
+    assert {
+        typed_group_key(value)
+        for value in generated["type"]
+    } == {
+        typed_group_key(1),
+        typed_group_key(2),
+        typed_group_key(3.0),
+    }
+    assert all(mask is not None for mask in masks)
+    assert all(0 < int(mask.sum()) < mask.size for mask in masks)
+    assert len({
+        tuple(mask.tolist())
+        for mask in masks
+    }) == len(masks)
 
 
 def test_span_runtime_null_saturates_extrapolated_end():
@@ -858,6 +991,76 @@ def test_materialized_and_streaming_use_identical_sum_order():
 
     assert materialized is not None and streaming is not None
     assert np.array_equal(materialized, streaming, equal_nan=True)
+
+
+def test_incomplete_partition_cannot_create_streaming_only_overflow():
+    parent_times = pd.date_range(
+        "2026-01-01",
+        periods=3,
+        freq="1min",
+    )
+    rows = []
+    for shard in ("a", "b", "missing"):
+        count = 2 if shard == "missing" else 3
+        values = (
+            [0.0, 0.0]
+            if shard == "missing"
+            else [0.0, 0.0, 1e308]
+        )
+        for timestamp, value in zip(
+            parent_times[:count] + pd.Timedelta("10s"),
+            values,
+        ):
+            rows.append({
+                "timestamp": timestamp,
+                "consumer_id": "consumer",
+                "shard_id": shard,
+                "collector_input_counted": value,
+                "presenter_output_counted": value,
+                "reset_flag": False,
+            })
+    raw = pd.DataFrame(rows)
+    derived = pd.DataFrame({
+        "timestamp": parent_times,
+        "consumer_id": "consumer",
+        "minute_index": np.arange(3),
+        "input_rate_bytes_per_min": np.nan,
+    })
+    prepared = prepare_gtib(derived, raw)
+    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]
+    materialized_dataset, _grammar = build_dataframe_grammar(
+        prepared,
+        _base_spec(),
+        name="incomplete_materialized_sum",
+    )
+    materialized, materialized_overflow = eval_term_overflow(
+        A.Agg("SUM", "shard_input_increment"),
+        "record",
+        {},
+        materialized_dataset.observed,
+        materialized_dataset.name_model,
+    )
+    streaming_frame = prepared.drop(columns=family)
+    streaming_frame.attrs = prepared.attrs
+    streaming_dataset, _grammar = build_dataframe_grammar(
+        streaming_frame,
+        _base_spec(),
+        name="incomplete_streaming_sum",
+    )
+    streaming, streaming_overflow = eval_term_overflow(
+        A.RelatedAgg("raw_input_rate"),
+        "record",
+        {},
+        streaming_dataset.observed,
+        streaming_dataset.name_model,
+    )
+
+    assert materialized is not None and streaming is not None
+    assert np.array_equal(materialized, streaming, equal_nan=True)
+    assert materialized_overflow is None
+    assert streaming_overflow is None
 
 
 def test_related_aggregates_scale_to_multi_day_child_history():

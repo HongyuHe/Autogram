@@ -226,6 +226,10 @@ def _validate_selectors(spec: GrammarSpec) -> None:
     for sel in spec.family_selectors:
         if any(not isinstance(column, str) or not column for column in sel.columns):
             raise CompileError(f"family {sel.family_role!r}: explicit columns must be non-empty strings")
+        _validate_unique(
+            f"column in family {sel.family_role!r}",
+            sel.columns,
+        )
         for pred in sel.predicates:
             if len(pred) != 3:
                 raise CompileError(

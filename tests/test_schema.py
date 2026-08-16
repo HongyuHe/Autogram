@@ -17,6 +17,7 @@ from autogram.schema import CompileError, compile_spec
 from autogram.schema.spec import (
     CellCodec,
     ColumnPattern,
+    FamilySelector,
     GrammarSpec,
     RefTemplate,
     RelatedTemplate,
@@ -440,6 +441,31 @@ def test_compiler_rejects_duplicate_declarations():
         compile_spec(duplicate_templates)
     with pytest.raises(CompileError, match="duplicate pattern"):
         compile_spec(duplicate_patterns)
+
+
+def test_compiler_rejects_duplicate_explicit_family_columns():
+    base = _node_template_spec()
+    duplicate_family = GrammarSpec(
+        **{
+            **base.__dict__,
+            "ontology": RoleOntology(
+                binders=("node",),
+                ref_roles={"node": ("value",)},
+                fam_roles={"node": ("family",)},
+            ),
+            "family_selectors": (
+                FamilySelector(
+                    "node",
+                    "family",
+                    "measurement",
+                    columns=("metric_a", "metric_a"),
+                ),
+            ),
+        }
+    )
+
+    with pytest.raises(CompileError, match="duplicate column"):
+        compile_spec(duplicate_family)
 
 
 def test_compiler_rejects_nonpositive_degree_bound():

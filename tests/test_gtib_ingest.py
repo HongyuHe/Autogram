@@ -607,6 +607,34 @@ def test_gtib_materialization_rejects_wide_unit_timestamp_wrap():
         _materialize_raw(derived, raw)
 
 
+def test_gtib_materialization_accepts_mixed_valid_timestamp_formats():
+    derived = pd.DataFrame({
+        "timestamp": [
+            "Jan 01 2026 00:01:00",
+            "01/01/2026 00:02:00",
+        ],
+        "consumer_id": ["consumer", "consumer"],
+        "minute_index": [1, 2],
+        "input_rate_bytes_per_min": [10.0, 10.0],
+    })
+    raw = pd.DataFrame({
+        "timestamp": [
+            "Jan 01 2026 00:00:10",
+            "01/01/2026 00:01:10",
+            "2026-01-01T00:02:10",
+        ],
+        "consumer_id": ["consumer"] * 3,
+        "shard_id": ["shard"] * 3,
+        "collector_input_counted": [0.0, 10.0, 20.0],
+        "presenter_output_counted": [0.0, 10.0, 20.0],
+        "reset_flag": [False, False, False],
+    })
+
+    prepared = prepare_gtib(derived, raw)
+
+    assert prepared["shard_input_increment"].tolist() == [10.0, 10.0]
+
+
 def test_materialization_preserves_original_minute_indices_after_slice():
     derived, raw = _tables()
     sliced = derived.loc[derived["minute_index"].isin([1, 2])].copy()

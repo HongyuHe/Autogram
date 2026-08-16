@@ -938,6 +938,7 @@ def _datetime_ns(values) -> np.ndarray:
     raw = np.asarray(values)
     output = np.empty(raw.size, dtype=np.int64)
     for index, value in enumerate(raw.reshape(-1)):
+        value = canonical_typed_value(value)
         if is_missing_scalar(value):
             output[index] = _NAT_NS
             continue
@@ -1316,6 +1317,7 @@ def _related_aggregate(template, frame: Frame):
         else:
             totals = np.zeros(len(ordered_parent), dtype=float)
         accepted = complete & any_valid
+        blown &= complete
         output[ordered_parent[accepted]] = totals[accepted]
         overflow[ordered_parent[blown]] = True
 

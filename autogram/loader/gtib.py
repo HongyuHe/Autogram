@@ -270,8 +270,12 @@ def prepare_gtib(
     if missing:
         raise ValueError(f"GTIB derived table is missing required columns: {missing}")
 
+    from ..dsl.evaluate import _datetime_ns
+
     out = derived.reset_index(drop=True).copy()
-    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="raise")
+    out["timestamp"] = _datetime_ns(
+        out["timestamp"].to_numpy()
+    ).view("datetime64[ns]")
     out = _coerce_flag_columns(out)
     condition_columns = [
         c for c in out.columns
@@ -427,8 +431,12 @@ def prepare_gtib_raw(raw: pd.DataFrame) -> pd.DataFrame:
     missing = sorted(required - set(raw.columns))
     if missing:
         raise ValueError(f"GTIB raw table is missing required columns: {missing}")
+    from ..dsl.evaluate import _datetime_ns
+
     frame = raw.copy()
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="raise")
+    frame["timestamp"] = _datetime_ns(
+        frame["timestamp"].to_numpy()
+    ).view("datetime64[ns]")
     frame = _coerce_flag_columns(frame)
     conditions = [
         column
@@ -534,7 +542,9 @@ def _materialize_raw(
         raise ValueError(f"GTIB raw table is missing required columns: {missing}")
 
     child = raw.copy()
-    child["timestamp"] = pd.to_datetime(child["timestamp"], errors="raise")
+    child["timestamp"] = _datetime_ns(
+        child["timestamp"].to_numpy()
+    ).view("datetime64[ns]")
     parent_lookup = {}
     parent_consumers = derived["consumer_id"].to_numpy(dtype=object)
     parent_minutes = derived["minute_index"].to_numpy(dtype=int)

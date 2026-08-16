@@ -1236,11 +1236,19 @@ def _runtime_relation_null(
                 if template.filter_values
                 else "__null__"
             )
-            for key, bucket in groups.items():
+            pattern_width = max(
+                2,
+                (len(span_templates) + 1).bit_length(),
+            )
+            for group_index, (key, bucket) in enumerate(groups.items()):
                 rows = bucket["rows"]
                 ordered = sorted(rows, key=lambda row: times[row])
                 for position, row in enumerate(ordered):
-                    if not ((position >> template_index) & 1):
+                    selected_position = (
+                        (template_index + 1)
+                        >> (group_index % pattern_width)
+                    ) & 1
+                    if position % 2 != selected_position:
                         continue
                     signature = (
                         tuple(key),
@@ -1291,9 +1299,13 @@ def _runtime_relation_null(
                 columns=relation.columns,
             )
             identity_columns = tuple(dict.fromkeys(
-                child_key
+                column
                 for template in span_templates
-                for child_key in template.child_keys
+                for column in (
+                    *template.child_keys,
+                    template.filter_column,
+                )
+                if column
             ))
             for column in identity_columns:
                 values = np.empty(len(records), dtype=object)
@@ -1389,10 +1401,7 @@ def _runtime_relation_null(
         else:
             buckets[()] = list(range(len(output)))
         time_values = (
-            pd.to_datetime(
-                output[template.child_time],
-                errors="coerce",
-            ).to_numpy(dtype="datetime64[ns]")
+            _datetime_ns(output[template.child_time])
             if template.child_time in output.columns
             else np.arange(len(output))
         )

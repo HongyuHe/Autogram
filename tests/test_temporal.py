@@ -24,6 +24,7 @@ from autogram.discovery.validate import score_recovery
 from autogram.dsl import ast as A
 from autogram.dsl.evaluate import (
     _consecutive_window_ends,
+    _datetime_ns,
     _row_group_keys,
     eval_term,
     typed_group_key,
@@ -280,6 +281,21 @@ def test_temporal_cadence_rejects_wide_unit_timestamp_wrap():
             dataset.observed,
             dataset.name_model,
         )
+
+
+def test_checked_datetime_parser_accepts_numpy_string_scalars():
+    parsed = _datetime_ns(np.array(
+        ["Jan 01 2026", "01/02/2026"],
+        dtype=str,
+    ))
+
+    assert [
+        pd.Timestamp(int(value))
+        for value in parsed
+    ] == [
+        pd.Timestamp("2026-01-01"),
+        pd.Timestamp("2026-01-02"),
+    ]
 
 
 def test_mixed_timestamp_formats_use_one_chronological_order():
