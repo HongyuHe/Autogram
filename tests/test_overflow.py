@@ -472,6 +472,43 @@ def test_conditioned_fit_overflow_keeps_full_frame_support_denominator():
     assert result.support == pytest.approx(0.099)
 
 
+def test_tolerated_band_overflow_group_still_fails_group_gate():
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "group_id": (
+                ["clean"] * 380
+                + ["overflow"] * 20
+            ),
+            "x": np.concatenate((
+                np.full(380, 1.5e308),
+                np.full(20, -1.5e308),
+            )),
+        }),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="band_overflow_group",
+    )
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.01,
+            hold_rate_threshold=0.9,
+            band_mode="global",
+            max_overflow_fraction=0.1,
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.BandDefinition(A.Ref("x"), None),
+    ))
+
+    assert result.support == pytest.approx(0.95)
+    assert not result.accepted
+    assert result.parameters["group_hold_rates"]["overflow"] == 0.0
+
+
 def test_proportional_coefficient_median_survives_ceiling_scale_ratios():
     # A well-determined coefficient must not be discarded (and the estimator silently swapped for
     # least squares) merely because the median's intermediate sum overflowed.

@@ -198,6 +198,34 @@ def test_exact_equality_at_float64_max_does_not_accept_zero():
     assert result.hold_rate == 0.0
 
 
+def test_exact_equality_never_reports_infinite_normalized_epsilon():
+    minimum = np.nextafter(0.0, 1.0)
+    frame = profile_dataframe(pd.DataFrame({
+        "x": np.full(400, minimum),
+        "zero": np.zeros(400),
+    }))
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="subnormal_exact_equality",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("x"), "==", A.Ref("zero")),
+    ))
+
+    assert np.isfinite(result.eps)
+    assert not result.accepted
+    assert "non-finite" in result.reason
+
+
 def test_proportional_fit_is_invariant_to_common_tiny_scaling():
     values = np.arange(1.0, 401.0)
     rule = A.Rule(

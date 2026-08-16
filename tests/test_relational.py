@@ -6,6 +6,7 @@ import time
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from autogram.discovery.loop import build_dataframe_grammar
 from autogram.discovery.known import KnownInvariant, _signature, shapes_for_invariant
@@ -500,6 +501,88 @@ def test_span_filters_and_cache_keys_preserve_typed_identity():
     assert true_values is not None and one_values is not None
     assert true_values.tolist() == [1.0, 0.0]
     assert one_values.tolist() == [0.0, 1.0]
+
+
+def test_span_join_preserves_datetime_child_key_identity():
+    parent_time = pd.Timestamp("1970-01-01")
+    frame = Frame(
+        np.empty((1, 0), dtype=float),
+        [],
+        row_context={
+            "timestamp": np.array(
+                [parent_time.to_datetime64()],
+            ),
+            "consumer_id": np.array([1], dtype=object),
+        },
+    )
+    child_key = np.empty(1, dtype=object)
+    child_key[0] = np.datetime64(
+        "1970-01-01T00:00:00.000000001",
+        "ns",
+    )
+    child = pd.DataFrame({
+        "consumer_id": child_key,
+        "span_start": [parent_time],
+        "span_end": [parent_time + pd.Timedelta("1s")],
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="event",
+        relation="events",
+        column="",
+        mode="span_any",
+        parent_keys=("consumer_id",),
+        child_keys=("consumer_id",),
+        partition_keys=(),
+        parent_time="timestamp",
+        child_time="",
+        window_seconds=60,
+        span_start="span_start",
+        span_end="span_end",
+    )
+
+    values = _span_any(template, frame, child)
+
+    assert values is not None
+    assert values.tolist() == [0.0]
+
+
+def test_span_join_rejects_timestamp_outside_nanosecond_range():
+    frame = Frame(
+        np.empty((1, 0), dtype=float),
+        [],
+        row_context={
+            "timestamp": np.array(
+                [np.datetime64("1970-01-01", "ns")],
+            ),
+        },
+    )
+    child = pd.DataFrame({
+        "span_start": np.array(
+            [np.datetime64("2554-01-01", "D")],
+        ),
+        "span_end": np.array(
+            [np.datetime64("2554-01-02", "D")],
+        ),
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="event",
+        relation="events",
+        column="",
+        mode="span_any",
+        parent_keys=(),
+        child_keys=(),
+        partition_keys=(),
+        parent_time="timestamp",
+        child_time="",
+        window_seconds=60,
+        span_start="span_start",
+        span_end="span_end",
+    )
+
+    with pytest.raises(ValueError, match="datetime64\\[ns\\] range"):
+        _span_any(template, frame, child)
 
 
 def test_span_runtime_null_preserves_typed_consumers():

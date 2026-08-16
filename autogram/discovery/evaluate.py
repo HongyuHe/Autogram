@@ -634,7 +634,14 @@ class DataOnlyEvaluator:
                     "exact equality tolerance is non-finite",
                 )
             holds = np.abs(rho) <= exact_tolerance
-            eps = float(np.max(exact_tolerance / scale))
+            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                normalized_tolerance = exact_tolerance / scale
+            if not np.all(np.isfinite(normalized_tolerance)):
+                return self._reject(
+                    rule,
+                    "normalized exact equality tolerance is non-finite",
+                )
+            eps = float(np.max(normalized_tolerance))
         else:
             if cfg.band_mode == "adaptive" and op in ("~=", "~∝"):
                 # item 4: per-candidate self-calibrated band (knee + split-conformal holdout),
@@ -953,6 +960,22 @@ class DataOnlyEvaluator:
         )
         return rejection, (tainted or None)
 
+    def _definition_failed_groups(self, tainted_rows):
+        if not tainted_rows:
+            return None
+        source_groups = _group_labels(
+            self.ds.observed,
+            self.ds.name_model,
+        )
+        if source_groups is None:
+            return None
+        chunks = [
+            source_groups[np.asarray(mask, dtype=bool)]
+            for mask in tainted_rows.values()
+            if np.any(mask)
+        ]
+        return np.concatenate(chunks) if chunks else None
+
     def _condition_support_rejection(self, rule: A.Rule):
         """Reject a conditioned rule whose condition selects too few rows, else ``None``.
 
@@ -1092,6 +1115,9 @@ class DataOnlyEvaluator:
                 if groups is not None
                 else None
             ),
+            failed_groups=self._definition_failed_groups(
+                tainted_rows,
+            ),
         )
 
     def _evaluate_category_definition(self, rule: A.Rule) -> Evaluation:
@@ -1185,6 +1211,7 @@ class DataOnlyEvaluator:
         parameters: dict,
         baseline: float,
         groups=None,
+        failed_groups=None,
     ) -> Evaluation:
         if holds.size == 0:
             return self._reject(rule, "definition grounded no valid points")
@@ -1212,6 +1239,7 @@ class DataOnlyEvaluator:
             groups,
             z=z,
             threshold=required,
+            failed_groups=failed_groups,
         )
         accepted &= group_ok
         residual = np.where(holds, 0.0, 1.0)
@@ -1251,6 +1279,7 @@ class DataOnlyEvaluator:
             self.ds.observed,
             self.ds.name_model,
         )
+        failed_groups = self._definition_failed_groups(tainted_rows)
         condition_mask = None
         if rule.condition is not None:
             condition_mask = _condition_mask(
@@ -1358,6 +1387,18 @@ class DataOnlyEvaluator:
             )
             if rejection is not None:
                 return rejection
+            if population_groups is not None:
+                centre_failed_groups = population_groups[
+                    centre_overflow
+                ]
+                failed_groups = (
+                    centre_failed_groups
+                    if failed_groups is None
+                    else np.concatenate((
+                        failed_groups,
+                        centre_failed_groups,
+                    ))
+                )
             evaluation_mask = evaluation_mask & ~centre_overflow
             if not np.any(evaluation_mask):
                 return self._reject(
@@ -1409,6 +1450,7 @@ class DataOnlyEvaluator:
             ),
             z=z_for_alpha(self.cfg.ci_alpha),
             threshold=threshold,
+            failed_groups=failed_groups,
         )
         accepted &= group_ok
         return Evaluation(

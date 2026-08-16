@@ -19,6 +19,7 @@ from ..config import DiscoveryConfig, SearchConfig
 from ..dsl import ast as A
 from ..dsl.binders import enumerate_bindings, resolve_family, resolve_ref
 from ..dsl.evaluate import (
+    _typed_object_array,
     eval_term,
     robust_median,
     typed_binary_domain,
@@ -364,7 +365,7 @@ def _add_ref_agg_sig(term, binder, binding, nm):
         return None
     rc = resolve_ref(refs[0].role, binder, binding, nm)
     fc = resolve_family(aggs[0].family_role, binder, binding, nm)
-    if rc is None or not fc:
+    if rc is None or not fc or rc in fc:
         return None
     return (rc, frozenset(fc))
 
@@ -1137,6 +1138,7 @@ def _balanced_null_numeric(
     rng,
     *,
     binary: bool,
+    magnitude_ceiling: float = _NULL_MAGNITUDE_CEILING,
 ) -> np.ndarray:
     source = np.asarray(values, dtype=float)
     output = np.full(source.shape, np.nan, dtype=float)
@@ -1168,7 +1170,7 @@ def _balanced_null_numeric(
         # the null's SHAPE (a balanced, sign-symmetric lognormal spread) is what the control depends
         # on, not its absolute magnitude, and ordinary data is far below the cap.
         largest = float(np.max(multipliers)) if multipliers.size else 1.0
-        scale = min(scale, _NULL_MAGNITUDE_CEILING / max(1.0, largest))
+        scale = min(scale, float(magnitude_ceiling) / max(1.0, largest))
         with np.errstate(over="ignore"):
             magnitudes = scale * multipliers
         signs = np.ones(positions.size, dtype=float)
@@ -1188,6 +1190,7 @@ def _runtime_relation_null(
     rng,
     *,
     definition_targets: bool,
+    magnitude_ceiling: float = _NULL_MAGNITUDE_CEILING,
 ):
     if not isinstance(relation, pd.DataFrame):
         return relation
@@ -1330,6 +1333,7 @@ def _runtime_relation_null(
                 values,
                 rng,
                 binary=binary,
+                magnitude_ceiling=magnitude_ceiling,
             )
         else:
             output[column] = rng.permutation(values)
@@ -1471,6 +1475,7 @@ def _runtime_null_dataset(
     *,
     seed: int,
     definition_targets: bool,
+    magnitude_ceiling: float = _NULL_MAGNITUDE_CEILING,
 ):
     rng = np.random.default_rng(int(seed))
     matrix = np.empty_like(dataset.observed.matrix, dtype=float)
@@ -1507,6 +1512,7 @@ def _runtime_null_dataset(
             values,
             rng,
             binary=binary,
+            magnitude_ceiling=magnitude_ceiling,
         )
         matrix[:, index] = generated
         generated_columns[name] = generated
@@ -1517,10 +1523,7 @@ def _runtime_null_dataset(
         for key in dataset.group_keys
     ):
         arrays = [
-            np.asarray(
-                dataset.observed.row_context[key],
-                dtype=object,
-            )
+            _typed_object_array(dataset.observed.row_context[key])
             for key in dataset.group_keys
         ]
         group_identities = [
@@ -1574,6 +1577,7 @@ def _runtime_null_dataset(
             row_context,
             rng,
             definition_targets=definition_targets,
+            magnitude_ceiling=magnitude_ceiling,
         )
         for name, relation in dataset.observed.relations.items()
     }
@@ -1611,6 +1615,50 @@ def _is_null_equality_candidate(rule: A.Rule) -> bool:
     ) or isinstance(rule.atom, A.BandDefinition)
 
 
+def _runtime_null_magnitude_ceiling(dataset, grammar, rules) -> float:
+    """Leaf bound that keeps the runtime grammar's widest products finite."""
+    terms = []
+    for rule in rules:
+        atom = rule.atom
+        if isinstance(atom, A.Compare):
+            terms.extend((atom.left, atom.right))
+        elif isinstance(atom, A.BooleanDefinition):
+            terms.append(atom.target)
+        elif isinstance(atom, A.BandDefinition):
+            terms.append(atom.term)
+    degree = max(
+        (int(term.degree()) for term in terms),
+        default=max(1, int(getattr(grammar, "max_degree", 1))),
+    )
+    degree = max(1, degree)
+    windows = tuple(int(window) for window in getattr(grammar, "windows", ()))
+    max_window = max((1, *windows))
+    max_add_arity = max(1, int(getattr(grammar, "max_add_arity", 1)))
+    # A concrete family cannot contain more columns than the observed frame. Multiplying by the
+    # largest rolling window and Add arity bounds every degree-one branch before products combine
+    # them. The degree root then keeps even the highest-degree rule below MAX/256.
+    relation_rows = max(
+        (
+            len(relation)
+            for relation in dataset.observed.relations.values()
+            if isinstance(relation, pd.DataFrame)
+        ),
+        default=1,
+    )
+    fan_in = max(
+        1,
+        len(dataset.observed.names),
+        relation_rows,
+    ) * max_window * max_add_arity
+    root = math.exp(
+        (math.log(np.finfo(float).max) - math.log(256.0)) / degree
+    )
+    return min(
+        _NULL_MAGNITUDE_CEILING,
+        root / float(fan_in),
+    )
+
+
 def prepare_runtime_null_controls(
     dataset,
     grammar,
@@ -1646,17 +1694,24 @@ def prepare_runtime_null_controls(
             (A.BooleanDefinition, A.CategoryDefinition),
         )
     ]
+    magnitude_ceiling = _runtime_null_magnitude_ceiling(
+        dataset,
+        grammar,
+        all_rules,
+    )
 
     equality_dataset = _runtime_null_dataset(
         dataset,
         seed=seed + 10_001,
         definition_targets=False,
+        magnitude_ceiling=magnitude_ceiling,
     )
     temporal_dataset = (
         _runtime_null_dataset(
             dataset,
             seed=seed + 20_003,
             definition_targets=False,
+            magnitude_ceiling=magnitude_ceiling,
         )
         if temporal_rules
         else None
@@ -1666,6 +1721,7 @@ def prepare_runtime_null_controls(
             dataset,
             seed=seed + 30_007,
             definition_targets=True,
+            magnitude_ceiling=magnitude_ceiling,
         )
         if definition_rules
         else None

@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from autogram.config import DiscoveryConfig, SearchConfig
@@ -14,7 +15,18 @@ from autogram.discovery import regime as R
 from autogram.discovery import validate as V
 from autogram.discovery.loop import discover
 from autogram.dsl import ast as A
-from autogram.dsl.evaluate import typed_group_key
+from autogram.dsl.evaluate import ground, typed_group_key
+from autogram.dsl.grammar import Grammar
+from autogram.loader.loader import build_dataset
+from autogram.schema.compiler import compile_spec
+from autogram.schema.spec import (
+    CellCodec,
+    ColumnPattern,
+    FamilySelector,
+    GrammarSpec,
+    RefTemplate,
+    RoleOntology,
+)
 
 
 def test_runtime_null_covers_each_typed_condition_domain_when_product_is_too_large():
@@ -41,6 +53,122 @@ def test_runtime_null_covers_each_typed_condition_domain_when_product_is_too_lar
             typed_group_key(value)
             for value in domain
         }
+
+
+def test_runtime_null_envelope_accounts_for_wide_family_products():
+    width = 1024
+    rows = 400
+    magnitude = V._NULL_MAGNITUDE_CEILING
+    left_names = tuple(f"left_{index}" for index in range(width))
+    right_names = tuple(f"right_{index}" for index in range(width))
+    columns = {}
+    for index, name in enumerate(left_names):
+        columns[name] = np.full(
+            rows,
+            magnitude if index % 2 == 0 else -magnitude,
+        )
+    for index, name in enumerate(right_names):
+        columns[name] = np.full(
+            rows,
+            magnitude if index % 2 == 0 else -magnitude,
+        )
+    columns["target"] = np.zeros(rows)
+    frame = pd.DataFrame(columns)
+    spec = GrammarSpec(
+        name="wide-null-product",
+        patterns=(
+            ColumnPattern(
+                "source",
+                "regex",
+                "measurement",
+                "value",
+                regex=r"^(?:left|right)_\d+$",
+            ),
+            ColumnPattern(
+                "target",
+                "regex",
+                "measurement",
+                "target",
+                regex=r"^target$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("target",)},
+            fam_roles={"record": ("left", "right")},
+            agg_kinds=("SUM",),
+        ),
+        ref_templates=(
+            RefTemplate("record", "target", "target"),
+        ),
+        family_selectors=(
+            FamilySelector(
+                "record",
+                "left",
+                "measurement",
+                columns=left_names,
+            ),
+            FamilySelector(
+                "record",
+                "right",
+                "measurement",
+                columns=right_names,
+            ),
+        ),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+        max_degree=2,
+    )
+    adapter = compile_spec(spec)
+    dataset = build_dataset(
+        frame.columns,
+        frame.to_numpy(dtype=float),
+        adapter,
+        name="wide_null_product",
+        timestamps=np.arange(rows),
+    )
+    grammar = Grammar(
+        binders=("record",),
+        ops=("==",),
+        ref_roles={"record": ("target",)},
+        fam_roles={"record": ("left", "right")},
+        agg_kinds=("SUM",),
+        max_complexity=12,
+        max_add_arity=3,
+        max_degree=2,
+    )
+    rule = A.Rule(
+        "record",
+        A.Compare(
+            A.Ref("target"),
+            "==",
+            A.Mul(
+                A.Agg("SUM", "left"),
+                A.Agg("SUM", "right"),
+            ),
+        ),
+    )
+
+    assert ground(
+        rule,
+        dataset.observed,
+        dataset.name_model,
+    ).overflow_points == 0
+    controls = V.prepare_runtime_null_controls(
+        dataset,
+        grammar,
+        SearchConfig(seed=0),
+        seed=0,
+        rules=[rule],
+    )
+    null_grounded = ground(
+        rule,
+        controls.null.ds.observed,
+        controls.null.ds.name_model,
+    )
+
+    assert null_grounded.overflow_points == 0
+    assert null_grounded.graded_points == rows
 
 
 def test_nonneg_proxy_plants_only_nonnegativity():

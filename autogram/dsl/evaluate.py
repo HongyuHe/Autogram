@@ -931,11 +931,19 @@ _RELATED_MISSING_KEY = object()
 
 
 def _datetime_ns(values) -> np.ndarray:
-    return (
-        pd.to_datetime(values, errors="raise")
-        .to_numpy(dtype="datetime64[ns]")
-        .astype(np.int64)
-    )
+    raw = np.asarray(values)
+    output = np.empty(raw.size, dtype=np.int64)
+    for index, value in enumerate(raw.reshape(-1)):
+        if is_missing_scalar(value):
+            output[index] = _NAT_NS
+            continue
+        try:
+            output[index] = pd.Timestamp(value).as_unit("ns").value
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"timestamp {value!r} is outside datetime64[ns] range"
+            ) from error
+    return output.reshape(raw.shape)
 
 
 def _saturating_add_ns(times: np.ndarray, delta_ns: int) -> np.ndarray:
@@ -1315,7 +1323,7 @@ def _span_child_index(template, frame: Frame, child):
         # Row-wise on the typed identity, for the same reason as the partition index: ``groupby``
         # merges ``True`` with ``1`` before the key is ever seen, joining two different children.
         columns = [
-            np.asarray(child[column].to_numpy(), dtype=object)
+            _typed_object_array(child[column].to_numpy())
             for column in template.child_keys
         ]
         buckets: dict[tuple, list[int]] = {}

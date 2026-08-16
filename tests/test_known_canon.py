@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
 from autogram.dsl import ast as A
 from autogram.dsl.evaluate import typed_group_key, typed_signature_value
 from autogram.loader.loader import Frame
 from autogram.discovery.known import (
+    KnownInvariant,
     _canonicalize,
     _drop_negligible,
     _known_condition_signature,
+    recover_known,
 )
+from autogram.discovery import known as known_module
 from autogram.discovery.validate import (
     _condition_signature,
     relation_signature_matches,
@@ -485,6 +490,66 @@ def test_exact_learned_sum_recovers_the_approximate_known_it_satisfies():
         _canonicalize(learned_exact, f, 1e-4, exact=True)[2]
         != _canonicalize(known_exact, f, 1e-4)[2]
     )
+
+
+def test_recovery_uses_approximate_known_tolerance_for_exact_witness(
+    monkeypatch,
+):
+    names = ["total", "a", "z"]
+    matrix = np.column_stack((
+        np.full(40, 1000.05),
+        np.full(40, 1000.0),
+        np.full(40, 0.05),
+    ))
+    frame = Frame(matrix, names)
+    learned_exact = (
+        "equality",
+        "exact",
+        ("ref_sum", ("total", frozenset({"a", "z"}))),
+    )
+    monkeypatch.setattr(
+        known_module,
+        "portfolio_relations",
+        lambda _result, **_kwargs: {learned_exact},
+    )
+    monkeypatch.setattr(
+        known_module,
+        "_one_sided_columns",
+        lambda _result, _op: set(),
+    )
+    result = SimpleNamespace(
+        dataset=SimpleNamespace(observed=frame),
+        portfolio=[],
+    )
+    known = KnownInvariant(
+        "approximate",
+        "~=",
+        "total",
+        {"sum": ["a"]},
+    )
+
+    assert recover_known(result, [known])["recall"] == 1.0
+
+
+def test_overlapping_aggregate_balance_is_not_set_canonicalized():
+    frame = Frame(
+        np.ones((20, 5)),
+        ["a", "b", "c", "d", "e"],
+    )
+    overlapping = (
+        "agg_ref_balance",
+        frozenset({
+            ("a", frozenset({"a", "b"})),
+            ("c", frozenset({"d", "e"})),
+        }),
+    )
+
+    assert _canonicalize(
+        overlapping,
+        frame,
+        1e-4,
+        exact=True,
+    ) == overlapping
 
 
 def test_singleton_sum_balance_canonicalizes_to_ref_sum_alias():

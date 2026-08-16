@@ -196,6 +196,29 @@ def test_overlapping_add_aggregate_does_not_emit_set_valued_sum_alias():
         for relation in relations
     )
 
+    balance_rule = A.Rule(
+        "record",
+        A.Compare(
+            A.Add((A.Ref("a_ref"), A.Agg("SUM", "fam"))),
+            "==",
+            A.Add((A.Ref("c_ref"), A.Agg("SUM", "fam"))),
+        ),
+    )
+    balance_relations = validation.rule_relations(
+        balance_rule,
+        dataset,
+    )
+    assert not any(
+        (
+            isinstance(relation, tuple)
+            and (
+                "agg_ref_balance" in str(relation)
+                or "sum_balance" in str(relation)
+            )
+        )
+        for relation in balance_relations
+    )
+
 
 def test_nullable_string_condition_domain_drops_all_missing_scalars():
     frame = profile_dataframe(

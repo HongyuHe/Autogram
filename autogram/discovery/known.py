@@ -835,6 +835,8 @@ def _canonicalize(sig, frame, zero_tol: float, exact: bool | None = None):
             )
         return sig
     if sig[0] == "agg_ref_balance":
+        if any(ref in fam for ref, fam in sig[1]):
+            return sig
         return (
             "sum_balance",
             frozenset(
@@ -934,10 +936,15 @@ def _candidate_is_exact(candidate) -> bool:
 
 def _matches_any(sig, frame, zero_tol: float, canon_by_tolerance: dict) -> bool:
     """Is any expansion of ``sig`` matched by a learned relation, at that expansion's tolerance?"""
+    tolerance_exact = _candidate_is_exact(sig)
     for candidate in _matching_signatures(sig):
-        exact = _candidate_is_exact(candidate)
-        canon_candidate = _canonicalize(candidate, frame, zero_tol, exact=exact)
-        for learned in canon_by_tolerance[exact]:
+        canon_candidate = _canonicalize(
+            candidate,
+            frame,
+            zero_tol,
+            exact=tolerance_exact,
+        )
+        for learned in canon_by_tolerance[tolerance_exact]:
             if relation_signature_matches(canon_candidate, learned):
                 return True
     return False
