@@ -186,6 +186,70 @@ def test_numpy_condition_scalars_canonicalize_before_dedup_and_render():
     assert type(restored.condition.values[0]) is bool
 
 
+def test_large_integer_condition_values_sort_and_propose_without_float_conversion():
+    huge = 10 ** 400
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=",),
+        ref_roles={"record": ("x", "y")},
+        fam_roles={"record": ()},
+        condition_columns={"kind": (0, huge, huge + 1)},
+        max_condition_values=3,
+        conditional_enabled=True,
+    )
+
+    proposed = list(EnumerationProposer(grammar).propose())
+
+    assert proposed
+    assert any(
+        rule.condition is not None
+        and huge in rule.condition.values
+        for rule in proposed
+    )
+
+
+def test_all_numeric_ast_fields_serialize_numpy_scalars_to_json():
+    rules = [
+        A.Rule(
+            "record",
+            A.Compare(
+                A.Scale(
+                    np.float64(2.0),
+                    A.Lag(A.Ref("x"), np.int64(2)),
+                ),
+                "~=",
+                A.Const(np.int64(4)),
+            ),
+        ),
+        A.Rule(
+            "record",
+            A.BooleanDefinition(
+                A.Ref("target"),
+                A.Sustained(
+                    A.Bound(
+                        A.Ref("x"),
+                        ">",
+                        np.float64(1.5),
+                    ),
+                    np.int64(3),
+                ),
+            ),
+        ),
+        A.Rule(
+            "record",
+            A.BandDefinition(
+                A.Ref("x"),
+                np.float64(2.5),
+            ),
+        ),
+    ]
+
+    for rule in rules:
+        payload = rule_to_dict(rule)
+        json.dumps(payload)
+        rule_from_dict(payload)
+
+
 def test_solver_and_membership_enumeration_preserve_typed_conditions():
     grammar = Grammar(
         binders=("record",),

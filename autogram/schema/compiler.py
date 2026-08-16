@@ -19,6 +19,7 @@ import math
 import numbers
 import re
 import string
+from dataclasses import replace
 from typing import Dict, Tuple
 
 from ..dsl import ast as A
@@ -406,7 +407,12 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
             raise CompileError(
                 f"duplicate related template {key!r}"
             )
-        related_templates[key] = template
+        related_templates[key] = replace(
+            template,
+            filter_values=_canonical_typed_values(
+                template.filter_values
+            ),
+        )
 
     patterns = tuple(_compile_pattern(p) for p in spec.patterns)
 

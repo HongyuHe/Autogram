@@ -428,8 +428,15 @@ def typed_binary_domain(values) -> bool:
     if len(kinds) != 1:
         return False
     return all(
-        isinstance(value, numbers.Real)
-        and float(value) in (0.0, 1.0)
+        (
+            isinstance(value, numbers.Integral)
+            and int(value) in (0, 1)
+        )
+        or (
+            isinstance(value, numbers.Real)
+            and not isinstance(value, numbers.Integral)
+            and float(value) in (0.0, 1.0)
+        )
         for value in unique
     )
 
@@ -476,7 +483,9 @@ def typed_sort_key(typed):
         )
     kind, value = typed
     try:
-        if isinstance(value, (bool, int, float)):
+        if isinstance(value, numbers.Integral):
+            return (0, kind, 0, int(value), "")
+        if isinstance(value, numbers.Real):
             return (0, kind, 0, float(value), "")
         if isinstance(value, str):
             return (0, kind, 1, 0.0, value)

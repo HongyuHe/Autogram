@@ -393,7 +393,15 @@ def _additional_operand_sigs(rule, binder, binding, nm):
         (A.Add, A.Agg),
     ) and not isinstance(rule.atom.right, (A.Add, A.Agg)):
         return set()
-    return {("sum_balance", frozenset({left, right}))}
+    return {
+        _with_condition(
+            rule,
+            _equality_relation(
+                rule.atom.op,
+                ("sum_balance", frozenset({left, right})),
+            ),
+        )
+    }
 
 
 def _ground_term_columns(term, binder, binding, nm):

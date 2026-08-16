@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
+import numpy as np
 import pytest
 
 from autogram.discovery import synth
-from autogram.discovery.induce import induce_spec
+from autogram.discovery.induce import _spec_to_json, induce_spec
 from autogram.schema import CompileError, compile_spec
 from autogram.schema.spec import (
     CellCodec,
@@ -95,6 +98,55 @@ def test_compiler_rejects_composite_condition_values_before_proposal():
 
     with pytest.raises(CompileError, match="condition column"):
         compile_spec(spec)
+
+
+def test_numpy_span_filter_values_compile_and_serialize_as_python_scalars():
+    spec = GrammarSpec(
+        name="numpy-span-filter",
+        patterns=(
+            ColumnPattern(
+                name="placeholder",
+                matcher="regex",
+                kind="unused",
+                direction="unused",
+                regex=r"^does_not_match$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ()},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        related_templates=(
+            RelatedTemplate(
+                binder="record",
+                role="event",
+                relation="events",
+                column="flag",
+                mode="span_any",
+                parent_keys=(),
+                child_keys=(),
+                partition_keys=(),
+                parent_time="timestamp",
+                child_time="timestamp",
+                window_seconds=60,
+                span_start="span_start",
+                span_end="span_end",
+                filter_column="kind",
+                filter_values=(np.int64(1),),
+            ),
+        ),
+        cell_codec=CellCodec(kind="scalar"),
+    )
+
+    adapter = compile_spec(spec)
+    compiled = adapter.related_templates[("record", "event")]
+    assert compiled.filter_values == (1,)
+    assert type(compiled.filter_values[0]) is int
+    json.dumps(_spec_to_json(spec))
 
 
 def test_infer_tokens_requires_full_column_match():

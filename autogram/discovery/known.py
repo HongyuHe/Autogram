@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import math
+import numbers
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -32,7 +33,9 @@ import numpy as np
 from ..dsl import ast as A
 from ..dsl.binders import enumerate_bindings, resolve_ref
 from ..dsl.evaluate import (
+    canonical_typed_value,
     eval_term,
+    is_missing_scalar,
     typed_group_key,
     typed_signature_value,
     typed_sort_key,
@@ -69,13 +72,21 @@ def load_known(path: str) -> List[KnownInvariant]:
         doc = json.loads(text)
     out: List[KnownInvariant] = []
     for i, e in enumerate(doc.get("invariants", [])):
-        out.append(KnownInvariant(
+        invariant = KnownInvariant(
             name=str(e.get("name", f"inv{i}")),
             op=str(e["op"]),
             lhs=e["lhs"],
             rhs=e.get("rhs"),
             where=e.get("where"),
-        ))
+        )
+        if (
+            invariant.where is not None
+            and _known_condition_signature(invariant.where) is None
+        ):
+            raise ValueError(
+                f"known invariant {invariant.name!r} has an invalid condition"
+            )
+        out.append(invariant)
     return out
 
 
@@ -225,12 +236,36 @@ def _known_condition_signature(where):
         return None if any(child is None for child in children) else ("all", children)
     if key.endswith("_in"):
         column = key[:-3]
+        if not isinstance(value, (list, tuple)) or not value:
+            return None
+        canonical = [
+            _known_condition_scalar(item)
+            for item in value
+        ]
+        if any(item is None for item in canonical):
+            return None
         values = tuple(sorted(
-            (typed_signature_value(item) for item in value),
+            (typed_signature_value(item) for item in canonical),
             key=lambda item: typed_sort_key(item[1]),
         ))
         return (column, "in", values)
-    return (str(key), "==", (typed_signature_value(value),))
+    canonical = _known_condition_scalar(value)
+    if canonical is None:
+        return None
+    return (str(key), "==", (typed_signature_value(canonical),))
+
+
+def _known_condition_scalar(value):
+    value = canonical_typed_value(value)
+    if is_missing_scalar(value):
+        return None
+    if isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, numbers.Integral) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, numbers.Real) and math.isfinite(float(value)):
+        return float(value)
+    return None
 
 
 def _known_temporal_ref(value, form: str):

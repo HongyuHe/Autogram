@@ -361,6 +361,8 @@ def _load_json_object(payload: str | dict) -> dict:
 
 
 def _spec_to_json(spec: GrammarSpec) -> dict:
+    from ..dsl.evaluate import canonical_typed_value
+
     return {
         "name": spec.name,
         "patterns": [p.__dict__ for p in spec.patterns],
@@ -385,13 +387,25 @@ def _spec_to_json(spec: GrammarSpec) -> dict:
         "notes": spec.notes,
         "time_index": spec.time_index,
         "group_keys": list(spec.group_keys),
-        "condition_columns": {k: list(v) for k, v in spec.condition_columns.items()},
+        "condition_columns": {
+            key: [canonical_typed_value(value) for value in values]
+            for key, values in spec.condition_columns.items()
+        },
         "temporal_enabled": spec.temporal_enabled,
         "max_lag": spec.max_lag,
         "windows": list(spec.windows),
         "conditional_enabled": spec.conditional_enabled,
         "max_condition_values": spec.max_condition_values,
-        "related_templates": [template.__dict__ for template in spec.related_templates],
+        "related_templates": [
+            {
+                **template.__dict__,
+                "filter_values": [
+                    canonical_typed_value(value)
+                    for value in template.filter_values
+                ],
+            }
+            for template in spec.related_templates
+        ],
         "boolean_roles": {k: list(v) for k, v in spec.boolean_roles.items()},
         "advanced_enabled": spec.advanced_enabled,
         "run_lengths": list(spec.run_lengths),

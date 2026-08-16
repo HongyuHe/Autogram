@@ -826,6 +826,7 @@ def test_known_split_keeps_atomic_and_lag_sign_aliases_together():
         KnownInvariant("atomic", ">=", "x", 0),
         KnownInvariant("lag_1", ">=", {"lag": ["x", 1]}, 0),
         KnownInvariant("lag_2", ">=", {"lag": ["x", 2]}, 0),
+        KnownInvariant("lag_strict", ">", {"lag": ["x", 3]}, 0),
         KnownInvariant("other", "==", "a", "b"),
         KnownInvariant("third", ">=", "y", 0),
     ]
@@ -841,9 +842,42 @@ def test_known_split_keeps_atomic_and_lag_sign_aliases_together():
         assert calibration_names.isdisjoint(validation_names)
         locations = {
             name: name in calibration_names
-            for name in ("atomic", "lag_1", "lag_2")
+            for name in ("atomic", "lag_1", "lag_2", "lag_strict")
         }
         assert len(set(locations.values())) == 1, (seed, locations)
+
+
+def test_known_split_keeps_singleton_sum_balance_aliases_together():
+    known = [
+        KnownInvariant(
+            "ref_sum",
+            "==",
+            "total",
+            {"sum": ["a", "b"]},
+        ),
+        KnownInvariant(
+            "singleton_balance",
+            "==",
+            {"sum": ["total"]},
+            {"sum": ["a", "b"]},
+        ),
+        KnownInvariant("other", "==", "x", "y"),
+        KnownInvariant("third", ">=", "z", 0),
+    ]
+
+    for seed in range(25):
+        calibration, validation = _split_known(
+            known,
+            frac=0.5,
+            seed=seed,
+        )
+        calibration_names = {item.name for item in calibration}
+        validation_names = {item.name for item in validation}
+        assert calibration_names.isdisjoint(validation_names)
+        assert (
+            ("ref_sum" in calibration_names)
+            == ("singleton_balance" in calibration_names)
+        ), seed
 
 
 def _crosscheck_columns(df: pd.DataFrame) -> list[str]:

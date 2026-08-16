@@ -16,11 +16,18 @@ from . import ast as A
 
 def term_to_dict(t: A.Term) -> dict:
     if isinstance(t, A.Const):
-        return {"k": "Const", "value": t.value}
+        return {
+            "k": "Const",
+            "value": _finite_float(t.value, "constant"),
+        }
     if isinstance(t, A.Ref):
         return {"k": "Ref", "role": t.role}
     if isinstance(t, A.Scale):
-        return {"k": "Scale", "coeff": t.coeff, "term": term_to_dict(t.term)}
+        return {
+            "k": "Scale",
+            "coeff": _finite_float(t.coeff, "scale coefficient"),
+            "term": term_to_dict(t.term),
+        }
     if isinstance(t, A.Add):
         return {"k": "Add", "terms": [term_to_dict(x) for x in t.terms]}
     if isinstance(t, A.Agg):
@@ -30,11 +37,24 @@ def term_to_dict(t: A.Term) -> dict:
     if isinstance(t, A.Div):
         return {"k": "Div", "num": term_to_dict(t.num), "den": term_to_dict(t.den)}
     if isinstance(t, A.Lag):
-        return {"k": "Lag", "steps": t.steps, "term": term_to_dict(t.term)}
+        return {
+            "k": "Lag",
+            "steps": _positive_int(t.steps, "lag steps"),
+            "term": term_to_dict(t.term),
+        }
     if isinstance(t, A.Diff):
-        return {"k": "Diff", "steps": t.steps, "term": term_to_dict(t.term)}
+        return {
+            "k": "Diff",
+            "steps": _positive_int(t.steps, "difference steps"),
+            "term": term_to_dict(t.term),
+        }
     if isinstance(t, A.Rolling):
-        return {"k": "Rolling", "window": t.window, "kind": t.kind, "term": term_to_dict(t.term)}
+        return {
+            "k": "Rolling",
+            "window": _positive_int(t.window, "rolling window"),
+            "kind": t.kind,
+            "term": term_to_dict(t.term),
+        }
     if isinstance(t, A.RelatedAgg):
         return {"k": "RelatedAgg", "role": t.role}
     raise TypeError(f"unknown term {t!r}")
@@ -218,7 +238,11 @@ def rule_to_dict(r: A.Rule) -> dict:
         payload.update({
             "atom_kind": "BandDefinition",
             "term": term_to_dict(r.atom.term),
-            "center": r.atom.center,
+            "center": (
+                None
+                if r.atom.center is None
+                else _finite_float(r.atom.center, "band center")
+            ),
         })
     else:
         raise TypeError(f"unknown rule atom {r.atom!r}")
@@ -378,12 +402,22 @@ def predicate_to_dict(predicate: A.Predicate) -> dict:
             "k": "Bound",
             "term": term_to_dict(predicate.term),
             "op": predicate.op,
-            "threshold": predicate.threshold,
+            "threshold": (
+                None
+                if predicate.threshold is None
+                else _finite_float(
+                    predicate.threshold,
+                    "predicate threshold",
+                )
+            ),
         }
     if isinstance(predicate, A.Sustained):
         return {
             "k": "Sustained",
-            "window": predicate.window,
+            "window": _positive_int(
+                predicate.window,
+                "sustained window",
+            ),
             "predicate": predicate_to_dict(predicate.predicate),
         }
     if isinstance(predicate, A.Conjunction):

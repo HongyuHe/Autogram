@@ -424,15 +424,46 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
 
     def atomic_sign_recovery_key(signature):
         """Entries one exact atomic sign law can recover together."""
+        def direction(op):
+            if op in (">", ">="):
+                return "positive"
+            if op in ("<", "<="):
+                return "negative"
+            return op
+
         if not isinstance(signature, tuple) or not signature:
             return None
         if signature[0] == "one_sided" and len(signature) == 3:
             _tag, column, op = signature
-            return ("atomic_sign_family", column, op)
+            return ("atomic_sign_family", column, direction(op))
         if signature[0] == "lag_bound" and len(signature) == 2:
             column, _steps, op = signature[1]
-            return ("atomic_sign_family", column, op)
+            return ("atomic_sign_family", column, direction(op))
         return None
+
+    def sum_balance_recovery_alias(signature):
+        """Canonical spelling shared by ref-vs-sum and singleton-sum balance relations."""
+        if not isinstance(signature, tuple) or not signature:
+            return signature
+        if signature[0] == "conditional" and len(signature) == 2:
+            condition, base = signature[1]
+            return (
+                "conditional",
+                (condition, sum_balance_recovery_alias(base)),
+            )
+        if signature[0] != "equality" or len(signature) != 3:
+            return signature
+        tag, strength, base = signature
+        if isinstance(base, tuple) and base and base[0] == "ref_sum":
+            reference, columns = base[1]
+            base = (
+                "sum_balance",
+                frozenset({
+                    frozenset({reference}),
+                    frozenset(columns),
+                }),
+            )
+        return (tag, strength, base)
 
     def find(index: int) -> int:
         while parent[index] != index:
@@ -459,6 +490,18 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                 # `recover_known` credits every grounded lag from one tolerance-free exact atomic
                 # sign law. Splitting those catalogue entries would put the calibration evidence
                 # itself in validation even though their structural signatures differ by lag.
+                union(i, j)
+                continue
+            if any(
+                relation_signature_matches(
+                    sum_balance_recovery_alias(left),
+                    sum_balance_recovery_alias(right),
+                )
+                for left in expansions[i]
+                for right in expansions[j]
+            ):
+                # One ref-vs-sum rule emits both its `ref_sum` signature and a singleton-left
+                # `sum_balance`, so those catalogue spellings share one recovery witness.
                 union(i, j)
                 continue
             if any(

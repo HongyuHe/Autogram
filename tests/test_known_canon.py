@@ -123,6 +123,12 @@ def test_typed_categorical_signatures_are_stable_and_distinct():
     assert not relation_signature_matches(float_category, nearby_float)
 
 
+def test_known_conditions_reject_missing_and_character_iterable_memberships():
+    assert _known_condition_signature({"kind": np.nan}) is None
+    assert _known_condition_signature({"kind_in": "ab"}) is None
+    assert _known_condition_signature({"kind_in": []}) is None
+
+
 def _bimodal_frame():
     """A member that is zero on 51% of the rows and large on the other 49%.
 

@@ -52,6 +52,38 @@ def test_nonneg_proxy_plants_only_nonnegativity():
     assert (data.matrix == 0).any()                        # dropout breaks trivial presence pairing
 
 
+def test_additional_sum_balance_preserves_exactness(dataset):
+    rule = A.Rule(
+        "node",
+        A.Compare(
+            A.Ref("measurement_source"),
+            "==",
+            A.Agg("SUM", "demand_row"),
+        ),
+    )
+
+    relations = V.rule_relations(rule, dataset)
+    balances = [
+        relation
+        for relation in relations
+        if (
+            isinstance(relation, tuple)
+            and len(relation) == 3
+            and relation[0] == "equality"
+            and isinstance(relation[2], tuple)
+            and relation[2][0] == "sum_balance"
+        )
+    ]
+
+    assert balances
+    assert all(relation[1] == "exact" for relation in balances)
+    assert not any(
+        isinstance(relation, tuple)
+        and relation[:1] == ("sum_balance",)
+        for relation in relations
+    )
+
+
 def test_nonpos_proxy_plants_only_nonpositivity():
     data = synth.make_synthetic(n_entities=3, n_snapshots=80, noise=0.0, seed=0,
                                 families=("nonpos",))
