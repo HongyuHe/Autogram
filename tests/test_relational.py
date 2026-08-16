@@ -103,6 +103,110 @@ def test_runtime_relation_null_preserves_declared_reset_domain():
     assert len(set(output["counter"].tolist())) > 2
 
 
+def test_runtime_relation_null_preserves_all_false_reset_support():
+    relation = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=18, freq="10s"),
+        "shard_id": ["s0"] * 18,
+        "counter": np.arange(18, dtype=float) * 10.0,
+        "reset_flag": [False] * 18,
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="counter_delta",
+        relation="raw",
+        column="counter",
+        mode="sum_delta",
+        parent_keys=(),
+        child_keys=(),
+        partition_keys=("shard_id",),
+        parent_time="timestamp",
+        child_time="timestamp",
+        window_seconds=60,
+        reset_column="reset_flag",
+        validity_columns=("counter",),
+    )
+
+    output = _runtime_relation_null(
+        relation,
+        [template],
+        {},
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+
+    assert not output["reset_flag"].astype(bool).any()
+    counter = output["counter"].to_numpy(dtype=float)
+    assert np.all(np.isfinite(counter))
+    assert np.all(np.diff(counter) >= 0.0)
+
+
+def test_mixed_span_and_delta_null_retains_both_relation_families():
+    relation = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=12, freq="10s"),
+        "consumer_id": ["c0"] * 12,
+        "shard_id": ["s0"] * 12,
+        "counter": np.arange(12, dtype=float),
+        "reset_flag": [False] * 12,
+        "type": ["event"] * 12,
+        "span_start": pd.date_range("2026-01-01", periods=12, freq="10s"),
+        "span_end": pd.date_range("2026-01-01 00:00:05", periods=12, freq="10s"),
+    })
+    span = RelatedTemplate(
+        binder="record",
+        role="event",
+        relation="mixed",
+        column="type",
+        mode="span_any",
+        parent_keys=("consumer_id",),
+        child_keys=("consumer_id",),
+        partition_keys=(),
+        parent_time="timestamp",
+        child_time="timestamp",
+        window_seconds=60,
+        span_start="span_start",
+        span_end="span_end",
+        filter_column="type",
+        filter_values=("event",),
+    )
+    delta = RelatedTemplate(
+        binder="record",
+        role="counter_delta",
+        relation="mixed",
+        column="counter",
+        mode="sum_delta",
+        parent_keys=("consumer_id",),
+        child_keys=("consumer_id",),
+        partition_keys=("shard_id",),
+        parent_time="timestamp",
+        child_time="timestamp",
+        window_seconds=60,
+        reset_column="reset_flag",
+        validity_columns=("counter",),
+    )
+    parent_context = {
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=3,
+            freq="1min",
+        ).to_numpy(),
+        "consumer_id": np.array(["c0"] * 3, dtype=object),
+    }
+
+    output = _runtime_relation_null(
+        relation,
+        [span, delta],
+        parent_context,
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+
+    assert int(np.count_nonzero(np.isfinite(
+        pd.to_numeric(output["counter"], errors="coerce")
+    ))) >= len(relation)
+    assert output["span_start"].notna().any()
+    assert len(output) > len(relation)
+
+
 def _prepared() -> pd.DataFrame:
     timestamps = pd.date_range("2026-01-01", periods=18, freq="10s")
     rows = []

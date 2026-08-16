@@ -786,5 +786,17 @@ def _materialize_raw(
                 # zeros must stay untouched.
                 column[np.intersect1d(rows, own, assume_unique=False)] = np.nan
 
+    # A parent consumer with no raw partition is ungradeable for EVERY related family. Leaving the
+    # generated shard columns at their cross-consumer structural zero would fabricate a total of
+    # zero, while the streaming join correctly returns NaN because it finds no child partitions.
+    raw_consumers = {
+        consumer_key
+        for consumer_key, _shard_key in groups
+    }
+    for consumer_key in set(own_rows) - raw_consumers:
+        rows = own_rows[consumer_key]
+        for column in materialized.values():
+            column[rows] = np.nan
+
     families = {name: columns for name, columns in families.items() if columns}
     return materialized, families

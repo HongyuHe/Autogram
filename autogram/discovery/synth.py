@@ -179,7 +179,7 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
         orig = row_totals + shared_offset
         term = col_totals + shared_offset
     else:
-        orig = (row_totals if "row_sum" in enabled
+        orig = (row_totals if enabled & {"row_sum", "sum_balance"}
                 else rng.gamma(shape=2.0, scale=10.0, size=(T, N)))
         term = (col_totals if "col_sum" in enabled
                 else rng.gamma(shape=2.0, scale=10.0, size=(T, N)))
@@ -188,6 +188,17 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
         orig = term / np.maximum(diagonal, 1e-6)
     if "proportional" in enabled:
         orig = 1.7 * term
+    if "conditional_proportional" in enabled:
+        regime = np.resize(
+            np.array(["proportional", "other"], dtype=object),
+            T,
+        )
+        independent = rng.gamma(shape=2.0, scale=10.0, size=(T, N))
+        orig = np.where(
+            (regime == "proportional")[:, None],
+            1.7 * term,
+            independent,
+        )
     if "monotone" in enabled:
         orig = np.cumsum(rng.uniform(1.0, 3.0, size=(T, N)), axis=0)
     if "windowed_ratio" in enabled:
@@ -205,6 +216,8 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
     relations: Dict[str, object] = {}
     related_aggregates: Dict[str, dict] = {}
     proxy_timestamps = None
+    if "conditional_proportional" in enabled:
+        row_context["regime"] = regime
     if enabled & {"conditional_positive", "conditional_zero"}:
         regime = np.resize(
             np.array(["positive", "zero", "other"], dtype=object),
@@ -357,6 +370,8 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
                         "ratio",
                         "windowed_ratio",
                         "monotone",
+                        "lag_bound",
+                        "conditional_proportional",
                     }
                     and name.endswith("_" + vocab.source)
                 )
@@ -557,9 +572,12 @@ def _planted(vocab: Vocab, ents, N, temporal_window: int = 5) -> Dict[str, objec
     ratios = set()
     proportionals = set()
     monotone = set()
+    lag_bound = set()
+    sum_balance = set()
     windowed_ratios = set()
     conditional_positive = set()
     conditional_zero = set()
+    conditional_proportional = set()
     sustained = set()
     conjunction = set()
     cross_grain = set()
@@ -584,6 +602,17 @@ def _planted(vocab: Vocab, ents, N, temporal_window: int = 5) -> Dict[str, objec
             1,
             ">=",
         ))
+        lag_bound.add((
+            f"{vocab.measurement}_{ents[i]}_{vocab.source}",
+            1,
+            ">=",
+        ))
+        sum_balance.add(frozenset({
+            frozenset({
+                f"{vocab.measurement}_{ents[i]}_{vocab.source}",
+            }),
+            frozenset(row),
+        }))
         windowed_ratios.add((
             f"{vocab.measurement}_{ents[i]}_{vocab.source}",
             f"{vocab.measurement}_{ents[i]}_{vocab.destination}",
@@ -610,6 +639,20 @@ def _planted(vocab: Vocab, ents, N, temporal_window: int = 5) -> Dict[str, objec
             (
                 "delta_zero",
                 (f"{vocab.measurement}_{ents[i]}_{vocab.source}", 1),
+            ),
+        ))
+        conditional_proportional.add((
+            (
+                "regime",
+                "==",
+                (typed_signature_value("proportional"),),
+            ),
+            (
+                "proportional",
+                (
+                    f"{vocab.measurement}_{ents[i]}_{vocab.source}",
+                    f"{vocab.measurement}_{ents[i]}_{vocab.destination}",
+                ),
             ),
         ))
         source = f"{vocab.measurement}_{ents[i]}_{vocab.source}"
@@ -695,9 +738,12 @@ def _planted(vocab: Vocab, ents, N, temporal_window: int = 5) -> Dict[str, objec
         "ratio": ratios,
         "proportional": proportionals,
         "monotone": monotone,
+        "lag_bound": lag_bound,
+        "sum_balance": sum_balance,
         "windowed_ratio": windowed_ratios,
         "conditional_positive": conditional_positive,
         "conditional_zero": conditional_zero,
+        "conditional_proportional": conditional_proportional,
         "sustained": sustained,
         "conjunction": conjunction,
         "categorical": {

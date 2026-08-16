@@ -744,6 +744,51 @@ def test_categorical_priority_map_is_evaluated_and_enumerated():
     assert normalize_rule(rule).unparse() in rendered
 
 
+def test_proxy_definition_credit_requires_exact_predicted_spans():
+    n = 120
+    values = np.linspace(0.0, 1.0, n)
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "timestamp": pd.date_range("2026-01-01", periods=n, freq="1min"),
+            "series_id": ["a"] * n,
+            "target": values < 0.5,
+            "x": values,
+        }),
+        time_index="timestamp",
+        group_keys=("series_id",),
+        temporal_windows=(1,),
+        advanced=True,
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="exact_proxy_spans",
+    )
+
+    def evaluation(threshold):
+        rule = A.Rule(
+            "record",
+            A.BooleanDefinition(
+                A.Ref("target"),
+                A.Sustained(
+                    A.Bound(A.Ref("x"), "<", threshold),
+                    1,
+                ),
+            ),
+        )
+        return SimpleNamespace(rule=rule, parameters={})
+
+    result = SimpleNamespace(dataset=dataset)
+    assert validation._definition_matches_planted_mask(
+        evaluation(0.5),
+        result,
+    )
+    assert not validation._definition_matches_planted_mask(
+        evaluation(0.4),
+        result,
+    )
+
+
 def test_categorical_definition_scores_typed_identity_and_remains_enumerable():
     """A rule that only works because ``True == 1`` must be rejected.
 
@@ -1362,8 +1407,11 @@ def test_advanced_known_signatures_and_recovery_fields():
         recovery = score_recovery(result, planted)
     finally:
         validation.portfolio_relations = original
-    assert recovery.sustained == 1.0
-    assert recovery.conjunction == 1.0
+    # Structural signatures alone no longer earn sustained/conjunction credit: the scorer requires
+    # an actual Evaluation whose predictions match the planted spans exactly. Dedicated live tests
+    # above cover that path; this mocked portfolio has no dataset/predictions, so credit stays zero.
+    assert recovery.sustained == 0.0
+    assert recovery.conjunction == 0.0
     assert recovery.categorical == 1.0
 
 

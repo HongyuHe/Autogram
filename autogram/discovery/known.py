@@ -58,6 +58,35 @@ class KnownInvariant:
     where: object = None
 
 
+def _known_positive_int(value, label: str) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value <= 0
+    ):
+        raise ValueError(f"{label} must be a positive JSON integer")
+    return value
+
+
+def _known_finite_number(value, label: str) -> float:
+    if (
+        not isinstance(value, numbers.Real)
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError(f"{label} must be a finite JSON number")
+    return float(value)
+
+
+def _known_is_zero(value) -> bool:
+    return (
+        isinstance(value, numbers.Real)
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) == 0.0
+    )
+
+
 def load_known(path: str) -> List[KnownInvariant]:
     """Load known invariants from a YAML or JSON file with an ``invariants:`` list."""
     text = open(path, "r", encoding="utf-8").read()
@@ -86,6 +115,16 @@ def load_known(path: str) -> List[KnownInvariant]:
             raise ValueError(
                 f"known invariant {invariant.name!r} has an invalid condition"
             )
+        try:
+            signature = _signature(invariant)
+        except ValueError as error:
+            raise ValueError(
+                f"known invariant {invariant.name!r}: {error}"
+            ) from error
+        if signature is None:
+            raise ValueError(
+                f"known invariant {invariant.name!r} has an unsupported or invalid form"
+            )
         out.append(invariant)
     return out
 
@@ -100,14 +139,23 @@ def _signature(inv: KnownInvariant):
 
 def _base_signature(inv: KnownInvariant):
     op, lhs, rhs = inv.op, inv.lhs, inv.rhs
-    is_zero = isinstance(rhs, (int, float)) and float(rhs) == 0.0
+    is_zero = _known_is_zero(rhs)
     if (
         op == "~band"
         and isinstance(lhs, str)
         and isinstance(rhs, dict)
         and "center" in rhs
     ):
-        return ("healthy_band", (lhs, float(rhs["center"])))
+        return (
+            "healthy_band",
+            (
+                lhs,
+                _known_finite_number(
+                    rhs["center"],
+                    "healthy-band center",
+                ),
+            ),
+        )
     if (
         op in ("~=", "==")
         and isinstance(lhs, dict)
@@ -166,14 +214,28 @@ def _base_signature(inv: KnownInvariant):
         if not isinstance(value, (list, tuple)) or len(value) != 2:
             return None
         column, steps = value
-        return ("lag_bound", (str(column), int(steps), op))
+        return (
+            "lag_bound",
+            (
+                str(column),
+                _known_positive_int(steps, "lag steps"),
+                op,
+            ),
+        )
     if op in (">=", "<=", ">", "<") and is_zero and isinstance(lhs, dict) and "delta" in lhs:
         value = lhs["delta"]
         if isinstance(value, (list, tuple)):
             column, steps = value
         else:
             column, steps = value, 1
-        return ("delta_bound", (str(column), int(steps), op))
+        return (
+            "delta_bound",
+            (
+                str(column),
+                _known_positive_int(steps, "delta steps"),
+                op,
+            ),
+        )
     if op in ("~=", "==") and is_zero and isinstance(lhs, dict) and "delta" in lhs:
         value = lhs["delta"]
         if isinstance(value, (list, tuple)):
@@ -182,7 +244,13 @@ def _base_signature(inv: KnownInvariant):
             column, steps = value, 1
         return _equality_relation(
             op,
-            ("delta_zero", (str(column), int(steps))),
+            (
+                "delta_zero",
+                (
+                    str(column),
+                    _known_positive_int(steps, "delta steps"),
+                ),
+            ),
         )
     if op in ("~=", "==") and isinstance(lhs, str) and isinstance(rhs, dict) and "ratio" in rhs:
         values = list(rhs["ratio"])
@@ -274,29 +342,52 @@ def _known_temporal_ref(value, form: str):
     payload = value[form]
     if not isinstance(payload, (list, tuple)) or len(payload) != 2:
         return None
-    return str(payload[0]), int(payload[1])
+    return (
+        str(payload[0]),
+        _known_positive_int(payload[1], f"{form} window"),
+    )
 
 
 def _known_term_signature(value):
     if isinstance(value, str):
         return ("ref", value)
-    if isinstance(value, (int, float)):
-        return ("const", float(value))
+    if isinstance(value, numbers.Real) and not isinstance(value, bool):
+        return (
+            "const",
+            _known_finite_number(value, "term constant"),
+        )
     if not isinstance(value, dict):
         return None
     if "delta" in value:
         payload = value["delta"]
         if isinstance(payload, (list, tuple)):
-            return ("delta", _known_term_signature(payload[0]), int(payload[1]))
+            if len(payload) != 2:
+                return None
+            return (
+                "delta",
+                _known_term_signature(payload[0]),
+                _known_positive_int(payload[1], "delta steps"),
+            )
         return ("delta", _known_term_signature(payload), 1)
     if "lag" in value:
         payload = value["lag"]
         if not isinstance(payload, (list, tuple)) or len(payload) != 2:
             return None
-        return ("lag", _known_term_signature(payload[0]), int(payload[1]))
+        return (
+            "lag",
+            _known_term_signature(payload[0]),
+            _known_positive_int(payload[1], "lag steps"),
+        )
     if "roll_sum" in value:
         payload = value["roll_sum"]
-        return ("rolling", "SUM", int(payload[1]), _known_term_signature(payload[0]))
+        if not isinstance(payload, (list, tuple)) or len(payload) != 2:
+            return None
+        return (
+            "rolling",
+            "SUM",
+            _known_positive_int(payload[1], "rolling window"),
+            _known_term_signature(payload[0]),
+        )
     if "difference" in value:
         left, right = value["difference"]
         return ("difference", _known_term_signature(left), _known_term_signature(right))
@@ -324,7 +415,7 @@ def _known_sustained_signature(value):
         return None
     return (
         "sustained",
-        int(value["window"]),
+        _known_positive_int(value["window"], "sustained window"),
         (
             "bound",
             term_signature,
@@ -337,7 +428,7 @@ def _known_sustained_signature(value):
 def _threshold_signature(value):
     if value is None:
         return None
-    return float(value)
+    return _known_finite_number(value, "predicate threshold")
 
 
 def shapes_for_invariant(inv: KnownInvariant) -> List[str]:
@@ -366,6 +457,8 @@ def shapes_for_invariant(inv: KnownInvariant) -> List[str]:
             return ["conditional_positive"]
         if base[0] == "delta_zero":
             return ["conditional_zero"]
+        if base[0] == "proportional":
+            return ["conditional_proportional"]
     if base is not None and base[0] == "related_aggregate":
         return ["cross_grain"]
     if base is not None and base[0] == "sustained_definition":
@@ -377,12 +470,14 @@ def shapes_for_invariant(inv: KnownInvariant) -> List[str]:
     if base is not None and base[0] == "healthy_band":
         return ["healthy_band"]
     if base is not None and base[0] == "lag_bound":
-        return ["monotone"]
+        return ["lag_bound"]
+    if base is not None and base[0] == "sum_balance":
+        return ["sum_balance"]
     if op in (">=", "<=", ">", "<") and isinstance(inv.lhs, dict) and "delta" in inv.lhs:
         return ["monotone"]
     if base is not None and base[0] == "windowed_ratio":
         return ["windowed_ratio"]
-    is_zero = isinstance(rhs, (int, float)) and float(rhs) == 0.0
+    is_zero = _known_is_zero(rhs)
     if op in ("~=", "==") and is_zero:
         return ["self_zero"]
     if op in ("~=", "==") and isinstance(rhs, dict) and "sum" in rhs:
@@ -704,6 +799,25 @@ def _canonicalize(sig, frame, zero_tol: float, exact: bool | None = None):
                 ),
             ),
         )
+    if sig[0] == "sum_balance":
+        groups = tuple(sig[1])
+        singletons = [group for group in groups if len(group) == 1]
+        if len(groups) == 2 and len(singletons) == 1:
+            singleton = frozenset(singletons[0])
+            anchor = next(iter(singleton))
+            other = groups[0] if groups[1] == singleton else groups[1]
+            canonical_other = _drop_negligible(
+                other,
+                anchor,
+                frame,
+                zero_tol,
+                exact=bool(exact),
+            )
+            return (
+                "sum_balance",
+                frozenset({singleton, canonical_other}),
+            )
+        return sig
     if sig[0] == "agg_ref_balance":
         return (
             "sum_balance",

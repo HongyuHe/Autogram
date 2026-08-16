@@ -880,6 +880,44 @@ def test_known_split_keeps_singleton_sum_balance_aliases_together():
         ), seed
 
 
+def test_known_split_canonicalizes_zero_members_in_singleton_sum_aliases():
+    from autogram.calibrate import _ColumnScaleView
+
+    frame = pd.DataFrame({
+        "total": np.full(60, 10.0),
+        "a": np.full(60, 10.0),
+        "z": np.zeros(60),
+        "x": np.linspace(1.0, 2.0, 60),
+        "y": np.linspace(3.0, 4.0, 60),
+    })
+    known = [
+        KnownInvariant("ref_sum", "==", "total", {"sum": ["a"]}),
+        KnownInvariant(
+            "singleton_balance",
+            "==",
+            {"sum": ["total"]},
+            {"sum": ["a", "z"]},
+        ),
+        KnownInvariant("other", "==", "x", "y"),
+        KnownInvariant("third", ">=", "x", 0),
+    ]
+
+    for seed in range(25):
+        calibration, validation = _split_known(
+            known,
+            frac=0.5,
+            seed=seed,
+            frame=_ColumnScaleView(frame),
+        )
+        calibration_names = {item.name for item in calibration}
+        validation_names = {item.name for item in validation}
+        assert calibration_names.isdisjoint(validation_names)
+        assert (
+            ("ref_sum" in calibration_names)
+            == ("singleton_balance" in calibration_names)
+        ), seed
+
+
 def _crosscheck_columns(df: pd.DataFrame) -> list[str]:
     return [str(column) for column in df.columns if str(column).startswith(("low_", "high_"))]
 

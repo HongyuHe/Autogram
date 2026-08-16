@@ -20,6 +20,7 @@ KNOWN_SHAPES = (
     "row_sum", "col_sum", "two_end", "self_zero",
     "offset_pair", "agg_ref_balance", "presence_pair",
     "nonneg", "nonpos", "ratio", "proportional", "monotone", "windowed_ratio",
+    "lag_bound", "sum_balance", "conditional_proportional",
     "conditional_positive", "conditional_zero",
     "cross_grain", "sustained", "conjunction", "categorical",
     "healthy_band",

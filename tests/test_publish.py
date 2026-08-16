@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from autogram.discovery import regime as R
 from autogram.discovery.known import (
     KnownInvariant, _signature, abstract_shapes, load_known, shapes_for_invariant,
@@ -24,6 +26,26 @@ def test_shapes_for_invariant_maps_each_relation_form():
     assert shapes_for_invariant(KnownInvariant("a", "<|>", "x", "y")) == ["presence_pair"]
     assert shapes_for_invariant(KnownInvariant("a", ">=", "x", 0)) == ["nonneg"]
     assert shapes_for_invariant(KnownInvariant("a", "<=", "x", 0)) == ["nonpos"]
+    assert shapes_for_invariant(
+        KnownInvariant("lag", ">=", {"lag": ["x", 2]}, 0)
+    ) == ["lag_bound"]
+    assert shapes_for_invariant(
+        KnownInvariant(
+            "balance",
+            "==",
+            {"sum": ["total"]},
+            {"sum": ["a", "b"]},
+        )
+    ) == ["sum_balance"]
+    assert shapes_for_invariant(
+        KnownInvariant(
+            "guarded_prop",
+            "~∝",
+            "x",
+            "y",
+            where={"regime": "proportional"},
+        )
+    ) == ["conditional_proportional"]
     # a reference-vs-sum never abstracts to agg_ref_balance (the file format cannot express it)
     assert "agg_ref_balance" not in shapes_for_invariant(
         KnownInvariant("a", "==", "x", {"sum": ["y", "z"]}))
@@ -89,6 +111,29 @@ def test_load_known_json(tmp_path):
     p.write_text(json.dumps({"invariants": [{"name": "n", "op": ">=", "lhs": "c", "rhs": 0}]}))
     k = load_known(str(p))
     assert len(k) == 1 and k[0].op == ">=" and k[0].lhs == "c"
+
+
+@pytest.mark.parametrize(
+    "invariant",
+    [
+        {"name": "fractional_lag", "op": ">=", "lhs": {"lag": ["x", 1.9]}, "rhs": 0},
+        {"name": "negative_lag", "op": ">=", "lhs": {"lag": ["x", -1]}, "rhs": 0},
+        {"name": "boolean_zero", "op": ">=", "lhs": "x", "rhs": False},
+        {"name": "fractional_window", "op": "~=", "lhs": "r", "rhs": {
+            "ratio": [
+                {"roll_sum": ["x", 3.9]},
+                {"roll_sum": ["y", 3.9]},
+            ],
+        }},
+        {"name": "nan_center", "op": "~band", "lhs": "x", "rhs": {"center": float("nan")}},
+    ],
+)
+def test_load_known_rejects_invalid_numeric_literals(tmp_path, invariant):
+    path = tmp_path / "invalid.json"
+    path.write_text(json.dumps({"invariants": [invariant]}))
+
+    with pytest.raises(ValueError, match="known invariant"):
+        load_known(str(path))
 
 
 def test_precheck_unknown_harness_fails():

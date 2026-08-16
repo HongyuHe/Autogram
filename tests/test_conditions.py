@@ -250,6 +250,27 @@ def test_all_numeric_ast_fields_serialize_numpy_scalars_to_json():
         rule_from_dict(payload)
 
 
+def test_parser_rejects_string_numbers_and_float_integer_fields():
+    with pytest.raises(ValueError, match="finite number"):
+        rule_from_dict({
+            "binder": "record",
+            "op": "~=",
+            "left": {"k": "Ref", "role": "x"},
+            "right": {"k": "Const", "value": "1.5"},
+        })
+    with pytest.raises(ValueError, match="positive integer"):
+        rule_from_dict({
+            "binder": "record",
+            "op": "~=",
+            "left": {
+                "k": "Lag",
+                "term": {"k": "Ref", "role": "x"},
+                "steps": 2.0,
+            },
+            "right": {"k": "Ref", "role": "y"},
+        })
+
+
 def test_solver_and_membership_enumeration_preserve_typed_conditions():
     grammar = Grammar(
         binders=("record",),

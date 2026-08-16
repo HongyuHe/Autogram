@@ -23,6 +23,7 @@ from autogram.dsl import ast as A
 from autogram.schema.spec import (
     CellCodec,
     ColumnPattern,
+    FamilySelector,
     GrammarSpec,
     RefTemplate,
     RoleOntology,
@@ -143,6 +144,28 @@ class _WideSyntheticInducer(_SyntheticInducer):
                 spec.ontology,
                 fam_roles=fam_roles,
                 agg_kinds=("SUM", "AVG", "MIN", "MAX"),
+            ),
+            family_selectors=(
+                FamilySelector(
+                    "node",
+                    "demand_row",
+                    "flow",
+                    "demand",
+                    (
+                        ("source", "==", "X"),
+                        ("destination", "!=", "X"),
+                    ),
+                ),
+                FamilySelector(
+                    "node",
+                    "demand_col",
+                    "flow",
+                    "demand",
+                    (
+                        ("destination", "==", "X"),
+                        ("source", "!=", "X"),
+                    ),
+                ),
             ),
         )
 
@@ -269,7 +292,7 @@ def test_new_proxy_shape_recovers_with_zero_temporal_null(shape, noise):
             ),
         ]),
         seed=0,
-        inducer=_SyntheticInducer(),
+        inducer=_WideSyntheticInducer(),
     )
     proxy = suite.positives[0]
     evaluation = DataOnlyEvaluator(
@@ -297,7 +320,7 @@ def test_time_shuffled_proxy_accepts_no_temporal_rules():
             ProxyEntry("monotone", noise=0.0, n_entities=3, n_snapshots=240),
         ]),
         seed=0,
-        inducer=_SyntheticInducer(),
+        inducer=_WideSyntheticInducer(),
     )
     assert suite.temporal_null is not None
     assert null_temporal_at(
@@ -461,8 +484,18 @@ def test_proxy_temporal_window_controls_positive_and_null_grammars():
     assert candidate.proxies[0].recovery == 1.0
 
 
-@pytest.mark.parametrize("shape", ["ratio", "proportional", "monotone", "windowed_ratio", "conditional_positive", "conditional_zero", "sustained", "conjunction", "categorical", "cross_grain", "healthy_band"])
+@pytest.mark.parametrize("shape", [
+    "ratio", "proportional", "monotone", "lag_bound", "sum_balance",
+    "conditional_proportional", "windowed_ratio", "conditional_positive",
+    "conditional_zero", "sustained", "conjunction", "categorical",
+    "cross_grain", "healthy_band",
+])
 def test_joint_grid_scores_new_proxy_compactly_and_safely(shape):
+    inducer = (
+        _WideSyntheticInducer()
+        if shape == "sum_balance"
+        else _SyntheticInducer()
+    )
     suite = prepare_proxy_suite(
         RegimeSpec(entries=[
             ProxyEntry(
@@ -474,7 +507,7 @@ def test_joint_grid_scores_new_proxy_compactly_and_safely(shape):
             ),
         ]),
         seed=0,
-        inducer=_SyntheticInducer(),
+        inducer=inducer,
     )
     candidate = evaluate_grid_candidate(
         suite,
@@ -498,6 +531,9 @@ def test_all_new_shapes_jointly_tune_under_all_null_guards():
         "ratio",
         "proportional",
         "monotone",
+        "lag_bound",
+        "sum_balance",
+        "conditional_proportional",
         "windowed_ratio",
         "conditional_positive",
         "conditional_zero",
@@ -519,7 +555,7 @@ def test_all_new_shapes_jointly_tune_under_all_null_guards():
             for shape in shapes
         ]),
         seed=0,
-        inducer=_SyntheticInducer(),
+        inducer=_WideSyntheticInducer(),
     )
     tuned = tune_joint(
         suite,

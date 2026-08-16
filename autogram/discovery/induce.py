@@ -1407,6 +1407,48 @@ def _log_schema_event(event: str, payload: dict) -> None:
 
 
 def _spec_from_json(payload) -> GrammarSpec:
+    def positive_int(value, label: str, *, minimum: int) -> int:
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < minimum
+        ):
+            raise ValueError(
+                f"{label} must be an integer >= {minimum}"
+            )
+        return value
+
+    def json_int(
+        name: str,
+        default: int,
+        *,
+        minimum: int,
+        zero_means_default: bool = False,
+    ) -> int:
+        value = payload.get(name, default)
+        if zero_means_default and value == 0 and not isinstance(value, bool):
+            value = default
+        return positive_int(
+            value,
+            f"induced schema field {name!r}",
+            minimum=minimum,
+        )
+
+    def json_ints(name: str, *, minimum: int) -> tuple[int, ...]:
+        values = payload.get(name, ()) or ()
+        if not isinstance(values, (list, tuple)):
+            raise ValueError(
+                f"induced schema field {name!r} must be a list of integers"
+            )
+        output = []
+        for value in values:
+            output.append(positive_int(
+                value,
+                f"induced schema field {name!r}",
+                minimum=minimum,
+            ))
+        return tuple(output)
+
     onto = payload["ontology"]
     noisy_kind = str(payload.get("noisy_kind") or "measurement")
     demand_kind = str(payload.get("demand_kind") or "demand")
@@ -1461,7 +1503,7 @@ def _spec_from_json(payload) -> GrammarSpec:
         noisy_kind=noisy_kind,
         demand_kind=demand_kind,
         link_marker_direction=(link_directions[0] if link_directions else payload.get("link_marker_direction") or _first_link_direction(ref_templates) or "demand"),
-        max_degree=int(payload.get("max_degree", 1) or 1),
+        max_degree=json_int("max_degree", 1, minimum=1),
         role_exclusions=tuple(
             frozenset(str(x) for x in pair)
             for pair in payload.get("role_exclusions", []) or []
@@ -1472,10 +1514,15 @@ def _spec_from_json(payload) -> GrammarSpec:
         group_keys=tuple(str(c) for c in payload.get("group_keys", ())),
         condition_columns=_condition_columns(payload.get("condition_columns", {})),
         temporal_enabled=temporal_enabled,
-        max_lag=int(payload.get("max_lag", 0) or 0),
-        windows=tuple(int(window) for window in payload.get("windows", ())),
+        max_lag=json_int("max_lag", 0, minimum=0),
+        windows=json_ints("windows", minimum=1),
         conditional_enabled=bool(payload.get("conditional_enabled", False)),
-        max_condition_values=int(payload.get("max_condition_values", 4) or 4),
+        max_condition_values=json_int(
+            "max_condition_values",
+            4,
+            minimum=1,
+            zero_means_default=True,
+        ),
         related_templates=tuple(
             RelatedTemplate(
                 binder=str(template["binder"]),
@@ -1488,7 +1535,11 @@ def _spec_from_json(payload) -> GrammarSpec:
                 partition_keys=tuple(str(value) for value in template.get("partition_keys", ())),
                 parent_time=str(template["parent_time"]),
                 child_time=str(template["child_time"]),
-                window_seconds=int(template["window_seconds"]),
+                window_seconds=positive_int(
+                    template["window_seconds"],
+                    "related template window_seconds",
+                    minimum=1,
+                ),
                 reset_column=str(template.get("reset_column", "")),
                 validity_columns=tuple(
                     str(value) for value in template.get("validity_columns", ())
@@ -1502,10 +1553,11 @@ def _spec_from_json(payload) -> GrammarSpec:
         ),
         boolean_roles=_role_map(payload.get("boolean_roles", {}), "boolean_roles"),
         advanced_enabled=bool(payload.get("advanced_enabled", False)),
-        run_lengths=tuple(int(window) for window in (payload.get("run_lengths", ()) or ())),
-        max_conjunction_terms=max(
-            2,
-            int(payload.get("max_conjunction_terms", 3) or 3),
+        run_lengths=json_ints("run_lengths", minimum=1),
+        max_conjunction_terms=json_int(
+            "max_conjunction_terms",
+            3,
+            minimum=2,
         ),
         metadata_columns=tuple(
             str(column) for column in (payload.get("metadata_columns", ()) or ())

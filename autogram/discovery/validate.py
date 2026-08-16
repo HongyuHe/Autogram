@@ -447,9 +447,12 @@ class Recovery:
     ratio: float = 0.0
     proportional: float = 0.0
     monotone: float = 0.0
+    lag_bound: float = 0.0
+    sum_balance: float = 0.0
     windowed_ratio: float = 0.0
     conditional_positive: float = 0.0
     conditional_zero: float = 0.0
+    conditional_proportional: float = 0.0
     cross_grain: float = 0.0
     sustained: float = 0.0
     conjunction: float = 0.0
@@ -645,6 +648,36 @@ def relation_signature_matches(expected, actual) -> bool:
     return expected == actual
 
 
+def _definition_matches_planted_mask(evaluation, result) -> bool:
+    """Whether one sustained/conjunction rule reproduces its full planted Boolean mask."""
+    from .evaluate import _boolean_population, _learned_bounds
+
+    rule = evaluation.rule
+    if not isinstance(rule.atom, A.BooleanDefinition):
+        return False
+    if not isinstance(rule.atom.predicate, (A.Sustained, A.Conjunction)):
+        return False
+    reported = dict(
+        getattr(evaluation, "parameters", {}).get("thresholds", {})
+    )
+    thresholds = {}
+    for bound in _learned_bounds(rule.atom.predicate):
+        key = bound.unparse()
+        if key not in reported:
+            return False
+        thresholds[bound] = float(reported[key])
+    target, predicted, valid, _n_bindings, _groups = _boolean_population(
+        rule,
+        result.dataset,
+        thresholds,
+    )
+    return bool(
+        target.size
+        and target.shape == predicted.shape == valid.shape
+        and np.array_equal(target, predicted)
+    )
+
+
 def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) -> Recovery:
     rels = portfolio_relations(result)
     pairs, refsums, zeros = _pairs(rels), _refsums(rels), _zeros(rels)
@@ -653,19 +686,39 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
     balances, presence = _agg_ref_balances(rels), _presence_pairs(rels)
     ratios, proportionals = _ratios(rels), _proportionals(rels)
     delta_bounds, windowed_ratios = _delta_bounds(rels), _windowed_ratios(rels)
+    lag_bounds = _relation_payloads(rels, "lag_bound")
+    sum_balances = _relation_payloads(rels, "sum_balance")
     conditional_positive_found = _conditionals(rels, "delta_bound")
     conditional_zero_found = _conditionals(
         rels,
         "delta_zero",
         strengths=("exact",),
     )
+    conditional_proportional_found = _conditionals(
+        rels,
+        "proportional",
+    )
     related_found = _relation_payloads(
         rels,
         "related_aggregate",
         strengths=("exact",),
     )
-    sustained_found = _payloads(rels, "sustained_definition")
-    conjunction_found = _payloads(rels, "conjunction_definition")
+    exact_definition_relations = set()
+    for evaluation in result.portfolio:
+        if _definition_matches_planted_mask(evaluation, result):
+            exact_definition_relations |= rule_relations(
+                evaluation.rule,
+                result.dataset,
+                getattr(evaluation, "parameters", {}),
+            )
+    sustained_found = _payloads(
+        exact_definition_relations,
+        "sustained_definition",
+    )
+    conjunction_found = _payloads(
+        exact_definition_relations,
+        "conjunction_definition",
+    )
     categorical_found = _payloads(rels, "categorical_definition")
     healthy_band_found = _payloads(rels, "healthy_band")
     conditional_band_found = _conditionals(rels, "healthy_band")
@@ -680,6 +733,59 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
                 for actual in found
             )
             for expected in target
+        )
+        return recovered / len(target)
+
+    def lag_cov(found, target):
+        target = set(target)
+        if not target:
+            return 0.0
+        exact_atomic = set()
+        dataset = result.dataset
+        for evaluation in result.portfolio:
+            if (
+                evaluation.rule.condition is not None
+                or not getattr(evaluation, "raw_exact_sign", False)
+                or not isinstance(evaluation.rule.atom, A.Compare)
+                or not isinstance(evaluation.rule.atom.left, A.Ref)
+                or not isinstance(evaluation.rule.atom.right, A.Const)
+                or float(evaluation.rule.atom.right.value) != 0.0
+            ):
+                continue
+            for binding in enumerate_bindings(
+                evaluation.rule.binder,
+                dataset.name_model,
+            ):
+                column = resolve_ref(
+                    evaluation.rule.atom.left.role,
+                    evaluation.rule.binder,
+                    binding,
+                    dataset.name_model,
+                )
+                if column is not None:
+                    exact_atomic.add((
+                        column,
+                        evaluation.rule.atom.op,
+                    ))
+
+        def atomic_implies(column, target_op):
+            allowed = {
+                ">=": {">=", ">"},
+                ">": {">"},
+                "<=": {"<=", "<"},
+                "<": {"<"},
+            }.get(target_op, {target_op})
+            return any(
+                atomic_column == column and atomic_op in allowed
+                for atomic_column, atomic_op in exact_atomic
+            )
+
+        recovered = sum(
+            (
+                item in found
+                or atomic_implies(item[0], item[2])
+            )
+            for item in target
         )
         return recovered / len(target)
 
@@ -701,6 +807,14 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
     )
     proportional = cov(proportionals, set(planted.get("proportional", set())))
     monotone = cov(delta_bounds, set(planted.get("monotone", set())))
+    lag_bound = lag_cov(
+        lag_bounds,
+        set(planted.get("lag_bound", set())),
+    )
+    sum_balance = cov(
+        sum_balances,
+        set(planted.get("sum_balance", set())),
+    )
     windowed_ratio = cov(
         _relation_payloads(
             rels,
@@ -716,6 +830,10 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
     conditional_zero = cov(
         conditional_zero_found,
         set(planted.get("conditional_zero", set())),
+    )
+    conditional_proportional = cov(
+        conditional_proportional_found,
+        set(planted.get("conditional_proportional", set())),
     )
     cross_grain = cov(related_found, set(planted.get("cross_grain", set())))
     sustained = cov(
@@ -746,9 +864,12 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
             ratio,
             proportional,
             monotone,
+            lag_bound,
+            sum_balance,
             windowed_ratio,
             conditional_positive,
             conditional_zero,
+            conditional_proportional,
             cross_grain,
             sustained,
             conjunction,
@@ -770,9 +891,12 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
         ratio=ratio,
         proportional=proportional,
         monotone=monotone,
+        lag_bound=lag_bound,
+        sum_balance=sum_balance,
         windowed_ratio=windowed_ratio,
         conditional_positive=conditional_positive,
         conditional_zero=conditional_zero,
+        conditional_proportional=conditional_proportional,
         cross_grain=cross_grain,
         sustained=sustained,
         conjunction=conjunction,
@@ -973,6 +1097,7 @@ def _runtime_relation_null(
 ):
     if not isinstance(relation, pd.DataFrame):
         return relation
+    span_frame = None
     span_templates = [
         template for template in templates
         if template.mode == "span_any"
@@ -1052,13 +1177,16 @@ def _runtime_relation_null(
                         record[template.filter_column] = filter_value
                     records.append(record)
         if records:
-            return pd.DataFrame.from_records(
+            span_frame = pd.DataFrame.from_records(
                 records,
                 columns=relation.columns,
             )
+            if len(span_templates) == len(templates):
+                return span_frame
     output = relation.copy(deep=True)
     structural = set()
     binary_columns = set()
+    monotone_columns = {}
     for template in templates:
         structural.update(template.child_keys)
         structural.update(template.partition_keys)
@@ -1069,11 +1197,23 @@ def _runtime_relation_null(
         })
         if template.reset_column:
             binary_columns.add(template.reset_column)
+        if template.mode == "sum_delta":
+            for column in (
+                template.column,
+                *template.validity_columns,
+            ):
+                monotone_columns.setdefault(column, template)
     structural.discard("")
     for column in output.columns:
         if column in structural:
             continue
         values = output[column].to_numpy(copy=True)
+        if column in binary_columns:
+            # Reset/validity flags define where a related increment is gradeable. Preserve their
+            # observed prevalence (and therefore support) rather than balancing an all-false reset
+            # column into 50% resets, which can make every related candidate ground zero points.
+            output[column] = rng.permutation(values)
+            continue
         if (
             pd.api.types.is_numeric_dtype(output[column])
             or pd.api.types.is_bool_dtype(output[column])
@@ -1099,6 +1239,61 @@ def _runtime_relation_null(
             )
         else:
             output[column] = rng.permutation(values)
+
+    for column, template in monotone_columns.items():
+        if column not in output.columns:
+            continue
+        values = pd.to_numeric(
+            output[column],
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        generated = np.full(values.shape, np.nan, dtype=float)
+        group_columns = tuple(dict.fromkeys(
+            (*template.child_keys, *template.partition_keys)
+        ))
+        buckets = {}
+        if group_columns:
+            arrays = [
+                output[name].to_numpy(dtype=object)
+                for name in group_columns
+            ]
+            for position in range(len(output)):
+                key = tuple(
+                    typed_group_key(array[position])
+                    for array in arrays
+                )
+                buckets.setdefault(key, []).append(position)
+        else:
+            buckets[()] = list(range(len(output)))
+        time_values = (
+            pd.to_datetime(
+                output[template.child_time],
+                errors="coerce",
+            ).to_numpy(dtype="datetime64[ns]")
+            if template.child_time in output.columns
+            else np.arange(len(output))
+        )
+        for positions in buckets.values():
+            ordered = np.asarray(sorted(
+                positions,
+                key=lambda position: time_values[position],
+            ), dtype=int)
+            finite = ordered[np.isfinite(values[ordered])]
+            if not finite.size:
+                continue
+            increments = rng.lognormal(
+                mean=0.0,
+                sigma=0.5,
+                size=finite.size,
+            )
+            generated[finite] = np.cumsum(increments)
+        output[column] = generated
+
+    if span_frame is not None:
+        output = pd.concat(
+            [output, span_frame],
+            ignore_index=True,
+        )
     return output
 
 
@@ -1495,7 +1690,12 @@ def prepare_proxy_suite(regime, seed: int = 0,
     ndata = S.enrich_null(
         _gen_null(seed=seed),
         seed=seed,
-        conditions="healthy_band" in control_shapes,
+        conditions=bool(
+            control_shapes & {
+                "healthy_band",
+                "conditional_proportional",
+            }
+        ),
         related="cross_grain" in control_shapes,
     )
     nds, nG, _nspec = prepare_columns(ndata.columns, ndata.matrix, inducer=inducer,
@@ -1503,12 +1703,19 @@ def prepare_proxy_suite(regime, seed: int = 0,
                                       timestamps=ndata.timestamps)
     _attach_proxy_context(nds, ndata)
     for shape in sorted(
-        control_shapes & {"ratio", "proportional", "healthy_band", "cross_grain"}
+        control_shapes & {
+            "ratio",
+            "proportional",
+            "conditional_proportional",
+            "healthy_band",
+            "cross_grain",
+        }
     ):
         _enable_shape_capabilities(nG, shape, nds)
     temporal_null = None
     temporal_shapes = {
         "monotone",
+        "lag_bound",
         "windowed_ratio",
         "conditional_positive",
         "conditional_zero",
@@ -1949,10 +2156,11 @@ def _enable_shape_capabilities(
             binder: max(2, degree)
             for binder, degree in grammar.max_degree_by_binder.items()
         }
-    if family == "proportional" and "~∝" not in grammar.ops:
+    if family in {"proportional", "conditional_proportional"} and "~∝" not in grammar.ops:
         grammar.ops = tuple(grammar.ops) + ("~∝",)
     if family in {
         "monotone",
+        "lag_bound",
         "windowed_ratio",
         "conditional_positive",
         "conditional_zero",
@@ -1983,16 +2191,20 @@ def _enable_shape_capabilities(
             dataset.time_index = "__time__"
             dataset.observed.row_context["__time__"] = np.asarray(dataset.timestamps)
             dataset.row_context["__time__"] = np.asarray(dataset.timestamps)
-    if family in {"conditional_positive", "conditional_zero"}:
+    if family in {
+        "conditional_positive",
+        "conditional_zero",
+        "conditional_proportional",
+    }:
         grammar.conditional_enabled = True
         grammar.condition_columns = {
-            "regime": ("positive", "zero", "other"),
+            "regime": ("positive", "zero", "proportional", "other"),
         }
         if dataset is not None:
             adapter = dataset.name_model.adapter
             adapter.conditional_enabled = True
             adapter.condition_columns = {
-                "regime": ("positive", "zero", "other"),
+                "regime": ("positive", "zero", "proportional", "other"),
             }
     if family in {"sustained", "conjunction", "categorical", "definition_null"}:
         grammar.advanced_enabled = True

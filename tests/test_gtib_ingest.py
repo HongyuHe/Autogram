@@ -391,6 +391,44 @@ def test_missing_consumer_identity_agrees_between_materialized_and_streaming():
     assert np.array_equal(materialized, streaming, equal_nan=True)
 
 
+def test_derived_only_consumer_is_ungradeable_on_all_materialized_families():
+    derived, raw = _tables()
+    extra = derived.copy()
+    extra["consumer_id"] = "derived_only"
+    combined = prepare_gtib(
+        pd.concat([derived, extra], ignore_index=True),
+        raw,
+    )
+    profile = combined.attrs[AUTOGRAM_PROFILE_ATTR]
+
+    for family in profile["families"].values():
+        values = combined[family].iloc[len(derived):]
+        assert values.isna().all().all(), family
+
+    input_family = profile["families"]["shard_input_increment"]
+    streaming_frame = combined.drop(columns=input_family)
+    streaming_frame.attrs = combined.attrs
+    dataset, _grammar = build_dataframe_grammar(
+        streaming_frame,
+        _base_spec(),
+        name="derived_only_streaming",
+    )
+    streaming = eval_term(
+        A.RelatedAgg("raw_input_rate"),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+    materialized = combined[input_family].sum(
+        axis=1,
+        min_count=len(input_family),
+    ).to_numpy(dtype=float)
+
+    assert streaming is not None
+    assert np.array_equal(materialized, streaming, equal_nan=True)
+
+
 def test_materialization_sorts_scalar_and_composite_consumer_ids():
     """Mixed scalar/composite typed IDs must have mutually comparable deterministic sort keys."""
     derived, raw = _tables()

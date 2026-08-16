@@ -10,6 +10,7 @@ contract used by the proposer backends and the archive.
 from __future__ import annotations
 
 import math
+import numbers
 
 from . import ast as A
 
@@ -79,25 +80,28 @@ def _name(value, label: str) -> str:
 
 
 def _finite_float(value, label: str) -> float:
-    if isinstance(value, bool):
+    from .evaluate import canonical_typed_value
+
+    value = canonical_typed_value(value)
+    if (
+        not isinstance(value, numbers.Real)
+        or isinstance(value, bool)
+    ):
         raise ValueError(f"{label} must be a finite number")
-    try:
-        number = float(value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{label} must be a finite number") from error
+    number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"{label} must be a finite number")
     return number
 
 
 def _positive_int(value, label: str) -> int:
-    if isinstance(value, bool):
+    from .evaluate import canonical_typed_value
+
+    value = canonical_typed_value(value)
+    if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"{label} must be a positive integer")
-    try:
-        number = int(value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{label} must be a positive integer") from error
-    if number <= 0 or number != value:
+    number = value
+    if number <= 0:
         raise ValueError(f"{label} must be a positive integer")
     return number
 
