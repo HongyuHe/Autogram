@@ -422,6 +422,18 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
         ]
     parent = list(range(len(known)))
 
+    def atomic_sign_recovery_key(signature):
+        """Entries one exact atomic sign law can recover together."""
+        if not isinstance(signature, tuple) or not signature:
+            return None
+        if signature[0] == "one_sided" and len(signature) == 3:
+            _tag, column, op = signature
+            return ("atomic_sign_family", column, op)
+        if signature[0] == "lag_bound" and len(signature) == 2:
+            column, _steps, op = signature[1]
+            return ("atomic_sign_family", column, op)
+        return None
+
     def find(index: int) -> int:
         while parent[index] != index:
             parent[index] = parent[parent[index]]
@@ -440,6 +452,14 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
             continue
         for j in range(i + 1, len(known)):
             if expansions[j] is None:
+                continue
+            left_sign = atomic_sign_recovery_key(signatures[i])
+            right_sign = atomic_sign_recovery_key(signatures[j])
+            if left_sign is not None and left_sign == right_sign:
+                # `recover_known` credits every grounded lag from one tolerance-free exact atomic
+                # sign law. Splitting those catalogue entries would put the calibration evidence
+                # itself in validation even though their structural signatures differ by lag.
+                union(i, j)
                 continue
             if any(
                 relation_signature_matches(left, right)

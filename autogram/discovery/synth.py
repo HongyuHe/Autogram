@@ -19,6 +19,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+from ..dsl.evaluate import typed_signature_value
+
 
 @dataclass
 class Vocab:
@@ -589,14 +591,22 @@ def _planted(vocab: Vocab, ents, N, temporal_window: int = 5) -> Dict[str, objec
             temporal_window,
         ))
         conditional_positive.add((
-            ("regime", "==", ("positive",)),
+            (
+                "regime",
+                "==",
+                (typed_signature_value("positive"),),
+            ),
             (
                 "delta_bound",
                 (f"{vocab.measurement}_{ents[i]}_{vocab.source}", 1, ">="),
             ),
         ))
         conditional_zero.add((
-            ("regime", "==", ("zero",)),
+            (
+                "regime",
+                "==",
+                (typed_signature_value("zero"),),
+            ),
             (
                 "delta_zero",
                 (f"{vocab.measurement}_{ents[i]}_{vocab.source}", 1),
@@ -651,12 +661,12 @@ def _planted(vocab: Vocab, ents, N, temporal_window: int = 5) -> Dict[str, objec
                     (
                         vocab.band_group_column,
                         "==",
-                        (vocab.band_group_focus,),
+                        (typed_signature_value(vocab.band_group_focus),),
                     ),
                     (
                         vocab.band_state_column,
                         "==",
-                        (vocab.band_state_focus,),
+                        (typed_signature_value(vocab.band_state_focus),),
                     ),
                 ), key=str)),
             ),
@@ -695,9 +705,12 @@ def _planted(vocab: Vocab, ents, N, temporal_window: int = 5) -> Dict[str, objec
                 vocab.category_target,
                 tuple(zip(
                     vocab.category_flags,
-                    vocab.category_values,
+                    (
+                        typed_signature_value(value)
+                        for value in vocab.category_values
+                    ),
                 )),
-                vocab.category_default,
+                typed_signature_value(vocab.category_default),
             ),
         },
         "cross_grain": cross_grain,

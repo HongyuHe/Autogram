@@ -820,6 +820,32 @@ def test_known_split_merges_entries_that_data_canonicalization_makes_identical()
         assert ("plain" in calib) == ("padded" in calib), seed
 
 
+def test_known_split_keeps_atomic_and_lag_sign_aliases_together():
+    """One exact atomic sign law recovers every same-direction grounded lag."""
+    known = [
+        KnownInvariant("atomic", ">=", "x", 0),
+        KnownInvariant("lag_1", ">=", {"lag": ["x", 1]}, 0),
+        KnownInvariant("lag_2", ">=", {"lag": ["x", 2]}, 0),
+        KnownInvariant("other", "==", "a", "b"),
+        KnownInvariant("third", ">=", "y", 0),
+    ]
+
+    for seed in range(25):
+        calibration, validation = _split_known(
+            known,
+            frac=0.4,
+            seed=seed,
+        )
+        calibration_names = {item.name for item in calibration}
+        validation_names = {item.name for item in validation}
+        assert calibration_names.isdisjoint(validation_names)
+        locations = {
+            name: name in calibration_names
+            for name in ("atomic", "lag_1", "lag_2")
+        }
+        assert len(set(locations.values())) == 1, (seed, locations)
+
+
 def _crosscheck_columns(df: pd.DataFrame) -> list[str]:
     return [str(column) for column in df.columns if str(column).startswith(("low_", "high_"))]
 

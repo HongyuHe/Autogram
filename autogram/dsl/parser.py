@@ -83,6 +83,9 @@ def _positive_int(value, label: str) -> int:
 
 
 def _scalar(value, label: str):
+    from .evaluate import canonical_typed_value
+
+    value = canonical_typed_value(value)
     if value is None or isinstance(value, (str, bool)):
         return value
     if isinstance(value, int) and not isinstance(value, bool):
@@ -202,8 +205,14 @@ def rule_to_dict(r: A.Rule) -> dict:
         payload.update({
             "atom_kind": "CategoryDefinition",
             "target_column": r.atom.target_column,
-            "cases": [list(case) for case in r.atom.cases],
-            "default": r.atom.default,
+            "cases": [
+                [column, _scalar(value, "categorical case value")]
+                for column, value in r.atom.cases
+            ],
+            "default": _scalar(
+                r.atom.default,
+                "categorical default",
+            ),
         })
     elif isinstance(r.atom, A.BandDefinition):
         payload.update({
@@ -315,7 +324,10 @@ def condition_to_dict(condition: A.Condition) -> dict:
             if isinstance(value, A.Condition)
         ]
     else:
-        values = list(condition.values)
+        values = [
+            _scalar(value, "condition value")
+            for value in condition.values
+        ]
     return {
         "column": condition.column,
         "op": condition.op,

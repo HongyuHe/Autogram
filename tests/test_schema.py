@@ -69,6 +69,34 @@ def test_compiler_rejects_unhashable_span_filter_values():
         compile_spec(spec)
 
 
+def test_compiler_rejects_composite_condition_values_before_proposal():
+    spec = GrammarSpec(
+        name="composite-condition",
+        patterns=(
+            ColumnPattern(
+                name="placeholder",
+                matcher="regex",
+                kind="unused",
+                direction="unused",
+                regex=r"^does_not_match$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ()},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        condition_columns={"kind": ((1, 2),)},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+
+    with pytest.raises(CompileError, match="condition column"):
+        compile_spec(spec)
+
+
 def test_infer_tokens_requires_full_column_match():
     # A regex token pattern must match the whole column name; a column that merely contains the
     # pattern as a prefix (with trailing junk) must not inject a spurious node token (I4).

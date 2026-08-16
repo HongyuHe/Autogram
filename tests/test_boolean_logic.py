@@ -18,7 +18,7 @@ from autogram.discovery.validate import score_recovery
 from autogram.discovery.loop import build_dataframe_grammar
 from autogram.discovery.propose import EnumerationProposer, normalize_rule
 from autogram.dsl import ast as A
-from autogram.dsl.evaluate import typed_group_key
+from autogram.dsl.evaluate import typed_group_key, typed_signature_value
 from autogram.dsl.grammar import Grammar
 from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
@@ -944,11 +944,11 @@ def test_categorical_proxy_vocabulary_is_parameterized():
         (
             "kind",
             (
-                ("flag_x", "class_x"),
-                ("flag_y", "class_y"),
-                ("flag_z", "class_z"),
+                ("flag_x", typed_signature_value("class_x")),
+                ("flag_y", typed_signature_value("class_y")),
+                ("flag_z", typed_signature_value("class_z")),
             ),
-            "baseline",
+            typed_signature_value("baseline"),
         ),
     }
 

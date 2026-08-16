@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -172,6 +173,17 @@ def test_numpy_condition_scalars_canonicalize_before_dedup_and_render():
         A.Condition("kind", "==", (np.bool_(True),)).unparse()
         == A.Condition("kind", "==", (True,)).unparse()
     )
+    rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("x"), "~=", A.Ref("x")),
+        condition=A.Condition("kind", "==", (np.bool_(True),)),
+    )
+    payload = rule_to_dict(rule)
+    json.dumps(payload)
+    restored = rule_from_dict(payload)
+    assert restored.condition is not None
+    assert restored.condition.values == (True,)
+    assert type(restored.condition.values[0]) is bool
 
 
 def test_solver_and_membership_enumeration_preserve_typed_conditions():
