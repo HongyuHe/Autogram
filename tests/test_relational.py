@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import time
 
 import numpy as np
@@ -849,17 +850,24 @@ def test_span_runtime_null_preserves_python_datetime_keys_and_string_times():
     assert values[2:].sum() == 1.0
 
 
-def test_span_runtime_null_varies_typed_filter_roles_on_short_groups():
-    groups = 100
+@pytest.mark.parametrize(
+    ("groups", "rows_per_group"),
+    [(100, 2), (1, 400)],
+)
+def test_span_runtime_null_varies_typed_filter_roles_on_short_groups(
+    groups,
+    rows_per_group,
+):
     consumers = np.repeat(
         [f"consumer-{index}" for index in range(groups)],
-        2,
+        rows_per_group,
     )
     times = np.tile(
-        pd.to_datetime([
-            "2026-02-01 00:00:00",
-            "2026-02-01 00:01:00",
-        ]).to_numpy(),
+        pd.date_range(
+            "2026-02-01",
+            periods=rows_per_group,
+            freq="1min",
+        ).to_numpy(),
         groups,
     )
     relation = pd.DataFrame({
@@ -954,17 +962,21 @@ def test_span_runtime_null_saturates_extrapolated_end():
         span_start="span_start",
         span_end="span_end",
     )
+    second = replace(template, role="event_second")
 
     generated = _runtime_relation_null(
         relation,
-        [template],
+        [template, second],
         {"timestamp": times},
         np.random.default_rng(0),
         definition_targets=False,
     )
 
-    assert generated["span_start"].iloc[0] == pd.Timestamp.max
-    assert generated["span_end"].iloc[0] == pd.Timestamp.max
+    maximum = generated.loc[
+        generated["span_start"] == pd.Timestamp.max
+    ]
+    assert len(maximum) == 1
+    assert maximum["span_end"].iloc[0] == pd.Timestamp.max
 
 
 def test_materialized_and_streaming_use_identical_sum_order():

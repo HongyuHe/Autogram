@@ -88,6 +88,34 @@ def test_runtime_null_preserves_joint_condition_support():
     ) == 40
 
 
+def test_definition_null_independently_permutes_categorical_target():
+    flag = np.resize(
+        np.array([False, True, True, False]),
+        400,
+    )
+    label = np.where(flag, "alert", "normal")
+    adapter = SimpleNamespace(condition_columns={
+        "flag": (False, True),
+        "label": ("normal", "alert"),
+    })
+
+    context = V._runtime_condition_context(
+        adapter,
+        flag.size,
+        np.random.default_rng(30_007),
+        randomize=True,
+        source_context={
+            "flag": flag,
+            "label": label,
+        },
+        independent_columns={"label"},
+    )
+
+    assert np.array_equal(context["flag"], flag)
+    assert sorted(context["label"].tolist()) == sorted(label.tolist())
+    assert not np.array_equal(context["label"], label)
+
+
 def test_runtime_null_envelope_accounts_for_wide_family_products():
     width = 1024
     rows = 400

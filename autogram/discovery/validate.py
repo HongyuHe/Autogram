@@ -1316,11 +1316,11 @@ def _runtime_relation_null(
                 rows = bucket["rows"]
                 ordered = sorted(rows, key=lambda row: times[row])
                 for position, row in enumerate(ordered):
-                    selected_position = (
+                    selected = (
                         (template_index + 1)
-                        >> (group_index % pattern_width)
+                        >> (int(row) % pattern_width)
                     ) & 1
-                    if position % 2 != selected_position:
+                    if not selected:
                         continue
                     signature = (
                         tuple(key),
@@ -1509,6 +1509,7 @@ def _runtime_condition_context(
     randomize: bool,
     group_identities=None,
     source_context=None,
+    independent_columns=(),
 ) -> dict[str, np.ndarray]:
     domains = {
         name: tuple(values)
@@ -1523,10 +1524,16 @@ def _runtime_condition_context(
         source_context is not None
         and all(name in source_context for name in domains)
     ):
-        return {
-            name: _typed_object_array(source_context[name]).copy()
-            for name in domains
-        }
+        independent = set(independent_columns)
+        context = {}
+        for name in domains:
+            source = _typed_object_array(source_context[name])
+            context[name] = (
+                rng.permutation(source)
+                if name in independent
+                else source.copy()
+            )
+        return context
     ordered = sorted(
         domains,
         key=lambda name: (
@@ -1592,6 +1599,7 @@ def _runtime_null_dataset(
     definition_targets: bool,
     magnitude_ceiling: float = _NULL_MAGNITUDE_CEILING,
     presence_masks: bool = False,
+    independent_condition_columns=(),
 ):
     rng = np.random.default_rng(int(seed))
     matrix = np.empty_like(dataset.observed.matrix, dtype=float)
@@ -1655,6 +1663,7 @@ def _runtime_null_dataset(
         randomize=definition_targets,
         group_identities=group_identities,
         source_context=dataset.observed.row_context,
+        independent_columns=independent_condition_columns,
     )
     templates = tuple(
         getattr(adapter, "related_templates", {}).values()
@@ -1825,6 +1834,11 @@ def prepare_runtime_null_controls(
             (A.BooleanDefinition, A.CategoryDefinition),
         )
     ]
+    categorical_targets = {
+        rule.atom.target_column
+        for rule in definition_rules
+        if isinstance(rule.atom, A.CategoryDefinition)
+    }
     magnitude_ceiling = _runtime_null_magnitude_ceiling(
         dataset,
         grammar,
@@ -1863,6 +1877,7 @@ def prepare_runtime_null_controls(
             seed=seed + 30_007,
             definition_targets=True,
             magnitude_ceiling=magnitude_ceiling,
+            independent_condition_columns=categorical_targets,
         )
         if definition_rules
         else None
