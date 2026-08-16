@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import itertools
+import numbers
 from typing import Dict, List, Sequence
 
 from ..dsl import ast as A
+from ..dsl.evaluate import typed_group_key, typed_unique
 from ..dsl.grammar import Grammar
 from ..dsl.typecheck import is_admissible
 from ..logic.solver import is_trivial, legacy_is_trivial
@@ -22,6 +24,27 @@ class SearchSpaceTruncatedError(RuntimeError):
 # columns are categorical/Boolean with small domains; a candidate space beyond this is a declaration
 # error (a continuous column mislabelled as a condition), so fail loud rather than exhaust memory.
 _MAX_CONDITION_CANDIDATES = 1_000_000
+
+
+def _binary_condition_domain(values) -> bool:
+    """Whether one typed condition domain represents a Boolean/binary column.
+
+    A mixed domain such as ``(True, 1)`` is categorical: the values compare equal in Python but are
+    distinct under Autogram's categorical identity, and classifying it as Boolean would erase that
+    distinction before category-definition enumeration.
+    """
+    unique = typed_unique(values)
+    if not unique:
+        return False
+    kinds = {typed_group_key(value)[0] for value in unique}
+    if len(kinds) != 1:
+        return False
+    return all(
+        isinstance(value, numbers.Real)
+        and not isinstance(value, complex)
+        and float(value) in (0.0, 1.0)
+        for value in unique
+    )
 
 
 def _term_key(t: A.Term) -> str:
@@ -765,17 +788,22 @@ class EnumerationProposer:
         bool_columns = [
             column
             for column, values in conditions.items()
-            if values and not (set(values) - {False, True, 0, 1})
+            if _binary_condition_domain(values)
         ]
         category_columns = [
             column
             for column, values in conditions.items()
-            if values and set(values) - {False, True, 0, 1}
+            if values and not _binary_condition_domain(values)
         ]
         for target_column in category_columns:
             target_values = tuple(conditions[target_column])
             for default in target_values:
-                labels = tuple(value for value in target_values if value != default)
+                default_key = typed_group_key(default)
+                labels = tuple(
+                    value
+                    for value in target_values
+                    if typed_group_key(value) != default_key
+                )
                 if not labels or len(labels) > len(bool_columns):
                     continue
                 for columns in itertools.permutations(bool_columns, len(labels)):
@@ -805,7 +833,7 @@ class EnumerationProposer:
         categorical_columns = {
             column
             for column, values in self.G.condition_columns.items()
-            if set(values) - {False, True, 0, 1}
+            if values and not _binary_condition_domain(values)
         }
         total = 0
         simple_per_column = []

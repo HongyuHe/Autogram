@@ -18,7 +18,7 @@ import pandas as pd
 from ..config import DiscoveryConfig, SearchConfig
 from ..dsl import ast as A
 from ..dsl.binders import enumerate_bindings, resolve_family, resolve_ref
-from ..dsl.evaluate import robust_median
+from ..dsl.evaluate import robust_median, typed_unique
 from ..loader.loader import Dataset, Frame
 from ..schema.spec import RelatedTemplate
 from . import synth as S
@@ -1803,7 +1803,7 @@ def _attach_proxy_context(dataset, data) -> None:
 def _proxy_context_values(dataset, max_values: int) -> dict:
     values = {}
     for name, array in dataset.row_context.items():
-        unique = tuple(pd.unique(np.asarray(array)).tolist())
+        unique = typed_unique(np.asarray(array, dtype=object))
         if 1 < len(unique) <= int(max_values):
             values[name] = unique
     return values

@@ -16,7 +16,7 @@ from autogram.discovery.loop import build_dataframe_grammar
 from autogram.discovery.propose import EnumerationProposer, normalize_rule
 from autogram.discovery.validate import score_recovery
 from autogram.dsl import ast as A
-from autogram.dsl.evaluate import _condition_mask
+from autogram.dsl.evaluate import _condition_mask, typed_group_key
 from autogram.dsl.grammar import Grammar
 from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
@@ -51,7 +51,13 @@ def _base_spec() -> GrammarSpec:
 
 def _data() -> pd.DataFrame:
     n = 240
-    label = np.resize(np.array(["normal", "true_loss", "benign_burst", "artifact"], dtype=object), n)
+    label = np.resize(
+        np.array(
+            ["normal", "true_loss", "benign_burst", "artifact"],
+            dtype=object,
+        ),
+        n,
+    )
     increment = np.select(
         [label == "true_loss", np.isin(label, ["benign_burst", "artifact"])],
         [2.0, 0.0],
@@ -72,6 +78,51 @@ def _data() -> pd.DataFrame:
         temporal_windows=(3,),
         max_lag=3,
     )
+
+
+def test_condition_domains_and_masks_preserve_typed_identity():
+    """Condition profiling and evaluation must distinguish ``True``, ``1``, and ``"1"``."""
+    values = np.empty(120, dtype=object)
+    values[0::3] = True
+    values[1::3] = 1
+    values[2::3] = "1"
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "category": pd.Series(values, dtype=object),
+            "x": np.arange(values.size, dtype=float),
+        }),
+        condition_columns=("category",),
+    )
+    dataset, grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="typed_conditions",
+    )
+
+    domain = grammar.condition_columns["category"]
+    assert len(domain) == 3
+    assert len({typed_group_key(value) for value in domain}) == 3
+
+    masks = [
+        _condition_mask(
+            A.Condition("category", "==", (value,)),
+            dataset.observed,
+        )
+        for value in (True, 1, "1")
+    ]
+    assert all(mask is not None for mask in masks)
+    assert [int(np.count_nonzero(mask)) for mask in masks] == [40, 40, 40]
+    assert not np.any(masks[0] & masks[1])
+    assert not np.any(masks[0] & masks[2])
+    assert not np.any(masks[1] & masks[2])
+
+    in_mask = _condition_mask(
+        A.Condition("category", "in", (True, "1")),
+        dataset.observed,
+    )
+    assert in_mask is not None
+    assert int(np.count_nonzero(in_mask)) == 80
+    assert not np.any(in_mask & masks[1])
 
 
 def test_condition_round_trip_typecheck_and_solver_antecedent():

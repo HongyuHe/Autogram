@@ -348,6 +348,30 @@ def _write_known(tmp_path, invs):
     return str(p)
 
 
+def test_invalid_split_inputs_fail_before_external_induction(monkeypatch, tmp_path):
+    import autogram.calibrate as calibration
+
+    known = _write_known(tmp_path, [
+        {"name": "only", "op": "==", "lhs": "x", "rhs": "y"},
+    ])
+
+    def should_not_construct_inducer(_cfg):
+        raise AssertionError("external inducer was constructed before local validation")
+
+    monkeypatch.setattr(
+        calibration,
+        "_make_calibration_inducer",
+        should_not_construct_inducer,
+    )
+
+    with pytest.raises(ValueError, match="at least two"):
+        calibrate(
+            pd.DataFrame({"x": [1.0, 2.0], "y": [1.0, 2.0]}),
+            known,
+            CalibrationConfig(max_capability_tiers=1, save_rules=False),
+        )
+
+
 def test_calibrate_runs_real_tuning_nulls_discovery_and_report(
     monkeypatch,
     tmp_path,

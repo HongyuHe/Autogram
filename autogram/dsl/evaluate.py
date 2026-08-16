@@ -359,6 +359,31 @@ def typed_group_key(label):
     return (type(label).__name__, label)
 
 
+def typed_unique(values, *, drop_missing: bool = False) -> tuple:
+    """Distinct values in first-seen order under :func:`typed_group_key`.
+
+    pandas/NumPy uniqueness uses Python equality, where ``True == 1``. Condition domains and
+    categorical targets must preserve that distinction or the grammar cannot even express the
+    type-correct relation the evaluator is supposed to score.
+    """
+    seen = set()
+    result = []
+    for value in values:
+        key = typed_group_key(value)
+        if drop_missing and key[0] == "missing":
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return tuple(result)
+
+
+def typed_equal(left, right) -> bool:
+    """Type-sensitive scalar equality, recursive through tuple values."""
+    return typed_group_key(left) == typed_group_key(right)
+
+
 def typed_sort_key(typed):
     """Deterministic ordering for typed keys that preserves natural order within a type.
 
@@ -723,22 +748,50 @@ def _condition_mask(condition: A.Condition | None, frame: Frame):
     if condition.op == "==":
         target = condition.values[0]
         if not bool(pd.isna(target)):
-            mask[present] = values[present] == target
+            target_key = typed_group_key(target)
+            mask[present] = np.fromiter(
+                (
+                    typed_group_key(value) == target_key
+                    for value in values[present]
+                ),
+                dtype=bool,
+                count=int(np.count_nonzero(present)),
+            )
         return mask
     if condition.op == "!=":
         target = condition.values[0]
         if not bool(pd.isna(target)):
-            mask[present] = values[present] != target
+            target_key = typed_group_key(target)
+            mask[present] = np.fromiter(
+                (
+                    typed_group_key(value) != target_key
+                    for value in values[present]
+                ),
+                dtype=bool,
+                count=int(np.count_nonzero(present)),
+            )
         return mask
-    allowed = np.asarray([
-        value for value in condition.values
+    allowed = {
+        typed_group_key(value)
+        for value in condition.values
         if not bool(pd.isna(value))
-    ], dtype=object)
+    }
     if condition.op == "in":
-        mask[present] = np.isin(values[present], allowed)
+        mask[present] = np.fromiter(
+            (typed_group_key(value) in allowed for value in values[present]),
+            dtype=bool,
+            count=int(np.count_nonzero(present)),
+        )
         return mask
     if condition.op == "not in":
-        mask[present] = ~np.isin(values[present], allowed)
+        mask[present] = np.fromiter(
+            (
+                typed_group_key(value) not in allowed
+                for value in values[present]
+            ),
+            dtype=bool,
+            count=int(np.count_nonzero(present)),
+        )
         return mask
     return None
 

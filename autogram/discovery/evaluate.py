@@ -166,6 +166,33 @@ def _typed_label(label):
     return (type(label).__name__, label)
 
 
+def _typed_equal_array(left, right) -> np.ndarray:
+    """Elementwise categorical equality under recursive typed identity."""
+    left = np.asarray(left, dtype=object)
+    right = np.asarray(right, dtype=object)
+    if left.shape != right.shape:
+        raise ValueError("typed categorical operands must have the same shape")
+    return np.fromiter(
+        (
+            _typed_label(left_value) == _typed_label(right_value)
+            for left_value, right_value in zip(left.flat, right.flat)
+        ),
+        dtype=bool,
+        count=left.size,
+    ).reshape(left.shape)
+
+
+def _typed_scalar_mask(values, target) -> np.ndarray:
+    """Rows of ``values`` equal to ``target`` under recursive typed identity."""
+    values = np.asarray(values, dtype=object)
+    target_key = _typed_label(target)
+    return np.fromiter(
+        (_typed_label(value) == target_key for value in values.flat),
+        dtype=bool,
+        count=values.size,
+    ).reshape(values.shape)
+
+
 def _untyped_label(typed):
     """Recover the displayable label from a typed identity."""
     kind, value = typed
@@ -1070,7 +1097,7 @@ class DataOnlyEvaluator:
                 start=left_index + 1,
             ):
                 identifiable = (
-                    left_value == right_value
+                    _typed_label(left_value) == _typed_label(right_value)
                     or np.any(
                         left_mask
                         & right_mask
@@ -1094,17 +1121,19 @@ class DataOnlyEvaluator:
         )
         return self._definition_evaluation(
             rule,
-            target[valid] == predicted[valid],
+            _typed_equal_array(target[valid], predicted[valid]),
             int(target.size),
             1,
             parameters={},
             baseline=max(
-                float(np.mean(target[valid] == value))
-                # `pd.unique` preserves order of appearance instead of sorting. A categorical
-                # target may legitimately mix types (an integer code alongside a string label
-                # after a CSV round-trip), and sorting those raises TypeError -- a valid rule
-                # would crash the evaluator rather than be scored.
-                for value in pd.unique(target[valid])
+                float(np.mean(_typed_scalar_mask(target[valid], value)))
+                for value in (
+                    _untyped_label(key)
+                    for key in dict.fromkeys(
+                        _typed_label(item)
+                        for item in target[valid].tolist()
+                    )
+                )
             ) if np.any(valid) else 1.0,
             groups=(
                 category_groups[valid]

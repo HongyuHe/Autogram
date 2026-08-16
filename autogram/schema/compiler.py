@@ -79,6 +79,18 @@ def _validate_unique(label: str, values) -> None:
         seen.add(value)
 
 
+def _validate_typed_unique(label: str, values) -> None:
+    """Uniqueness for categorical values, where ``True`` and ``1`` are distinct."""
+    from ..dsl.evaluate import typed_group_key
+
+    seen = set()
+    for value in values:
+        key = typed_group_key(value)
+        if key in seen:
+            raise CompileError(f"duplicate {label} {value!r}")
+        seen.add(key)
+
+
 def _validate_names(label: str, values) -> None:
     values = tuple(values)
     for value in values:
@@ -301,7 +313,7 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
                 f"trusted domain ceiling {_MAX_CONDITION_DOMAIN}"
             )
         try:
-            _validate_unique(
+            _validate_typed_unique(
                 f"condition value for {name!r}",
                 values,
             )

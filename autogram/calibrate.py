@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 from .config import DiscoveryConfig, SearchConfig
+from .dsl.evaluate import typed_unique
 from .discovery.export import write_rules_dl
 from .discovery.induce import induce_spec, make_inducer
 from .discovery.induce import _spec_to_json
@@ -363,6 +364,17 @@ class _ColumnScaleView:
                 )
 
 
+def _validate_split_inputs(known: List[KnownInvariant], frac: float) -> None:
+    """Validate deterministic split inputs before any external schema induction."""
+    if len(known) < 2:
+        raise ValueError(
+            "calibration requires at least two known invariants "
+            "for a disjoint held-out validation split"
+        )
+    if not 0.0 < float(frac) < 1.0:
+        raise ValueError("validation_frac must be strictly between 0 and 1")
+
+
 def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                  frame=None, zero_tol: float = 1e-4):
     """Partition known invariants into a calibration set and a structurally disjoint validation set.
@@ -380,13 +392,7 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
     tolerance-based matching is not transitive and a chain of near-identical thresholds must still
     travel together.
     """
-    if len(known) < 2:
-        raise ValueError(
-            "calibration requires at least two known invariants "
-            "for a disjoint held-out validation split"
-        )
-    if not 0.0 < float(frac) < 1.0:
-        raise ValueError("validation_frac must be strictly between 0 and 1")
+    _validate_split_inputs(known, frac)
     signatures = [_known_signature(invariant) for invariant in known]
     # `recover_known` does not compare signatures literally: an *approximate* equality is also
     # satisfied by the exact rule that recovers it (`known._matching_signatures`). Two catalogue
@@ -528,7 +534,8 @@ def _capability_tiers() -> List[dict]:
     """Grammar-widening tiers, applied to a freshly re-induced spec when recall stalls.
 
     Tier 0 is the model's own proposal; each later tier raises a capability floor so the search
-    space strictly grows (more aggregations, then decidable-nonlinear products/ratios).
+    space never shrinks (more aggregations, then decidable-nonlinear products/ratios). A floor may
+    already be satisfied, so a tier can be identity-preserving rather than strictly larger.
     """
     return [
         {},                                              # tier 0: as the subagent proposed
@@ -606,11 +613,11 @@ def _widen_spec(spec, *, all_aggs: bool = False, max_degree: Optional[int] = Non
 
 
 def _merge_specs(base, new):
-    """Union two specs' search spaces so re-induction can only *grow* the grammar (item 2).
+    """Union two specs' search spaces so re-induction can never *shrink* the grammar (item 2).
 
     A fresh induction each tier is non-deterministic: a role/pattern/family present in an earlier
     tier can be absent from a later proposal, so a bare re-induction does **not** guarantee the
-    "search space strictly grows" property the tiers rely on.  This folds the new proposal into the
+    non-shrinking search-space property the tiers rely on. This folds the new proposal into the
     accumulated ``base`` spec, keeping ``base`` authoritative on every conflict so no existing
     grounding is silently redefined, and only *adding* what ``new`` proposes:
 
@@ -662,9 +669,9 @@ def _merge_specs(base, new):
         for key, values in base.condition_columns.items()
     }
     for key, values in new.condition_columns.items():
-        conditions[key] = tuple(dict.fromkeys(
+        conditions[key] = typed_unique(
             (*conditions.get(key, ()), *tuple(values))
-        ))
+        )
     seen_related = {
         (template.binder, template.role)
         for template in base.related_templates
@@ -795,6 +802,10 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             "between 1 and 500000"
         )
     known = load_known(known_path)
+    # These checks are deterministic and local. Run them before constructing/invoking the external
+    # inducer, so an invalid known catalogue or split fraction fails without spending a subagent
+    # request or producing its side effects.
+    _validate_split_inputs(known, cfg.validation_frac)
     inducer = _make_calibration_inducer(cfg)
     # Induce the grammar BEFORE the split, purely to learn how the runtime will decode a cell. The
     # split has to canonicalise known signatures against the same data the runtime frame sees, and
@@ -893,7 +904,7 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             reinductions += 1
             # Fold the fresh (non-deterministic) proposal back into the accumulated grammar so a
             # later tier can never drop a role/pattern an earlier tier already had -- this is what
-            # makes "the search space strictly grows" across tiers actually hold (item 2).
+            # makes the search space non-shrinking across tiers actually hold (item 2).
             spec = _merge_specs(accumulated, spec)
         spec = _widen_spec(spec, all_aggs=caps.get("all_aggs", False),
                            max_degree=caps.get("max_degree"),

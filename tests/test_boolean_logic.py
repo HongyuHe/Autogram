@@ -18,6 +18,7 @@ from autogram.discovery.validate import score_recovery
 from autogram.discovery.loop import build_dataframe_grammar
 from autogram.discovery.propose import EnumerationProposer, normalize_rule
 from autogram.dsl import ast as A
+from autogram.dsl.evaluate import typed_group_key
 from autogram.dsl.grammar import Grammar
 from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
@@ -741,6 +742,68 @@ def test_categorical_priority_map_is_evaluated_and_enumerated():
     assert result.hold_rate == 1.0
     rendered = {candidate.unparse() for candidate in EnumerationProposer(grammar).propose()}
     assert normalize_rule(rule).unparse() in rendered
+
+
+def test_categorical_definition_scores_typed_identity_and_remains_enumerable():
+    """A rule that only works because ``True == 1`` must be rejected.
+
+    The two Boolean cases deliberately emit the other's typed label. Python equality calls every
+    prediction correct; typed equality calls only the overlap and default rows correct.
+    """
+    n = 400
+    phase = np.arange(n) % 4
+    is_true = (phase == 0) | (phase == 2)
+    is_one = (phase == 1) | (phase == 2)
+    labels = np.empty(n, dtype=object)
+    labels[phase == 0] = True
+    labels[phase == 1] = 1
+    labels[phase == 2] = 1
+    labels[phase == 3] = "other"
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "is_true": is_true,
+            "is_one": is_one,
+            "label": pd.Series(labels, dtype=object),
+        }),
+        condition_columns=("is_true", "is_one", "label"),
+        advanced=True,
+    )
+    dataset, grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="typed_category_definition",
+    )
+    rule = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            target_column="label",
+            cases=(
+                ("is_true", 1),
+                ("is_one", True),
+            ),
+            default="other",
+        ),
+    )
+
+    domain = grammar.condition_columns["label"]
+    assert len({typed_group_key(value) for value in domain}) == 3
+    assert normalize_rule(rule).unparse() in {
+        normalize_rule(candidate).unparse()
+        for candidate in EnumerationProposer(grammar).propose()
+        if isinstance(candidate.atom, A.CategoryDefinition)
+    }
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.8,
+            definition_min_lift=0.0,
+        ),
+    ).evaluate(rule)
+
+    assert not result.accepted
+    assert result.hold_rate == 0.5
+    assert result.parameters["baseline_agreement"] == 0.5
 
 
 def test_categorical_enumeration_is_boolean_column_rename_invariant():

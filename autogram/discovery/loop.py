@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import DiscoveryConfig, SearchConfig
+from ..dsl.evaluate import typed_unique
 from ..dsl.grammar import Grammar, grammar_from_adapter
 from ..loader.loader import Dataset, build_dataset, load_dataframe
 from ..schema.compiler import compile_spec
@@ -357,7 +358,10 @@ def _augment_profiled_dataframe_spec(df, spec):
         agg_kinds=agg_kinds,
     )
     condition_columns = {
-        name: tuple(pd.unique(df[name].dropna()).tolist())
+        name: typed_unique(
+            df[name].to_numpy(dtype=object),
+            drop_missing=True,
+        )
         for name in condition_names
     }
     boolean_roles = {

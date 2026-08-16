@@ -627,9 +627,9 @@ def _canonicalize(sig, frame, zero_tol: float, exact: bool | None = None):
 
     Only the sum-shaped signatures carry groupings, so only they are canonicalized; pairwise,
     zero, presence and one-sided signatures pass through unchanged.  The transform is idempotent
-    and strictly widens matching: a member is removed only when it is negligible against the anchor
-    on *every* gradeable row, so the sum it feeds is unchanged everywhere it is evaluated, and
-    anything that matched exactly still matches after canonicalizing.
+    and widens matching within the declared tolerance: an exact relation removes only members with
+    zero contribution, while an approximate relation may remove a collectively bounded non-zero
+    contribution. Anything that matched before still matches after canonicalizing.
     """
     if not isinstance(sig, tuple) or not sig:
         return sig
