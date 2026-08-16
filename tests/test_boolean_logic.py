@@ -449,7 +449,7 @@ def test_known_definition_thresholds_use_scale_aware_matching():
         ),
         "series_id": "a",
         "signal": signal,
-        "alert": signal < 0.004,
+        "alert": _sustained(signal, 0.004, 3),
     }))
     dataset, _grammar = build_dataframe_grammar(
         frame,
@@ -503,6 +503,84 @@ def test_known_definition_thresholds_use_scale_aware_matching():
 
     assert recover_known(result, [wrong])["recall"] == 0.0
     assert recover_known(result, [matching])["recall"] == 1.0
+
+
+def test_known_sustained_recovery_requires_an_exact_full_mask():
+    signal = np.resize(
+        np.array([0.8, 0.4, 0.3, 0.2, 0.9, 0.7]),
+        600,
+    )
+    target = _sustained(signal, 0.5, 3)
+    target[200] = ~target[200]
+    frame = _profile(pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=signal.size,
+            freq="1min",
+        ),
+        "series_id": "a",
+        "signal": signal,
+        "alert": target,
+    }))
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="inexact_known_sustained",
+    )
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("alert"),
+            A.Sustained(
+                A.Bound(A.Ref("signal"), "<", 0.5),
+                3,
+            ),
+        ),
+    )
+    evaluation = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(hold_rate_threshold=0.9),
+    ).evaluate(rule)
+    result = SimpleNamespace(
+        dataset=dataset,
+        portfolio=[evaluation],
+    )
+    known = KnownInvariant(
+        "sustained",
+        ":=",
+        "alert",
+        {
+            "sustained": {
+                "term": "signal",
+                "op": "<",
+                "threshold": 0.5,
+                "window": 3,
+            },
+        },
+    )
+
+    assert evaluation.accepted
+    assert evaluation.hold_rate < 1.0
+    assert recover_known(result, [known])["recall"] == 0.0
+
+
+def test_learned_threshold_candidates_separate_adjacent_floats():
+    from autogram.discovery.evaluate import _fit_threshold_candidates
+
+    lower = 1.0
+    upper = np.nextafter(lower, np.inf)
+    values = np.array([lower, upper])
+
+    candidates = _fit_threshold_candidates(
+        values,
+        np.ones(values.size, dtype=bool),
+        DiscoveryConfig(),
+    )
+
+    assert any(
+        (values < threshold).tolist() == [True, False]
+        for threshold in candidates
+    )
 
 
 def test_sustained_predicate_is_false_across_timestamp_gap():

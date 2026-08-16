@@ -60,6 +60,10 @@ class Grounded:
     full_left: np.ndarray | None = None
     full_right: np.ndarray | None = None
     full_row_indices: np.ndarray | None = None
+    # Source rows where candidate-created arithmetic overflowed before the finite population was
+    # formed. They remain excluded from numeric fitting, but their group identities must still
+    # reach the per-group gate as failures.
+    overflow_row_indices: np.ndarray | None = None
     # True only for an atomic sign bound ``x OP 0`` that holds tolerance-free on every grounded row,
     # computed on the FULL population BEFORE any subsampling so a sampled-out violation can never
     # spuriously mark the bound exact.
@@ -343,9 +347,24 @@ def canonical_typed_value(value):
     """Canonical Python representation of one categorical/group value."""
     if isinstance(value, tuple):
         return tuple(canonical_typed_value(item) for item in value)
+    if isinstance(value, np.datetime64):
+        return pd.Timestamp(value)
+    if isinstance(value, np.timedelta64):
+        return pd.Timedelta(value)
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+def _typed_object_array(values) -> np.ndarray:
+    """Object array that does not integerize NumPy temporal scalars."""
+    array = np.asarray(values)
+    if array.dtype.kind not in ("M", "m"):
+        return np.asarray(values, dtype=object)
+    output = np.empty(array.shape, dtype=object)
+    for index in np.ndindex(array.shape):
+        output[index] = array[index]
+    return output
 
 
 def is_missing_scalar(value) -> bool:
@@ -508,9 +527,14 @@ def _ordered_groups(frame: Frame, nm: NameModel):
         if not group_keys:
             key = "__all__"
         elif len(group_keys) == 1:
-            key = np.asarray(frame.row_context[group_keys[0]], dtype=object)[row]
+            key = _typed_object_array(
+                frame.row_context[group_keys[0]]
+            )[row]
         else:
-            key = tuple(np.asarray(frame.row_context[name], dtype=object)[row] for name in group_keys)
+            key = tuple(
+                _typed_object_array(frame.row_context[name])[row]
+                for name in group_keys
+            )
         groups.setdefault(typed_group_key(key), []).append(row)
     ordered = []
     for rows in groups.values():
@@ -536,12 +560,25 @@ def _consecutive_window_ends(
         np.asarray(frame.row_context[time_index])[rows],
         errors="coerce",
     ).to_numpy(dtype="datetime64[ns]").astype(np.int64)
-    diffs = np.diff(times)
-    positive = diffs[diffs > 0]
-    if not positive.size:
+    diffs = [
+        (
+            int(times[index + 1]) - int(times[index])
+            if (
+                times[index] != _NAT_NS
+                and times[index + 1] != _NAT_NS
+            )
+            else None
+        )
+        for index in range(times.size - 1)
+    ]
+    positive = [delta for delta in diffs if delta is not None and delta > 0]
+    if not positive:
         return valid
-    cadence = int(np.min(positive))
-    consecutive = diffs == cadence
+    cadence = min(positive)
+    consecutive = np.asarray(
+        [delta == cadence for delta in diffs],
+        dtype=bool,
+    )
     for end in range(window - 1, rows.size):
         valid[end] = bool(np.all(
             consecutive[end - window + 1:end]
@@ -641,7 +678,10 @@ def _row_group_keys(frame: Frame, nm: NameModel, rows: np.ndarray) -> np.ndarray
     group_keys = tuple(getattr(adapter, "group_keys", ()))
     if not group_keys or not all(key in frame.row_context for key in group_keys):
         return None
-    columns = [np.asarray(frame.row_context[key], dtype=object) for key in group_keys]
+    columns = [
+        _typed_object_array(frame.row_context[key])
+        for key in group_keys
+    ]
     if len(columns) == 1:
         return columns[0][rows]
     # A composite key must stay a ONE-dimensional object array whose elements are tuples. Passing a
@@ -759,6 +799,7 @@ def ground(rule: A.Rule, frame: Frame, nm: NameModel,
     overflow_fraction = (
         float(overflow_points) / float(attempted_points) if attempted_points else 0.0
     )
+    overflow_rows = rows[overflowed]
     mask = np.isfinite(rho) & np.isfinite(scale) & ~overflowed
     left, right, rho, scale, rows = (
         left[mask],
@@ -807,7 +848,8 @@ def ground(rule: A.Rule, frame: Frame, nm: NameModel,
                     overflow_fraction=overflow_fraction,
                     attempted_points=attempted_points,
                     full_left=full_left, full_right=full_right,
-                    full_row_indices=full_rows)
+                    full_row_indices=full_rows,
+                    overflow_row_indices=overflow_rows)
 
 
 def rel_residual(g: Grounded) -> np.ndarray:
@@ -830,7 +872,7 @@ def _condition_mask(condition: A.Condition | None, frame: Frame):
         return mask
     if condition.column not in frame.row_context:
         return None
-    values = np.asarray(frame.row_context[condition.column], dtype=object)
+    values = _typed_object_array(frame.row_context[condition.column])
     present = ~pd.isna(values)
     mask = np.zeros(frame.n_rows, dtype=bool)
     if condition.op == "==":
@@ -935,7 +977,7 @@ def _parent_time_index(template, frame: Frame):
         np.asarray(frame.row_context[template.parent_time])
     )
     key_arrays = [
-        np.asarray(frame.row_context[column], dtype=object)
+        _typed_object_array(frame.row_context[column])
         for column in template.parent_keys
     ]
     groups: dict[tuple, list[int]] = {}
@@ -970,7 +1012,7 @@ def _child_partition_index(template, frame: Frame, child):
         # sums their readings together. Grouping here has to agree with the parent index, so both
         # sides use the same typed key.
         columns = [
-            np.asarray(child[column].to_numpy(), dtype=object)
+            _typed_object_array(child[column].to_numpy())
             for column in group_columns
         ]
         buckets: dict[tuple, list[int]] = {}
@@ -1183,23 +1225,28 @@ def _related_aggregate(template, frame: Frame):
             has_prior = prior_boundaries >= 0
             prior_is_adjacent = np.zeros(len(ordered_parent), dtype=bool)
             prior_rows = np.flatnonzero(has_prior)
+            prior_deadlines, _prior_saturated = _saturating_add_ns(
+                times[prior_boundaries[prior_rows]],
+                window_ns,
+            )
             prior_is_adjacent[prior_rows] = (
-                times[prior_boundaries[prior_rows]]
-                >= starts[prior_rows] - window_ns
+                prior_deadlines >= starts[prior_rows]
             )
             coverage = has_interval & has_prior & prior_is_adjacent
-            active = np.flatnonzero(coverage)
-            valid = np.ones(len(active), dtype=bool)
+            eligible = coverage.copy()
             if template.reset_column:
                 prefix = _partition_reset_prefix(
                     partition,
                     child,
                     template.reset_column,
                 )
-                valid &= (
-                    prefix[interval_ends[active]]
-                    - prefix[interval_starts[active]]
+                covered_rows = np.flatnonzero(coverage)
+                eligible[covered_rows] = (
+                    prefix[interval_ends[covered_rows]]
+                    - prefix[interval_starts[covered_rows]]
                 ) == 0
+            active = np.flatnonzero(eligible)
+            valid = np.ones(len(active), dtype=bool)
             active_blown = np.zeros(len(active), dtype=bool)
             for column in template.validity_columns:
                 end_values = values[column][boundaries[active]]

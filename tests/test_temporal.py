@@ -22,7 +22,12 @@ from autogram.discovery.induce import SchemaInducer
 from autogram.discovery.propose import EnumerationProposer, normalize_rule
 from autogram.discovery.validate import score_recovery
 from autogram.dsl import ast as A
-from autogram.dsl.evaluate import eval_term
+from autogram.dsl.evaluate import (
+    _consecutive_window_ends,
+    _row_group_keys,
+    eval_term,
+    typed_group_key,
+)
 from autogram.dsl.grammar import Grammar
 from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
@@ -153,6 +158,97 @@ def _profile(
         max_lag=max_lag,
         max_degree=max_degree,
     )
+
+
+def test_temporal_typed_identity_does_not_collide_with_integer_zero():
+    integer = typed_group_key(0)
+    numpy_integer = typed_group_key(np.int64(0))
+    instant = typed_group_key(
+        np.datetime64("1970-01-01", "ns")
+    )
+    duration = typed_group_key(np.timedelta64(0, "ns"))
+
+    assert integer == numpy_integer
+    assert len({integer, instant, duration}) == 3
+    assert (
+        typed_group_key(np.datetime64("NaT", "ns"))
+        == typed_group_key(None)
+    )
+    assert (
+        typed_group_key(np.timedelta64("NaT", "ns"))
+        == typed_group_key(None)
+    )
+
+
+def test_temporal_group_array_preserves_temporal_scalars():
+    instant = typed_group_key(
+        np.datetime64("1970-01-01", "ns")
+    )
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "group_id": np.array(
+                [
+                    "1970-01-01T00:00:00.000000000",
+                    "1970-01-01T00:00:00.000000001",
+                ],
+                dtype="datetime64[ns]",
+            ),
+            "x": [1.0, 2.0],
+        }),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="temporal_group_identity",
+    )
+    labels = _row_group_keys(
+        dataset.observed,
+        dataset.name_model,
+        np.arange(2),
+    )
+    assert labels is not None
+    assert typed_group_key(labels[0]) == instant
+
+
+def test_nat_timestamp_cannot_complete_a_temporal_window():
+    cadence = 60 * 1_000_000_000
+    maximum = np.iinfo(np.int64).max
+    timestamps = np.array(
+        [
+            maximum - 2 * cadence + 1,
+            maximum - cadence + 1,
+            np.iinfo(np.int64).min,
+        ],
+        dtype=np.int64,
+    ).view("datetime64[ns]")
+    frame = _profile(pd.DataFrame({
+        "timestamp": timestamps,
+        "series_id": "a",
+        "x": [1.0, 2.0, 3.0],
+    }))
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="nat_temporal_window",
+    )
+
+    consecutive = _consecutive_window_ends(
+        dataset.observed,
+        dataset.name_model,
+        np.arange(3),
+        2,
+    )
+    lagged = eval_term(
+        A.Lag(A.Ref("x"), 1),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert consecutive.tolist() == [False, True, False]
+    assert np.isnan(lagged[2])
 
 
 def test_composite_group_keys_survive_stratified_subsampling():

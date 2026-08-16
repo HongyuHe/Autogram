@@ -14,6 +14,7 @@ from dataclasses import replace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from autogram.config import DiscoveryConfig
 from autogram.discovery.evaluate import DataOnlyEvaluator
@@ -174,6 +175,56 @@ def test_residual_subtraction_overflow_is_detected():
 
     assert g.overflow_points == 30
     assert g.graded_points == 0
+
+
+def test_overflow_only_group_still_fails_the_per_group_gate():
+    n_clean = 95
+    n_overflow = 5
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "group_id": (
+                ["clean"] * n_clean
+                + ["overflow"] * n_overflow
+            ),
+            "a": np.concatenate((
+                np.ones(n_clean),
+                np.full(n_overflow, 1e308),
+            )),
+            "b": np.concatenate((
+                np.ones(n_clean),
+                np.full(n_overflow, 1e308),
+            )),
+            "target": np.ones(n_clean + n_overflow),
+        }),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="overflow_only_group",
+    )
+    rule = A.Rule(
+        "record",
+        A.Compare(
+            A.Ref("target"),
+            "~=",
+            A.Mul(A.Ref("a"), A.Ref("b")),
+        ),
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.01,
+            hold_rate_threshold=0.9,
+            band_mode="global",
+            max_overflow_fraction=0.1,
+        ),
+    ).evaluate(rule)
+
+    assert result.support == pytest.approx(0.95)
+    assert not result.accepted
+    assert result.parameters["group_hold_rates"]["overflow"] == 0.0
 
 
 def test_overflow_taint_survives_being_mapped_back_to_a_finite_value():
@@ -367,6 +418,58 @@ def test_proportional_fit_overflow_is_refused_not_scored():
 
     assert not result.accepted
     assert "overflow" in result.reason
+
+
+def test_conditioned_fit_overflow_keeps_full_frame_support_denominator():
+    n = 1000
+    selected = np.arange(n) < 100
+    x = np.ones(n)
+    x[50] = 10.0
+    y = np.ones(n)
+    y[selected] = 1e308
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "x": x,
+            "y": y,
+            "label": np.where(selected, "selected", "other"),
+        }),
+        condition_columns=("label",),
+        proportional=True,
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="conditioned_overflow_support",
+    )
+    rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~\u221d", A.Ref("x")),
+        condition=A.Condition(
+            "label",
+            "==",
+            ("selected",),
+        ),
+    )
+
+    grounded = ground(
+        rule,
+        dataset.observed,
+        dataset.name_model,
+    )
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.05,
+            hold_rate_threshold=0.62,
+            band_mode="global",
+            seed=1,
+            max_overflow_fraction=0.02,
+        ),
+    ).evaluate(rule)
+
+    assert grounded.support == pytest.approx(0.1)
+    assert result.accepted
+    assert result.support == pytest.approx(0.099)
 
 
 def test_proportional_coefficient_median_survives_ceiling_scale_ratios():

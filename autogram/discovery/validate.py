@@ -452,9 +452,23 @@ def _ground_term_column_items(term, binder, binding, nm):
     return []
 
 
-def portfolio_relations(result: DiscoveryResult) -> set:
+def portfolio_relations(
+    result: DiscoveryResult,
+    *,
+    require_exact_definition_masks: bool = False,
+) -> set:
     rels: set = set()
     for ev in result.portfolio:
+        if (
+            require_exact_definition_masks
+            and isinstance(ev.rule.atom, A.BooleanDefinition)
+            and isinstance(
+                ev.rule.atom.predicate,
+                (A.Sustained, A.Conjunction),
+            )
+            and not _definition_matches_planted_mask(ev, result)
+        ):
+            continue
         rels |= rule_relations(
             ev.rule,
             result.dataset,

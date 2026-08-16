@@ -935,3 +935,57 @@ def test_related_delta_overflow_is_reported_not_absorbed_as_invalidity():
     assert bool(np.any(overflow)), "the blown-up shard was absorbed as mere invalidity"
     # The overflow is invisible in the output: the shard was dropped, so the total stayed finite.
     assert np.all(np.isfinite(values[~np.isnan(values)]))
+
+
+def test_reset_interval_is_excluded_before_streaming_delta_arithmetic():
+    from autogram.dsl.evaluate import _related_aggregate
+
+    parent_time = pd.Timestamp("2026-01-01 00:01:00")
+    raw = pd.DataFrame({
+        "timestamp": [
+            parent_time - pd.Timedelta("10s"),
+            parent_time + pd.Timedelta("10s"),
+        ] * 2,
+        "shard_id": ["bad", "bad", "good", "good"],
+        "counter": [-1.5e308, 1.5e308, 0.0, 10.0],
+        "reset_flag": [False, True, False, False],
+    })
+    parent = pd.DataFrame({
+        "timestamp": [parent_time],
+        "consumer_id": ["c0"],
+        "total": [10.0],
+    })
+    frame = profile_dataframe(
+        parent,
+        time_index="timestamp",
+        group_keys=("consumer_id",),
+        related_frames={"raw": raw},
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="reset_before_delta",
+    )
+    template = RelatedTemplate(
+        binder="record",
+        role="raw_counter_delta",
+        relation="raw",
+        column="counter",
+        mode="sum_delta",
+        parent_keys=(),
+        child_keys=(),
+        partition_keys=("shard_id",),
+        parent_time="timestamp",
+        child_time="timestamp",
+        window_seconds=60,
+        reset_column="reset_flag",
+        validity_columns=(),
+    )
+
+    values, overflow = _related_aggregate(
+        template,
+        dataset.observed,
+    )
+
+    assert np.allclose(values, [10.0])
+    assert overflow is None

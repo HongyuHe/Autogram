@@ -21,6 +21,7 @@ from ..dsl.evaluate import (
     _ordered_groups,
     _union_overflow,
     _window_overflow,
+    _typed_object_array,
     eval_term,
     eval_term_overflow,
     ground,
@@ -98,6 +99,15 @@ def _strictness(op: str, eps: float, rel: np.ndarray, hold: np.ndarray) -> str:
     return "loose"
 
 
+def _finite_ulp(values: np.ndarray) -> np.ndarray:
+    """Finite one-ULP magnitude, including at either float64 ceiling."""
+    values = np.asarray(values, dtype=float)
+    with np.errstate(over="ignore", invalid="ignore"):
+        spacing = np.abs(np.spacing(values))
+        inward = np.abs(values - np.nextafter(values, 0.0))
+    return np.where(np.isfinite(spacing), spacing, inward)
+
+
 def _group_labels(frame, name_model, row_indices=None):
     keys = tuple(
         getattr(
@@ -112,13 +122,10 @@ def _group_labels(frame, name_model, row_indices=None):
     ):
         return None
     if len(keys) == 1:
-        labels = np.asarray(
-            frame.row_context[keys[0]],
-            dtype=object,
-        )
+        labels = _typed_object_array(frame.row_context[keys[0]])
     else:
         columns = [
-            np.asarray(frame.row_context[key], dtype=object)
+            _typed_object_array(frame.row_context[key])
             for key in keys
         ]
         labels = np.empty(frame.n_rows, dtype=object)
@@ -224,7 +231,21 @@ def _group_hold_gate(
     z: float,
     threshold: float,
     use_wilson: bool = False,
+    failed_groups=None,
 ) -> tuple[bool, dict]:
+    if failed_groups is not None:
+        failed_groups = np.asarray(failed_groups, dtype=object)
+        if failed_groups.size:
+            if groups is None:
+                return False, {}
+            holds = np.concatenate((
+                np.asarray(holds, dtype=bool),
+                np.zeros(failed_groups.size, dtype=bool),
+            ))
+            groups = np.concatenate((
+                np.asarray(groups, dtype=object),
+                failed_groups,
+            ))
     if groups is None:
         return True, {}
     groups = np.asarray(groups, dtype=object)
@@ -470,6 +491,12 @@ class DataOnlyEvaluator:
             nm,
             g.row_indices,
         )
+        overflow_rows = getattr(g, "overflow_row_indices", None)
+        failed_groups = (
+            _group_labels(frame, nm, overflow_rows)
+            if overflow_rows is not None and overflow_rows.size
+            else None
+        )
         if op == "~∝":
             fitted = _fit_proportional(g, frame, nm, cfg)
             if fitted is None:
@@ -509,6 +536,25 @@ class DataOnlyEvaluator:
             )
             fit_blown = 0 if fit_overflow is None else int(np.count_nonzero(fit_overflow))
             if fit_blown:
+                fit_rows = (
+                    g.full_row_indices
+                    if g.full_row_indices is not None
+                    else g.row_indices
+                )
+                fit_failed_groups = _group_labels(
+                    frame,
+                    nm,
+                    fit_rows[fit_overflow],
+                )
+                if fit_failed_groups is not None:
+                    failed_groups = (
+                        fit_failed_groups
+                        if failed_groups is None
+                        else np.concatenate((
+                            np.asarray(failed_groups, dtype=object),
+                            np.asarray(fit_failed_groups, dtype=object),
+                        ))
+                    )
                 attempted = int(g.attempted_points) or int(full_left.size)
                 blown = int(g.overflow_points) + fit_blown
                 rejection = self._overflow_reject_if(
@@ -577,14 +623,16 @@ class DataOnlyEvaluator:
             signed = rho / scale
             holds = signed > eps if op == ">" else signed < -eps
         elif op == "==":
-            ulp = np.maximum(
-                np.abs(np.spacing(g.left)),
-                np.abs(np.spacing(g.right)),
-            )
+            ulp = np.maximum(_finite_ulp(g.left), _finite_ulp(g.right))
             exact_tolerance = 4.0 * np.maximum(
                 ulp,
                 np.finfo(float).eps,
             )
+            if not np.all(np.isfinite(exact_tolerance)):
+                return self._reject(
+                    rule,
+                    "exact equality tolerance is non-finite",
+                )
             holds = np.abs(rho) <= exact_tolerance
             eps = float(np.max(exact_tolerance / scale))
         else:
@@ -625,6 +673,7 @@ class DataOnlyEvaluator:
             z=z,
             threshold=thr,
             use_wilson=op == "~\u221d",
+            failed_groups=failed_groups,
         )
         ok &= group_ok
         parameters.update(group_parameters)
@@ -783,11 +832,11 @@ class DataOnlyEvaluator:
         Tolerated overflow is still not evidence: the rows leave the scored population, so the
         reported support has to leave with them.
         """
-        attempted = int(g.attempted_points)
-        if not attempted or not g.n_candidates:
+        graded = int(g.graded_points)
+        if graded <= 0:
             return g.support
-        graded = max(0, int(g.graded_points) - int(blown))
-        return (g.n_bindings / g.n_candidates) * (float(graded) / float(attempted))
+        remaining = max(0, graded - int(blown))
+        return float(g.support) * (float(remaining) / float(graded))
 
     def _graded_support_rejection(self, rule: A.Rule, g, blown: int):
         """Re-apply the conditioned support floor after overflowed rows are excluded, else ``None``."""
@@ -1395,9 +1444,14 @@ def _fit_proportional(g, frame, nm, cfg):
     keys = tuple(getattr(getattr(nm, "adapter", None), "group_keys", ()))
     if keys and all(key in frame.row_context for key in keys):
         if len(keys) == 1:
-            labels = np.asarray(frame.row_context[keys[0]], dtype=object)[g.row_indices]
+            labels = _typed_object_array(
+                frame.row_context[keys[0]]
+            )[g.row_indices]
         else:
-            columns = [np.asarray(frame.row_context[key], dtype=object)[g.row_indices] for key in keys]
+            columns = [
+                _typed_object_array(frame.row_context[key])[g.row_indices]
+                for key in keys
+            ]
             labels = np.empty(g.n_points, dtype=object)
             for index, values in enumerate(zip(*columns)):
                 labels[index] = tuple(values)
@@ -1417,7 +1471,7 @@ def _fit_proportional(g, frame, nm, cfg):
         left = g.left[mask]
         right = g.right[mask]
         finite = np.isfinite(left) & np.isfinite(right)
-        usable = finite & (np.abs(right) > 1e-12)
+        usable = finite & (right != 0.0)
         local_positions = np.flatnonzero(mask)
         usable_positions = local_positions[usable]
         zero_predictor_positions = local_positions[
@@ -1676,11 +1730,12 @@ def _fit_threshold_candidates(effective: np.ndarray, fit_mask: np.ndarray, cfg=N
 
     Candidates are drawn from the *fit* rows only (never the evaluation split) as the midpoints
     between consecutive distinct effective-term values plus two edge sentinels (below the minimum
-    and above the maximum). Because a stump's prediction only changes as the threshold crosses a
-    distinct value, this discrete set contains the exact agreement-maximising threshold, and the
-    Cartesian product across a conjunction's learned bounds therefore contains the exact *joint*
-    optimum -- not merely a per-bound heuristic. A positive ``max_threshold_candidates`` fails loud
-    rather than silently coarsening.
+    and above the maximum). When adjacent floats have no representable interior midpoint, both
+    observed endpoints are included so strict and non-strict operators remain separable. Because a
+    stump's prediction only changes at these boundaries, this discrete set contains the exact
+    agreement-maximising threshold, and the Cartesian product across a conjunction's learned bounds
+    therefore contains the exact *joint* optimum -- not merely a per-bound heuristic. A positive
+    ``max_threshold_candidates`` fails loud rather than silently coarsening.
     """
     mask = np.asarray(fit_mask, dtype=bool) & np.isfinite(effective)
     terms = effective[mask]
@@ -1703,6 +1758,11 @@ def _fit_threshold_candidates(effective: np.ndarray, fit_mask: np.ndarray, cfg=N
         overflow = ~np.isfinite(base)
         if overflow.any():
             base = np.where(overflow, lo_vals * 0.5 + hi_vals * 0.5, base)
+        collapsed = (base <= lo_vals) | (base >= hi_vals)
+        separators = np.concatenate((
+            lo_vals[collapsed],
+            hi_vals[collapsed],
+        ))
         with np.errstate(over="ignore"):
             raw_span = float(hi_vals[-1] - lo_vals[0])
         span = raw_span if np.isfinite(raw_span) else 0.0
@@ -1722,7 +1782,11 @@ def _fit_threshold_candidates(effective: np.ndarray, fit_mask: np.ndarray, cfg=N
     if not np.isfinite(high):
         high = float(unique[-1])
     edges = np.array([low, high], dtype=float)
-    candidates = np.unique(np.concatenate([base, edges]))
+    candidates = np.unique(np.concatenate([
+        base,
+        edges,
+        separators if unique.size > 1 else np.empty(0, dtype=float),
+    ]))
     cap = int(getattr(cfg, "max_threshold_candidates", 0) or 0)
     if cap > 0 and candidates.size > cap:
         from .propose import SearchSpaceTruncatedError

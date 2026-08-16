@@ -478,6 +478,100 @@ def test_materialization_fails_loudly_on_finite_counter_subtraction_overflow():
         prepare_gtib(derived, raw)
 
 
+def test_materialization_skips_extreme_ineligible_gap_and_reset_deltas():
+    derived, raw = _tables()
+    raw = raw.loc[raw["shard_id"] == "shard_000_0"].copy()
+    minute_zero = raw["timestamp"] < pd.Timestamp(
+        "2026-01-01 00:01:00"
+    )
+    minute_one = (
+        (raw["timestamp"] >= pd.Timestamp("2026-01-01 00:01:00"))
+        & (raw["timestamp"] < pd.Timestamp("2026-01-01 00:02:00"))
+    )
+    minute_two = raw["timestamp"] >= pd.Timestamp(
+        "2026-01-01 00:02:00"
+    )
+
+    gapped = raw.loc[~minute_one].copy()
+    gapped.loc[minute_zero[~minute_one], "collector_input_counted"] = -1.5e308
+    gapped.loc[minute_two[~minute_one], "collector_input_counted"] = 1.5e308
+    gap_frame = prepare_gtib(derived, gapped)
+    assert gap_frame["shard_000_0_input_increment"].isna().all()
+
+    reset = raw.copy()
+    reset.loc[minute_zero, "collector_input_counted"] = -1.5e308
+    reset.loc[~minute_zero, "collector_input_counted"] = 1.5e308
+    reset.loc[minute_one, "reset_flag"] = True
+    reset_frame = prepare_gtib(derived, reset)
+    assert pd.isna(reset_frame.loc[
+        reset_frame["minute_index"] == 1,
+        "shard_000_0_input_increment",
+    ].item())
+
+
+def _boundary_fixture(parent: pd.Timestamp, minute_index: int):
+    derived = pd.DataFrame({
+        "timestamp": [parent],
+        "consumer_id": ["consumer"],
+        "minute_index": [minute_index],
+        "input_rate_bytes_per_min": [10.0],
+    })
+    raw = pd.DataFrame({
+        "timestamp": [
+            parent - pd.Timedelta("1ns"),
+            parent + pd.Timedelta("10s"),
+        ],
+        "consumer_id": ["consumer", "consumer"],
+        "shard_id": ["shard", "shard"],
+        "collector_input_counted": [0.0, 10.0],
+        "presenter_output_counted": [0.0, 10.0],
+        "reset_flag": [False, False],
+    })
+    return derived, raw
+
+
+def test_materialized_minute_bucketing_uses_exact_nanoseconds():
+    minute = 1_000_000
+    parent = (
+        pd.Timestamp("2020-01-01")
+        + pd.Timedelta(minutes=minute)
+    )
+    derived, raw = _boundary_fixture(parent, minute)
+
+    frame = prepare_gtib(derived, raw)
+
+    assert frame["shard_input_increment"].item() == 10.0
+
+
+def test_related_window_matches_materialization_near_timestamp_min():
+    parent = pd.Timestamp.min + pd.Timedelta("30s")
+    derived, raw = _boundary_fixture(parent, 1)
+    # The prior reading must be ten seconds before the parent, not one nanosecond before it.
+    raw.loc[0, "timestamp"] = parent - pd.Timedelta("10s")
+
+    prepared = prepare_gtib(derived, raw)
+    materialized = prepared["shard_input_increment"].to_numpy()
+    streaming_frame = prepared.drop(
+        columns=["shard_input_increment"],
+    )
+    streaming_frame.attrs = prepared.attrs
+    dataset, _grammar = build_dataframe_grammar(
+        streaming_frame,
+        _base_spec(),
+        name="timestamp_min_related",
+    )
+    streaming = eval_term(
+        A.RelatedAgg("raw_input_rate"),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert np.allclose(materialized, [10.0])
+    assert np.array_equal(materialized, streaming, equal_nan=True)
+
+
 def test_materialization_preserves_original_minute_indices_after_slice():
     derived, raw = _tables()
     sliced = derived.loc[derived["minute_index"].isin([1, 2])].copy()

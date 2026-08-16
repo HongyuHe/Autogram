@@ -561,22 +561,33 @@ def _materialize_raw(
     # a total of 0 in the fast path while the join calls the row ungradeable.
     consumer_covered: dict[tuple, set] = {}
     consumer_any_valid: dict[tuple, set] = {}
-    origins = derived["timestamp"] - pd.to_timedelta(
-        derived["minute_index"],
-        unit="min",
+    minute_ns = 60 * 1_000_000_000
+    parent_timestamps = (
+        derived["timestamp"]
+        .to_numpy(dtype="datetime64[ns]")
+        .astype(np.int64)
     )
     parent_start = {}
     parent_raw_by_key = {}
     inconsistent = []
-    for consumer, origin in zip(parent_consumers, origins):
+    nat_ns = np.iinfo(np.int64).min
+    for consumer, minute, timestamp_ns in zip(
+        parent_consumers,
+        parent_minutes,
+        parent_timestamps,
+    ):
         key = typed_group_key(consumer)
         parent_raw_by_key.setdefault(key, consumer)
-        timestamp = pd.Timestamp(origin)
+        if timestamp_ns == nat_ns:
+            raise ValueError(
+                f"GTIB derived table has NaT timestamp for consumer {consumer!r}"
+            )
+        origin_ns = int(timestamp_ns) - int(minute) * minute_ns
         previous = parent_start.get(key)
-        if previous is not None and previous != timestamp:
+        if previous is not None and previous != origin_ns:
             inconsistent.append(consumer)
         else:
-            parent_start[key] = timestamp
+            parent_start[key] = origin_ns
     if inconsistent:
         raise ValueError(
             "GTIB derived timestamps and minute_index values imply "
@@ -647,10 +658,22 @@ def _materialize_raw(
         # `minute_index` is relative to the derived series' exact origin, which need not be aligned
         # to a wall-clock minute. Flooring shifts every materialized window while the streaming join
         # keeps the true `[parent_time, parent_time + 60s)` interval, making the two paths disagree.
-        consumer_start = pd.Timestamp(parent_start[consumer_key])
-        group["_minute_index"] = (
-            (group["timestamp"] - consumer_start).dt.total_seconds() // 60
-        ).astype(int)
+        consumer_start_ns = parent_start[consumer_key]
+        group_times = (
+            group["timestamp"]
+            .to_numpy(dtype="datetime64[ns]")
+            .astype(np.int64)
+        )
+        present = group_times != nat_ns
+        group = group.loc[present].copy()
+        group_times = group_times[present]
+        group["_minute_index"] = np.asarray(
+            [
+                (int(timestamp_ns) - consumer_start_ns) // minute_ns
+                for timestamp_ns in group_times
+            ],
+            dtype=np.int64,
+        )
 
         boundaries = group.groupby("_minute_index", sort=True, observed=True).tail(1)
         minute_ids = boundaries["_minute_index"].to_numpy(dtype=int)
@@ -676,15 +699,22 @@ def _materialize_raw(
                 .reindex(minute_ids)
                 .to_numpy(dtype=float)
             )
+        adjacent = np.zeros(minute_ids.size, dtype=bool)
+        if minute_ids.size > 1:
+            adjacent[1:] = np.diff(minute_ids) == 1
+        eligible = adjacent & ~reset_by_minute
         increments = {}
         for counter, values in counter_boundaries.items():
             previous = np.concatenate((values[:1], values[:-1]))
+            delta = np.full(values.shape, np.nan, dtype=float)
+            rows = np.flatnonzero(eligible)
             with np.errstate(over="ignore", invalid="ignore"):
-                delta = values - previous
+                delta[rows] = values[rows] - previous[rows]
             overflow = (
                 ~np.isfinite(delta)
                 & np.isfinite(values)
                 & np.isfinite(previous)
+                & eligible
             )
             if np.any(overflow):
                 raw_consumer = raw_consumer_by_key[consumer_key]
@@ -696,19 +726,15 @@ def _materialize_raw(
                     f"counter {counter!r}, minute {minute}"
                 )
             increments[counter] = delta
-        valid = ~reset_by_minute
+        valid = eligible.copy()
         for values in increments.values():
             valid &= np.isfinite(values) & (values >= 0.0)
-        adjacent = np.zeros(minute_ids.size, dtype=bool)
-        if minute_ids.size > 1:
-            adjacent[1:] = np.diff(minute_ids) == 1
         # The streaming join separates *coverage* from *validity*: a minute with no adjacent prior
         # boundary has no measurable increment at all (`coverage` in `dsl/evaluate.py`), whereas a
         # covered minute whose increment is unusable (a reset, a negative step) still counts as a
         # deliberate zero contribution. The materialised path has to draw the same line, or the two
         # implementations of one law disagree on exactly the awkward rows.
         covered = adjacent.copy()
-        valid &= adjacent
 
         safe_shard = safe_group_names[(consumer_key, shard_key)]
         for counter, suffix in _COUNTERS.items():

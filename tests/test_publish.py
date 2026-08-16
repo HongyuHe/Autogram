@@ -123,6 +123,29 @@ def test_load_known_json(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("lhs", "rhs"),
+    [
+        ("total", {"sum": ["a", "a"]}),
+        ({"sum": ["total", "total"]}, {"sum": ["a"]}),
+        ({"sum": ["total"]}, {"sum": ["a", "a"]}),
+    ],
+)
+def test_load_known_rejects_duplicate_sum_members(tmp_path, lhs, rhs):
+    path = tmp_path / "duplicate-sum.json"
+    path.write_text(json.dumps({
+        "invariants": [{
+            "name": "duplicate",
+            "op": "==",
+            "lhs": lhs,
+            "rhs": rhs,
+        }],
+    }))
+
+    with pytest.raises(ValueError, match="duplicate columns"):
+        load_known(str(path))
+
+
+@pytest.mark.parametrize(
     "invariant",
     [
         {"name": "fractional_lag", "op": ">=", "lhs": {"lag": ["x", 1.9]}, "rhs": 0},

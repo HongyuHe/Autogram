@@ -87,6 +87,15 @@ def _known_is_zero(value) -> bool:
     )
 
 
+def _known_sum_columns(value, label: str) -> frozenset[str]:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{label} must be a non-empty list of columns")
+    columns = tuple(str(column) for column in value)
+    if len(columns) != len(set(columns)):
+        raise ValueError(f"{label} contains duplicate columns")
+    return frozenset(columns)
+
+
 def load_known(path: str) -> List[KnownInvariant]:
     """Load known invariants from a YAML or JSON file with an ``invariants:`` list."""
     text = open(path, "r", encoding="utf-8").read()
@@ -163,13 +172,15 @@ def _base_signature(inv: KnownInvariant):
         and isinstance(rhs, dict)
         and "sum" in rhs
     ):
+        left_columns = _known_sum_columns(lhs["sum"], "left sum")
+        right_columns = _known_sum_columns(rhs["sum"], "right sum")
         return _equality_relation(
             op,
             (
                 "sum_balance",
                 frozenset({
-                    frozenset(str(column) for column in lhs["sum"]),
-                    frozenset(str(column) for column in rhs["sum"]),
+                    left_columns,
+                    right_columns,
                 }),
             ),
         )
@@ -267,7 +278,10 @@ def _base_signature(inv: KnownInvariant):
     if op in ("~=", "==") and isinstance(rhs, dict) and "sum" in rhs:
         return _equality_relation(
             op,
-            ("ref_sum", (lhs, frozenset(str(c) for c in rhs["sum"]))),
+            (
+                "ref_sum",
+                (lhs, _known_sum_columns(rhs["sum"], "right sum")),
+            ),
         )
     if op in ("~=", "==") and isinstance(rhs, dict) and "ratio" in rhs:
         values = list(rhs["ratio"])
@@ -941,7 +955,10 @@ def recover_known(result: DiscoveryResult, known: List[KnownInvariant],
     identical law the engine found.  Set ``zero_tol=0`` to require exact column-set matches.
     """
     frame = result.dataset.observed
-    rels = portfolio_relations(result)
+    rels = portfolio_relations(
+        result,
+        require_exact_definition_masks=True,
+    )
     # The learned side is canonicalised under the tolerance the KNOWN relation permits, not under
     # its own. A learned *exact* sum is still recovered by an approximate known written over a
     # slightly different column set -- the known one tolerates the difference, and it is the known

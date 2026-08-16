@@ -170,6 +170,68 @@ def test_proportional_evaluator_checks_zero_predictor_rows():
     assert result.n_points > 30
 
 
+def test_exact_equality_at_float64_max_does_not_accept_zero():
+    maximum = np.finfo(float).max
+    frame = profile_dataframe(pd.DataFrame({
+        "x": np.full(400, maximum),
+        "zero": np.zeros(400),
+    }))
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="max_exact_equality",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("x"), "==", A.Ref("zero")),
+    ))
+
+    assert np.isfinite(result.eps)
+    assert not result.accepted
+    assert result.hold_rate == 0.0
+
+
+def test_proportional_fit_is_invariant_to_common_tiny_scaling():
+    values = np.arange(1.0, 401.0)
+    rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~\u221d", A.Ref("x")),
+    )
+    results = []
+    for scale in (1.0, 1e-15):
+        frame = profile_dataframe(pd.DataFrame({
+            "x": scale * values,
+            "y": scale * 2.0 * values,
+        }))
+        dataset, _grammar_obj = build_dataframe_grammar(
+            frame,
+            _base_spec(),
+            name=f"proportional_scale_{scale}",
+        )
+        results.append(DataOnlyEvaluator(
+            dataset,
+            DiscoveryConfig(
+                tolerance=1e-9,
+                hold_rate_threshold=0.9,
+                band_mode="global",
+                seed=0,
+            ),
+        ).evaluate(rule))
+
+    assert all(result.accepted for result in results)
+    assert all(
+        abs(result.parameters["coefficient"] - 2.0) < 1e-12
+        for result in results
+    )
+
+
 def test_proportional_evaluator_keeps_all_zero_predictor_groups():
     group = np.repeat(["valid", "violating"], [240, 120])
     x = np.concatenate([
