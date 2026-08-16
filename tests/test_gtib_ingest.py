@@ -4,11 +4,38 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from autogram.cli import _load_dataframe
 from autogram.discovery.loop import build_dataframe_grammar
+from autogram.dsl import ast as A
+from autogram.dsl.evaluate import eval_term
 from autogram.loader.gtib import AUTOGRAM_PROFILE_ATTR, infer_tabular_profile, prepare_gtib
 from autogram.schema.spec import CellCodec, ColumnPattern, GrammarSpec, RoleOntology
+
+
+def _base_spec() -> GrammarSpec:
+    return GrammarSpec(
+        name="flat",
+        patterns=(
+            ColumnPattern(
+                name="placeholder",
+                matcher="regex",
+                kind="unused",
+                direction="unused",
+                regex=r"^does_not_match$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("network",),
+            ref_roles={"network": ()},
+            fam_roles={"network": ()},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={"network": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
 
 
 def _tables() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -174,6 +201,66 @@ def test_prepare_gtib_qualifies_shard_ids_reused_across_consumers():
     # disagree with the streaming join.
     assert _increments(combined[first]) == [None, 60.0, 60.0, 0.0, 0.0, 0.0]
     assert _increments(combined[second]) == [0.0, 0.0, 0.0, None, 120.0, 120.0]
+
+
+@pytest.mark.parametrize(
+    "first_shard,second_shard",
+    [
+        (True, 1),
+        (1, "1"),
+    ],
+)
+def test_materialized_and_streaming_joins_preserve_typed_shard_identity(
+    first_shard,
+    second_shard,
+):
+    """Typed-distinct shard IDs must not merge in materialization or in generated names.
+
+    pandas ``groupby`` merges ``True`` with ``1`` before a key is exposed, while ``str``-keyed
+    lookups and names merge ``1`` with ``"1"``. Either collapse under-counts one path or overwrites
+    a materialized column, making the fast path disagree with the streaming related join.
+    """
+    derived, raw = _tables()
+    shard_ids = np.empty(len(raw), dtype=object)
+    first = raw["shard_id"] == "shard_000_0"
+    shard_ids[first.to_numpy()] = first_shard
+    shard_ids[~first.to_numpy()] = second_shard
+    raw = raw.copy()
+    raw["shard_id"] = pd.Series(shard_ids, dtype=object)
+    assert {type(value) for value in raw["shard_id"].tolist()} == {
+        type(first_shard),
+        type(second_shard),
+    }
+
+    prepared = prepare_gtib(derived, raw)
+    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]
+
+    assert len(family) == len(set(family)) == 2
+    materialized = prepared[family].sum(
+        axis=1,
+        min_count=len(family),
+    ).to_numpy(dtype=float)
+
+    streaming_frame = prepared.drop(columns=family)
+    streaming_frame.attrs = prepared.attrs
+    dataset, _grammar = build_dataframe_grammar(
+        streaming_frame,
+        _base_spec(),
+        name="typed_shard_streaming",
+    )
+    streaming = eval_term(
+        A.RelatedAgg("raw_input_rate"),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert streaming is not None
+    assert np.array_equal(materialized, streaming, equal_nan=True)
+    assert np.allclose(streaming[1:], [180.0, 180.0])
 
 
 def test_materialization_preserves_original_minute_indices_after_slice():

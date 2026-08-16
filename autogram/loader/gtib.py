@@ -436,6 +436,54 @@ def _materialize_raw(
     derived: pd.DataFrame,
     raw: pd.DataFrame,
 ) -> tuple[dict[str, np.ndarray], dict[str, list[str]]]:
+    # Local import avoids making loader initialisation depend on the DSL module. Identity-sensitive
+    # grouping must use the same recursive rule as streaming related joins: pandas groupby merges
+    # `True` with `1`, while string coercion also merges `1` with `"1"`.
+    from ..dsl.evaluate import typed_group_key, typed_sort_key
+
+    def typed_display_map(raw_by_key: dict) -> dict:
+        """Readable, deterministic, injective labels for typed identities.
+
+        Ordinary string IDs retain their old spelling. Only colliding renderings are qualified, so
+        existing GTIB column names and known catalogues remain byte-for-byte stable.
+        """
+        ordered = sorted(raw_by_key, key=typed_sort_key)
+        plain = {key: str(raw_by_key[key]) for key in ordered}
+        counts: dict[str, int] = {}
+        for text in plain.values():
+            counts[text] = counts.get(text, 0) + 1
+        result = {}
+        used = set()
+        for key in ordered:
+            raw_value = raw_by_key[key]
+            base = (
+                plain[key]
+                if counts[plain[key]] == 1
+                else f"{type(raw_value).__name__}:{raw_value!r}"
+            )
+            candidate = base
+            suffix = 2
+            while candidate in used:
+                candidate = f"{base}#{suffix}"
+                suffix += 1
+            used.add(candidate)
+            result[key] = candidate
+        return result
+
+    def unique_group_names(group_order, preferred) -> dict:
+        result = {}
+        used = set()
+        for key in group_order:
+            base = preferred[key]
+            candidate = base
+            suffix = 2
+            while candidate in used:
+                candidate = f"{base}#{suffix}"
+                suffix += 1
+            used.add(candidate)
+            result[key] = candidate
+        return result
+
     required = {
         "timestamp",
         "consumer_id",
@@ -450,18 +498,26 @@ def _materialize_raw(
 
     child = raw.copy()
     child["timestamp"] = pd.to_datetime(child["timestamp"], errors="raise")
-    child = child.sort_values(["consumer_id", "shard_id", "timestamp"], kind="stable")
-    parent_lookup = {
-        (str(row.consumer_id), int(row.minute_index)): int(index)
-        for index, row in derived[["consumer_id", "minute_index"]].iterrows()
-    }
+    parent_lookup = {}
+    parent_consumers = derived["consumer_id"].to_numpy(dtype=object)
+    parent_minutes = derived["minute_index"].to_numpy(dtype=int)
+    for position, (consumer, minute) in enumerate(
+        zip(parent_consumers, parent_minutes)
+    ):
+        key = (typed_group_key(consumer), int(minute))
+        if key in parent_lookup:
+            raise ValueError(
+                "GTIB derived table has duplicate consumer/minute row "
+                f"for {consumer!r}, minute {minute}"
+            )
+        parent_lookup[key] = position
     # Which parent rows belong to each consumer, so a shard can mark its own consumer's minutes as
     # "no reading yet" without disturbing the structural zeros on other consumers' rows. Derived
     # from `parent_lookup` so the two can never index differently.
-    _own: dict[str, list] = {}
+    _own: dict[tuple, list] = {}
     for (consumer, _minute), index in parent_lookup.items():
         _own.setdefault(consumer, []).append(index)
-    own_rows: dict[str, np.ndarray] = {
+    own_rows: dict[tuple, np.ndarray] = {
         consumer: np.asarray(sorted(indices), dtype=int)
         for consumer, indices in _own.items()
     }
@@ -470,31 +526,29 @@ def _materialize_raw(
     # is expressible per shard column; "at least one usable contributor" is not, so it is collected
     # here and applied in a second pass. Without it a consumer whose only shard resets would read as
     # a total of 0 in the fast path while the join calls the row ungradeable.
-    consumer_covered: dict[str, set] = {}
-    consumer_any_valid: dict[str, set] = {}
+    consumer_covered: dict[tuple, set] = {}
+    consumer_any_valid: dict[tuple, set] = {}
     origins = derived["timestamp"] - pd.to_timedelta(
         derived["minute_index"],
         unit="min",
     )
-    origin_frame = pd.DataFrame({
-        "consumer_id": derived["consumer_id"].astype(str),
-        "origin": origins,
-    })
-    origin_counts = (
-        origin_frame.groupby("consumer_id", observed=True)["origin"]
-        .nunique(dropna=False)
-    )
-    inconsistent = origin_counts[origin_counts != 1]
-    if not inconsistent.empty:
+    parent_start = {}
+    parent_raw_by_key = {}
+    inconsistent = []
+    for consumer, origin in zip(parent_consumers, origins):
+        key = typed_group_key(consumer)
+        parent_raw_by_key.setdefault(key, consumer)
+        timestamp = pd.Timestamp(origin)
+        previous = parent_start.get(key)
+        if previous is not None and previous != timestamp:
+            inconsistent.append(consumer)
+        else:
+            parent_start[key] = timestamp
+    if inconsistent:
         raise ValueError(
             "GTIB derived timestamps and minute_index values imply "
-            f"inconsistent origins for consumers {sorted(inconsistent.index.tolist())}"
+            f"inconsistent origins for consumers {sorted(map(repr, inconsistent))}"
         )
-    parent_start = (
-        origin_frame.groupby("consumer_id", observed=True)["origin"]
-        .first()
-        .to_dict()
-    )
 
     materialized: dict[str, np.ndarray] = {}
     families = {
@@ -503,17 +557,48 @@ def _materialize_raw(
         "shard_backlog_bytes": [],
         "shard_cum_lost_bytes": [],
     }
-    shard_owner_counts = (
-        child.groupby("shard_id", observed=True)["consumer_id"]
-        .nunique(dropna=False)
-        .to_dict()
-    )
 
-    for (consumer_id, shard_id), group in child.groupby(
-        ["consumer_id", "shard_id"], sort=True, observed=True
+    child_consumers = child["consumer_id"].to_numpy(dtype=object)
+    child_shards = child["shard_id"].to_numpy(dtype=object)
+    groups: dict[tuple, list[int]] = {}
+    raw_consumer_by_key = dict(parent_raw_by_key)
+    raw_shard_by_key = {}
+    shard_owners: dict[tuple, set] = {}
+    for position, (consumer, shard) in enumerate(
+        zip(child_consumers, child_shards)
     ):
+        consumer_key = typed_group_key(consumer)
+        shard_key = typed_group_key(shard)
+        raw_consumer_by_key.setdefault(consumer_key, consumer)
+        raw_shard_by_key.setdefault(shard_key, shard)
+        groups.setdefault((consumer_key, shard_key), []).append(position)
+        shard_owners.setdefault(shard_key, set()).add(consumer_key)
+
+    group_order = sorted(
+        groups,
+        key=lambda pair: tuple(typed_sort_key(part) for part in pair),
+    )
+    consumer_names = typed_display_map(raw_consumer_by_key)
+    shard_names = typed_display_map(raw_shard_by_key)
+    preferred_group_names = {
+        (consumer_key, shard_key): (
+            f"{consumer_names[consumer_key]}__{shard_names[shard_key]}"
+            if len(shard_owners[shard_key]) > 1
+            else shard_names[shard_key]
+        )
+        for consumer_key, shard_key in group_order
+    }
+    safe_group_names = unique_group_names(group_order, preferred_group_names)
+
+    for consumer_key, shard_key in group_order:
+        group = child.iloc[groups[(consumer_key, shard_key)]]
         group = group.sort_values("timestamp", kind="stable").copy()
-        consumer_start = pd.Timestamp(parent_start[str(consumer_id)]).floor("min")
+        if consumer_key not in parent_start:
+            raise ValueError(
+                "GTIB raw table references consumer absent from derived table: "
+                f"{raw_consumer_by_key[consumer_key]!r}"
+            )
+        consumer_start = pd.Timestamp(parent_start[consumer_key]).floor("min")
         group["_minute_index"] = (
             (group["timestamp"] - consumer_start).dt.total_seconds() // 60
         ).astype(int)
@@ -560,11 +645,7 @@ def _materialize_raw(
         covered = adjacent.copy()
         valid &= adjacent
 
-        safe_shard = (
-            f"{consumer_id}__{shard_id}"
-            if int(shard_owner_counts.get(shard_id, 0)) > 1
-            else str(shard_id)
-        )
+        safe_shard = safe_group_names[(consumer_key, shard_key)]
         for counter, suffix in _COUNTERS.items():
             name = f"{safe_shard}_{suffix}"
             # Three-way, mirroring the streaming join. Other consumers' rows stay 0 (this shard
@@ -574,19 +655,19 @@ def _materialize_raw(
             # whose increment is unusable is a deliberate 0, because the emitted per-minute value
             # excludes that shard too.
             values = np.zeros(len(derived), dtype=float)
-            own = own_rows.get(str(consumer_id))
+            own = own_rows.get(consumer_key)
             if own is not None and own.size:
                 values[own] = np.nan
             for minute, value, is_valid, is_covered in zip(
                 minute_ids, increments[counter], valid, covered
             ):
-                index = parent_lookup.get((str(consumer_id), int(minute)))
+                index = parent_lookup.get((consumer_key, int(minute)))
                 if index is None or not is_covered:
                     continue
                 values[index] = float(value) if is_valid else 0.0
                 if is_valid:
-                    consumer_any_valid.setdefault(str(consumer_id), set()).add(index)
-                consumer_covered.setdefault(str(consumer_id), set()).add(index)
+                    consumer_any_valid.setdefault(consumer_key, set()).add(index)
+                consumer_covered.setdefault(consumer_key, set()).add(index)
             materialized[name] = values
             families[f"shard_{suffix}"].append(name)
 
@@ -601,14 +682,14 @@ def _materialize_raw(
             # silently counting as zero. That matches the streaming path in `dsl/evaluate.py`,
             # which requires every partition to contribute before a total is accepted.
             values = np.zeros(len(derived), dtype=float)
-            own = own_rows.get(str(consumer_id))
+            own = own_rows.get(consumer_key)
             if own is not None and own.size:
                 values[own] = np.nan
             for minute, value in zip(
                 minute_ids,
                 boundaries[boundary_col].to_numpy(dtype=float),
             ):
-                index = parent_lookup.get((str(consumer_id), int(minute)))
+                index = parent_lookup.get((consumer_key, int(minute)))
                 if index is not None and np.isfinite(value):
                     values[index] = float(value)
             materialized[name] = values
