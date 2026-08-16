@@ -1510,6 +1510,7 @@ def _runtime_null_dataset(
     seed: int,
     definition_targets: bool,
     magnitude_ceiling: float = _NULL_MAGNITUDE_CEILING,
+    presence_masks: bool = False,
 ):
     rng = np.random.default_rng(int(seed))
     matrix = np.empty_like(dataset.observed.matrix, dtype=float)
@@ -1548,6 +1549,11 @@ def _runtime_null_dataset(
             binary=binary,
             magnitude_ceiling=magnitude_ceiling,
         )
+        if presence_masks and not binary:
+            generated = generated.copy()
+            finite_positions = np.flatnonzero(np.isfinite(generated))
+            absent = rng.random(finite_positions.size) < 0.25
+            generated[finite_positions[absent]] = 0.0
         matrix[:, index] = generated
         generated_columns[name] = generated
 
@@ -1645,6 +1651,7 @@ def _is_null_equality_candidate(rule: A.Rule) -> bool:
             "<=",
             ">",
             "<",
+            "<|>",
         }
     ) or isinstance(rule.atom, A.BandDefinition)
 
@@ -1733,12 +1740,18 @@ def prepare_runtime_null_controls(
         grammar,
         all_rules,
     )
+    presence_masks = any(
+        isinstance(rule.atom, A.Compare)
+        and rule.atom.op == "<|>"
+        for rule in equality_rules
+    )
 
     equality_dataset = _runtime_null_dataset(
         dataset,
         seed=seed + 10_001,
         definition_targets=False,
         magnitude_ceiling=magnitude_ceiling,
+        presence_masks=presence_masks,
     )
     temporal_dataset = (
         _runtime_null_dataset(
@@ -2016,6 +2029,7 @@ def null_equalities_at(prepared_null: PreparedProxy, dcfg: DiscoveryConfig, seed
                 "<=",
                 ">",
                 "<",
+                "<|>",
             )
         ) or isinstance(evaluation.rule.atom, A.BandDefinition)
     ])

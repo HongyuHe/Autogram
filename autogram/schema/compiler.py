@@ -326,11 +326,11 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
                 f"Boolean roles {sorted(unknown)} are not ref roles for "
                 f"binder {binder!r}"
             )
+    _validate_role_names(
+        "condition column",
+        spec.condition_columns,
+    )
     for name, values in spec.condition_columns.items():
-        if not isinstance(name, str) or not name:
-            raise CompileError(
-                "condition column names must be non-empty strings"
-            )
         # An empty value tuple is legitimate: induction declares condition column *names*
         # from the column vocabulary, while their observed *values* are populated later from
         # data during profiling. Both the proposer and admissibility skip empty-domain

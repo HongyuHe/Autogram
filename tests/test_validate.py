@@ -260,6 +260,77 @@ def test_runtime_null_normalizes_tiny_division_denominators():
     assert null.graded_points == rows
 
 
+def test_runtime_null_selects_and_scores_presence_rules():
+    rows = 401
+    frame = pd.DataFrame({
+        "x": np.linspace(1.0, 2.0, rows),
+        "y": np.linspace(2.0, 3.0, rows),
+    })
+    spec = GrammarSpec(
+        name="presence-null",
+        patterns=tuple(
+            ColumnPattern(
+                name,
+                "regex",
+                "measurement",
+                name,
+                regex=rf"^{name}$",
+            )
+            for name in ("x", "y")
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("x", "y")},
+            fam_roles={"record": ()},
+            ops=("<|>",),
+        ),
+        ref_templates=(
+            RefTemplate("record", "x", "x"),
+            RefTemplate("record", "y", "y"),
+        ),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    adapter = compile_spec(spec)
+    dataset = build_dataset(
+        frame.columns,
+        frame.to_numpy(dtype=float),
+        adapter,
+        name="presence_null",
+        timestamps=np.arange(rows),
+    )
+    grammar = Grammar(
+        binders=("record",),
+        ops=("<|>",),
+        ref_roles={"record": ("x", "y")},
+        fam_roles={"record": ()},
+    )
+    rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("x"), "<|>", A.Ref("y")),
+    )
+    controls = V.prepare_runtime_null_controls(
+        dataset,
+        grammar,
+        SearchConfig(seed=0),
+        seed=0,
+        rules=[rule],
+    )
+    null = controls.null.ds.observed
+
+    assert controls.candidate_counts["equalities"] == 1
+    assert 0 < np.count_nonzero(null.col("x") == 0.0) < rows
+    assert 0 < np.count_nonzero(null.col("y") == 0.0) < rows
+    assert V.null_equalities_at(
+        controls.null,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ) == 0
+
+
 def test_nonneg_proxy_plants_only_nonnegativity():
     data = synth.make_synthetic(n_entities=3, n_snapshots=80, noise=0.0, seed=0,
                                 families=("nonneg",))

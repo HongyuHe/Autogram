@@ -841,7 +841,10 @@ def ground(rule: A.Rule, frame: Frame, nm: NameModel,
             )
     # global floor keeps near-zero-scale points from exploding the relative residual
     med = robust_median(scale[scale > 0]) if np.any(scale > 0) else 1.0
-    floor = scale_floor_frac * med
+    floor = max(
+        scale_floor_frac * med,
+        float(np.nextafter(0.0, 1.0)),
+    )
     scale = np.maximum(scale, floor)
     return Grounded(rho=rho, scale=scale, left=left, right=right, n_bindings=n_ok,
                     n_candidates=len(bindings), degenerate=False, row_indices=rows,
@@ -1045,13 +1048,16 @@ def _child_partition_index(template, frame: Frame, child):
     else:
         grouped = [((), np.arange(len(child), dtype=int))]
     by_parent: dict[tuple, list[dict]] = {}
-    for sum_index, (raw_key, raw_positions) in enumerate(grouped):
+    sum_index = 0
+    for raw_key, raw_positions in grouped:
         parent_key = tuple(raw_key[:len(template.child_keys)])
         positions = np.asarray(raw_positions, dtype=int)
         times = child_times[positions]
         present = times != _NAT_NS
         positions = positions[present]
         times = times[present]
+        if not positions.size:
+            continue
         order = np.argsort(times, kind="stable")
         by_parent.setdefault(parent_key, []).append({
             "positions": positions[order],
@@ -1060,6 +1066,7 @@ def _child_partition_index(template, frame: Frame, child):
             "reset_prefix": {},
             "sum_index": sum_index,
         })
+        sum_index += 1
     frame.related_index_cache[cache_key] = by_parent
     return by_parent
 

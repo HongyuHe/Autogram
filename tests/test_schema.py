@@ -488,6 +488,23 @@ def test_compiler_requires_plain_binder_identifiers(binder):
         compile_spec(invalid)
 
 
+@pytest.mark.parametrize(
+    "column",
+    ["a == 1, b", "b == 2, c", "a::b", "a\n"],
+)
+def test_compiler_requires_plain_condition_column_identifiers(column):
+    base = _node_template_spec()
+    invalid = GrammarSpec(
+        **{
+            **base.__dict__,
+            "condition_columns": {column: (1, 2)},
+        }
+    )
+
+    with pytest.raises(CompileError, match="plain identifier"):
+        compile_spec(invalid)
+
+
 def test_compiler_rejects_nonpositive_degree_bound():
     with pytest.raises(CompileError, match="max_degree"):
         compile_spec(_node_template_spec(max_degree=0))

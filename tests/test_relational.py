@@ -18,6 +18,7 @@ from autogram.discovery import synth
 from autogram.discovery.propose import EnumerationProposer, normalize_rule
 from autogram.dsl import ast as A
 from autogram.dsl.evaluate import (
+    _related_aggregate,
     _span_any,
     eval_term,
     eval_term_overflow,
@@ -256,6 +257,42 @@ def test_mixed_span_and_delta_null_retains_both_relation_families():
     ))) >= len(relation)
     assert output["span_start"].notna().any()
     assert len(output) > len(relation)
+
+    delta_only = _runtime_relation_null(
+        relation,
+        [delta],
+        parent_context,
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+    mixed_frame = Frame(
+        np.empty((3, 0), dtype=float),
+        [],
+        row_context=parent_context,
+        relations={"mixed": output},
+    )
+    delta_frame = Frame(
+        np.empty((3, 0), dtype=float),
+        [],
+        row_context=parent_context,
+        relations={"mixed": delta_only},
+    )
+    mixed_values, mixed_overflow = _related_aggregate(
+        delta,
+        mixed_frame,
+    )
+    delta_values, delta_overflow = _related_aggregate(
+        delta,
+        delta_frame,
+    )
+
+    assert np.array_equal(
+        np.isfinite(mixed_values),
+        np.isfinite(delta_values),
+    )
+    assert np.isfinite(mixed_values).any()
+    assert mixed_overflow is None
+    assert delta_overflow is None
 
 
 def _prepared() -> pd.DataFrame:

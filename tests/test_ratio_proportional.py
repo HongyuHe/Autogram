@@ -251,6 +251,38 @@ def test_exact_equality_rejects_materially_different_tiny_values():
     assert np.isfinite(result.eps)
 
 
+def test_exact_equality_accepts_identical_zero_and_subnormal_rows():
+    minimum = np.nextafter(0.0, 1.0)
+    values = np.concatenate((
+        np.zeros(200),
+        np.full(200, minimum),
+    ))
+    frame = profile_dataframe(pd.DataFrame({
+        "x": values,
+        "y": values.copy(),
+    }))
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="mixed_subnormal_exact_equality",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("x"), "==", A.Ref("y")),
+    ))
+
+    assert result.accepted
+    assert result.hold_rate == 1.0
+    assert np.isfinite(result.eps)
+
+
 def test_proportional_fit_is_invariant_to_common_tiny_scaling():
     values = np.arange(1.0, 401.0)
     rule = A.Rule(
