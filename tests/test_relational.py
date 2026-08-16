@@ -641,6 +641,66 @@ def test_span_runtime_null_preserves_typed_consumers():
     assert len(generated) == 2
 
 
+def test_span_runtime_null_preserves_temporal_parent_keys_through_join():
+    consumers = np.array(
+        [
+            "2026-01-01T00:00:00.000000000",
+            "2026-01-01T00:00:00.000000000",
+            "2026-01-02T00:00:00.000000000",
+            "2026-01-02T00:00:00.000000000",
+        ],
+        dtype="datetime64[ns]",
+    )
+    times = pd.to_datetime([
+        "2026-02-01 00:00:00",
+        "2026-02-01 00:01:00",
+        "2026-02-01 00:00:00",
+        "2026-02-01 00:01:00",
+    ]).to_numpy()
+    relation = pd.DataFrame({
+        "consumer_id": pd.Series(dtype="datetime64[ns]"),
+        "span_start": pd.Series(dtype="datetime64[ns]"),
+        "span_end": pd.Series(dtype="datetime64[ns]"),
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="event",
+        relation="events",
+        column="",
+        mode="span_any",
+        parent_keys=("consumer_id",),
+        child_keys=("consumer_id",),
+        partition_keys=(),
+        parent_time="timestamp",
+        child_time="",
+        window_seconds=60,
+        span_start="span_start",
+        span_end="span_end",
+    )
+    context = {
+        "timestamp": times,
+        "consumer_id": consumers,
+    }
+
+    generated = _runtime_relation_null(
+        relation,
+        [template],
+        context,
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+    frame = Frame(
+        np.empty((len(times), 0), dtype=float),
+        [],
+        row_context=context,
+    )
+    values = _span_any(template, frame, generated)
+
+    assert generated["consumer_id"].dtype.kind == "M"
+    assert values is not None
+    assert values.tolist() == [0.0, 1.0, 0.0, 1.0]
+
+
 def test_related_aggregates_scale_to_multi_day_child_history():
     n_minutes = 2_160
     parent_times = pd.date_range("2026-01-01", periods=n_minutes, freq="1min")

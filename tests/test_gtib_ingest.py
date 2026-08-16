@@ -12,7 +12,12 @@ from autogram.discovery.evaluate import DataOnlyEvaluator
 from autogram.discovery.loop import build_dataframe_grammar
 from autogram.dsl import ast as A
 from autogram.dsl.evaluate import eval_term
-from autogram.loader.gtib import AUTOGRAM_PROFILE_ATTR, infer_tabular_profile, prepare_gtib
+from autogram.loader.gtib import (
+    AUTOGRAM_PROFILE_ATTR,
+    _materialize_raw,
+    infer_tabular_profile,
+    prepare_gtib,
+)
 from autogram.schema.spec import CellCodec, ColumnPattern, GrammarSpec, RoleOntology
 
 
@@ -570,6 +575,36 @@ def test_related_window_matches_materialization_near_timestamp_min():
 
     assert np.allclose(materialized, [10.0])
     assert np.array_equal(materialized, streaming, equal_nan=True)
+
+
+def test_gtib_materialization_rejects_wide_unit_timestamp_wrap():
+    derived = pd.DataFrame({
+        "timestamp": np.array(
+            ["2554-01-01T00:01:00", "2554-01-01T00:02:00"],
+            dtype="datetime64[s]",
+        ),
+        "consumer_id": ["consumer", "consumer"],
+        "minute_index": [1, 2],
+        "input_rate_bytes_per_min": [10.0, 10.0],
+    })
+    raw = pd.DataFrame({
+        "timestamp": np.array(
+            [
+                "2554-01-01T00:00:10",
+                "2554-01-01T00:01:10",
+                "2554-01-01T00:02:10",
+            ],
+            dtype="datetime64[s]",
+        ),
+        "consumer_id": ["consumer"] * 3,
+        "shard_id": ["shard"] * 3,
+        "collector_input_counted": [0.0, 10.0, 20.0],
+        "presenter_output_counted": [0.0, 10.0, 20.0],
+        "reset_flag": [False, False, False],
+    })
+
+    with pytest.raises(ValueError, match="datetime64\\[ns\\] range"):
+        _materialize_raw(derived, raw)
 
 
 def test_materialization_preserves_original_minute_indices_after_slice():

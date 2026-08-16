@@ -171,6 +171,95 @@ def test_runtime_null_envelope_accounts_for_wide_family_products():
     assert null_grounded.graded_points == rows
 
 
+def test_runtime_null_normalizes_tiny_division_denominators():
+    rows = 400
+    numerator = np.full(rows, 1e-10)
+    denominator = np.full(rows, 1e-318)
+    target = numerator / denominator
+    frame = pd.DataFrame({
+        "num": numerator,
+        "den": denominator,
+        "target": target,
+    })
+    spec = GrammarSpec(
+        name="tiny-denominator-null",
+        patterns=tuple(
+            ColumnPattern(
+                name,
+                "regex",
+                "measurement",
+                name,
+                regex=rf"^{name}$",
+            )
+            for name in ("num", "den", "target")
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={
+                "record": ("num", "den", "target"),
+            },
+            fam_roles={"record": ()},
+        ),
+        ref_templates=tuple(
+            RefTemplate("record", name, name)
+            for name in ("num", "den", "target")
+        ),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+        max_degree=2,
+    )
+    adapter = compile_spec(spec)
+    dataset = build_dataset(
+        frame.columns,
+        frame.to_numpy(dtype=float),
+        adapter,
+        name="tiny_denominator_null",
+        timestamps=np.arange(rows),
+    )
+    grammar = Grammar(
+        binders=("record",),
+        ops=("==",),
+        ref_roles={
+            "record": ("num", "den", "target"),
+        },
+        fam_roles={"record": ()},
+        max_complexity=12,
+        max_degree=2,
+    )
+    rule = A.Rule(
+        "record",
+        A.Compare(
+            A.Ref("target"),
+            "==",
+            A.Div(A.Ref("num"), A.Ref("den")),
+        ),
+    )
+
+    real = ground(
+        rule,
+        dataset.observed,
+        dataset.name_model,
+    )
+    controls = V.prepare_runtime_null_controls(
+        dataset,
+        grammar,
+        SearchConfig(seed=0),
+        seed=0,
+        rules=[rule],
+    )
+    null = ground(
+        rule,
+        controls.null.ds.observed,
+        controls.null.ds.name_model,
+    )
+
+    assert real.overflow_points == 0
+    assert real.graded_points == rows
+    assert null.overflow_points == 0
+    assert null.graded_points == rows
+
+
 def test_nonneg_proxy_plants_only_nonnegativity():
     data = synth.make_synthetic(n_entities=3, n_snapshots=80, noise=0.0, seed=0,
                                 families=("nonneg",))

@@ -556,10 +556,9 @@ def _consecutive_window_ends(
         return valid
     adapter = getattr(nm, "adapter", None)
     time_index = getattr(adapter, "time_index", "")
-    times = pd.to_datetime(
-        np.asarray(frame.row_context[time_index])[rows],
-        errors="coerce",
-    ).to_numpy(dtype="datetime64[ns]").astype(np.int64)
+    times = _datetime_ns(
+        np.asarray(frame.row_context[time_index])[rows]
+    )
     diffs = [
         (
             int(times[index + 1]) - int(times[index])

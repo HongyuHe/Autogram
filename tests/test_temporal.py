@@ -251,6 +251,37 @@ def test_nat_timestamp_cannot_complete_a_temporal_window():
     assert np.isnan(lagged[2])
 
 
+def test_temporal_cadence_rejects_wide_unit_timestamp_wrap():
+    timestamps = np.array(
+        [
+            "2262-04-10",
+            "2262-04-11",
+            "2262-04-12",
+            "2262-04-13",
+        ],
+        dtype="datetime64[s]",
+    )
+    frame = _profile(pd.DataFrame({
+        "timestamp": timestamps,
+        "series_id": "a",
+        "x": np.arange(4.0),
+    }))
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="wide_temporal_cadence",
+    )
+
+    with pytest.raises(ValueError, match="datetime64\\[ns\\] range"):
+        eval_term(
+            A.Lag(A.Ref("x"), 1),
+            "record",
+            {},
+            dataset.observed,
+            dataset.name_model,
+        )
+
+
 def test_composite_group_keys_survive_stratified_subsampling():
     # Round-22: a composite group key must be bucketed as a 1-D object array of TUPLES. Building it
     # as a 2-D array made ``tolist()`` yield unhashable lists and crashed group-stratified

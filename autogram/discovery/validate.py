@@ -1161,6 +1161,7 @@ def _balanced_null_numeric(
             sigma=0.5,
             size=positions.size,
         )
+        multipliers = np.clip(multipliers, 0.25, 4.0)
         # Finite leaves are not enough. The null control exists to be run through the SAME candidate
         # grammar as the data -- sums, differences and (at degree 2) products of these columns -- and
         # at ceiling scale every one of those overflows. The candidates are then refused for
@@ -1170,7 +1171,10 @@ def _balanced_null_numeric(
         # the null's SHAPE (a balanced, sign-symmetric lognormal spread) is what the control depends
         # on, not its absolute magnitude, and ordinary data is far below the cap.
         largest = float(np.max(multipliers)) if multipliers.size else 1.0
-        scale = min(scale, float(magnitude_ceiling) / max(1.0, largest))
+        scale = min(
+            max(scale, 1.0),
+            float(magnitude_ceiling) / max(1.0, largest),
+        )
         with np.errstate(over="ignore"):
             magnitudes = scale * multipliers
         signs = np.ones(positions.size, dtype=float)
@@ -1213,7 +1217,7 @@ def _runtime_relation_null(
                 parent_context[template.parent_time]
             )
             key_arrays = [
-                np.asarray(parent_context[key], dtype=object)
+                _typed_object_array(parent_context[key])
                 for key in template.parent_keys
             ]
             groups = {}

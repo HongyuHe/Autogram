@@ -452,7 +452,11 @@ def _materialize_raw(
     # Local import avoids making loader initialisation depend on the DSL module. Identity-sensitive
     # grouping must use the same recursive rule as streaming related joins: pandas groupby merges
     # `True` with `1`, while string coercion also merges `1` with `"1"`.
-    from ..dsl.evaluate import typed_group_key, typed_sort_key
+    from ..dsl.evaluate import (
+        _datetime_ns,
+        typed_group_key,
+        typed_sort_key,
+    )
 
     def typed_display_map(raw_by_key: dict) -> dict:
         """Readable, deterministic, injective labels for typed identities.
@@ -562,10 +566,8 @@ def _materialize_raw(
     consumer_covered: dict[tuple, set] = {}
     consumer_any_valid: dict[tuple, set] = {}
     minute_ns = 60 * 1_000_000_000
-    parent_timestamps = (
-        derived["timestamp"]
-        .to_numpy(dtype="datetime64[ns]")
-        .astype(np.int64)
+    parent_timestamps = _datetime_ns(
+        derived["timestamp"].to_numpy()
     )
     parent_start = {}
     parent_raw_by_key = {}
@@ -659,10 +661,8 @@ def _materialize_raw(
         # to a wall-clock minute. Flooring shifts every materialized window while the streaming join
         # keeps the true `[parent_time, parent_time + 60s)` interval, making the two paths disagree.
         consumer_start_ns = parent_start[consumer_key]
-        group_times = (
-            group["timestamp"]
-            .to_numpy(dtype="datetime64[ns]")
-            .astype(np.int64)
+        group_times = _datetime_ns(
+            group["timestamp"].to_numpy()
         )
         present = group_times != nat_ns
         group = group.loc[present].copy()
