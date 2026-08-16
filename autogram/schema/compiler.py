@@ -247,7 +247,7 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
         raise CompileError("spec has no column patterns")
 
     onto = spec.ontology
-    _validate_names("binder", onto.binders)
+    _validate_role_names("binder", onto.binders)
     _validate_names("pattern", (pattern.name for pattern in spec.patterns))
     for mapping_name, mapping in (
         ("ref_roles", onto.ref_roles),

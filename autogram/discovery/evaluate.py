@@ -624,10 +624,7 @@ class DataOnlyEvaluator:
             holds = signed > eps if op == ">" else signed < -eps
         elif op == "==":
             ulp = np.maximum(_finite_ulp(g.left), _finite_ulp(g.right))
-            exact_tolerance = 4.0 * np.maximum(
-                ulp,
-                np.finfo(float).eps,
-            )
+            exact_tolerance = 4.0 * ulp
             if not np.all(np.isfinite(exact_tolerance)):
                 return self._reject(
                     rule,

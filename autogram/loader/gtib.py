@@ -788,7 +788,10 @@ def _materialize_raw(
                 values[own] = np.nan
             for minute, value in zip(
                 minute_ids,
-                boundaries[boundary_col].to_numpy(dtype=float),
+                pd.to_numeric(
+                    boundaries[boundary_col],
+                    errors="coerce",
+                ).to_numpy(dtype=float),
             ):
                 index = parent_lookup.get((consumer_key, int(minute)))
                 if index is not None and np.isfinite(value):

@@ -468,6 +468,26 @@ def test_compiler_rejects_duplicate_explicit_family_columns():
         compile_spec(duplicate_family)
 
 
+@pytest.mark.parametrize("binder", ["a::b", "a b", "a\n"])
+def test_compiler_requires_plain_binder_identifiers(binder):
+    base = _node_template_spec()
+    invalid = GrammarSpec(
+        **{
+            **base.__dict__,
+            "ontology": RoleOntology(
+                binders=(binder,),
+                ref_roles={binder: ()},
+                fam_roles={binder: ()},
+            ),
+            "ref_templates": (),
+            "binder_enumerate": {binder: "singleton"},
+        }
+    )
+
+    with pytest.raises(CompileError, match="plain identifier"):
+        compile_spec(invalid)
+
+
 def test_compiler_rejects_nonpositive_degree_bound():
     with pytest.raises(CompileError, match="max_degree"):
         compile_spec(_node_template_spec(max_degree=0))

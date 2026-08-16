@@ -701,6 +701,24 @@ def test_materialization_does_not_bridge_missing_raw_minute():
     assert _increments(pd.Series(values)) == [None, None, None]
 
 
+def test_materialized_boundary_treats_pdna_as_missing():
+    derived, raw = _tables()
+    raw = raw.loc[raw["shard_id"] == "shard_000_0"].copy()
+    raw["backlog_bytes"] = raw["backlog_bytes"].astype(object)
+    missing = (
+        (raw["timestamp"] >= pd.Timestamp("2026-01-01 00:01:00"))
+        & (raw["timestamp"] < pd.Timestamp("2026-01-01 00:02:00"))
+    )
+    raw.loc[missing, "backlog_bytes"] = pd.NA
+
+    prepared = prepare_gtib(derived, raw)
+
+    values = prepared["shard_000_0_backlog_bytes"]
+    assert values.iloc[0] == 5.0
+    assert pd.isna(values.iloc[1])
+    assert values.iloc[2] == 17.0
+
+
 def test_load_dataframe_accepts_csv_and_auto_prepares_gtib(tmp_path):
     derived, raw = _tables()
     derived_path = tmp_path / "timeseries_derived.csv"

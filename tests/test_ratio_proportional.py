@@ -222,8 +222,33 @@ def test_exact_equality_never_reports_infinite_normalized_epsilon():
     ))
 
     assert np.isfinite(result.eps)
+
+
+def test_exact_equality_rejects_materially_different_tiny_values():
+    frame = profile_dataframe(pd.DataFrame({
+        "x": np.full(400, 1e-100),
+        "zero": np.zeros(400),
+    }))
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="tiny_exact_equality",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("x"), "==", A.Ref("zero")),
+    ))
+
     assert not result.accepted
-    assert "non-finite" in result.reason
+    assert result.hold_rate == 0.0
+    assert np.isfinite(result.eps)
 
 
 def test_proportional_fit_is_invariant_to_common_tiny_scaling():
