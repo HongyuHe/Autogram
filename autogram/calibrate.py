@@ -376,7 +376,8 @@ def _validate_split_inputs(known: List[KnownInvariant], frac: float) -> None:
 
 
 def _split_known(known: List[KnownInvariant], frac: float, seed: int,
-                 frame=None, zero_tol: float = 1e-4):
+                 frame=None, zero_tol: float = 1e-4,
+                 recovery_dataset=None):
     """Partition known invariants into a calibration set and a structurally disjoint validation set.
 
     The split is by *recovery equivalence*, not by list position and not by exact signature. Two
@@ -448,19 +449,71 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
             "<": lambda: np.all(values < 0.0),
         }.get(op, lambda: False)()
 
+    def lag_grounds(column, steps) -> bool:
+        if recovery_dataset is None:
+            return False
+        from .dsl import ast as A
+        from .dsl.binders import enumerate_bindings, resolve_ref
+        from .dsl.evaluate import eval_term
+
+        name_model = recovery_dataset.name_model
+        adapter = name_model.adapter
+        for binder in adapter.binders:
+            for role in adapter.refs_for(binder):
+                for binding in enumerate_bindings(binder, name_model):
+                    if resolve_ref(
+                        role,
+                        binder,
+                        binding,
+                        name_model,
+                    ) != column:
+                        continue
+                    values = eval_term(
+                        A.Lag(A.Ref(role), int(steps)),
+                        binder,
+                        binding,
+                        recovery_dataset.observed,
+                        name_model,
+                    )
+                    if (
+                        values is not None
+                        and np.any(np.isfinite(values))
+                    ):
+                        return True
+        return False
+
     def sign_aliases(left_signature, right_signature) -> bool:
         left = atomic_sign_recovery_key(left_signature)
         right = atomic_sign_recovery_key(right_signature)
         if left is None or right is None or left[1] != right[1]:
             return False
-        if left[2] == right[2]:
-            return True
+        lag_signatures = [
+            signature
+            for signature in (left_signature, right_signature)
+            if (
+                isinstance(signature, tuple)
+                and signature[:1] == ("lag_bound",)
+            )
+        ]
+        if not lag_signatures:
+            return False
         positive = left[2] in (">", ">=") and right[2] in (">", ">=")
         negative = left[2] in ("<", "<=") and right[2] in ("<", "<=")
         if not (positive or negative):
             return False
-        stricter = ">" if positive else "<"
-        return frame_satisfies(left[1], stricter)
+        required_op = (
+            ">" if ">" in (left[2], right[2])
+            else "<" if "<" in (left[2], right[2])
+            else ">=" if positive
+            else "<="
+        )
+        return (
+            frame_satisfies(left[1], required_op)
+            and all(
+                lag_grounds(signature[1][0], signature[1][1])
+                for signature in lag_signatures
+            )
+        )
 
     def sum_balance_recovery_alias(signature):
         """Canonical spelling shared by ref-vs-sum and singleton-sum balance relations."""
@@ -883,6 +936,17 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             "advanced calibration requires finite max_rules "
             "between 1 and 500000"
         )
+    scfg = SearchConfig(
+        seed=cfg.seed,
+        max_complexity=cfg.max_complexity,
+        max_add_arity=cfg.max_add_arity,
+        max_rules=cfg.max_rules,
+        max_nonlinear_leaves=cfg.max_nonlinear_leaves,
+        max_linear_leaves=cfg.max_linear_leaves,
+        max_conditioned_rules=cfg.max_conditioned_rules,
+        max_lag=cfg.max_lag,
+        windows=cfg.windows,
+    )
     known = load_known(known_path)
     # These checks are deterministic and local. Run them before constructing/invoking the external
     # inducer, so an invalid known catalogue or split fraction fails without spending a subagent
@@ -895,12 +959,18 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     # dataset whose induced codec names a different primary key. The proposal is reused as tier 0,
     # so this costs no extra induction.
     initial_spec = induce_spec(list(df.columns), inducer)
-    split_view = _ColumnScaleView(df, primary=initial_spec.cell_codec.primary)
+    split_dataset, _split_grammar = build_dataframe_grammar(
+        df,
+        initial_spec,
+        search_cfg=scfg,
+        name=f"{name}_split",
+    )
     calib, valid = _split_known(
         known,
         cfg.validation_frac,
         cfg.seed,
-        frame=split_view,
+        frame=split_dataset.observed,
+        recovery_dataset=split_dataset,
     )
 
     # 1) proxy suite -- a caller-supplied regime is authoritative; otherwise it is derived from the
@@ -914,17 +984,6 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             null_max_conjunction_terms,
             int(caps.get("max_conjunction_terms", 3)),
         )
-    scfg = SearchConfig(
-        seed=cfg.seed,
-        max_complexity=cfg.max_complexity,
-        max_add_arity=cfg.max_add_arity,
-        max_rules=cfg.max_rules,
-        max_nonlinear_leaves=cfg.max_nonlinear_leaves,
-        max_linear_leaves=cfg.max_linear_leaves,
-        max_conditioned_rules=cfg.max_conditioned_rules,
-        max_lag=cfg.max_lag,
-        windows=cfg.windows,
-    )
 
     # 2) prepare every selected positive proxy + the null control ONCE (schema induction per proxy);
     #    the prepared grammars are reused for every joint-tuning grid cell and every ladder rung.
@@ -1006,13 +1065,6 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             search_cfg=scfg,
             name=name,
         )
-        # The split canonicalised known signatures against `split_view` before any adapter existed.
-        # Now that the real one does, confirm the two agree on every column the split consulted --
-        # otherwise an alias pair could have straddled the split and "held out" would be a fiction.
-        # A split whose signatures carry no summed grouping reads no column data at all, and there
-        # is then nothing to verify.
-        if split_view.decoded_columns:
-            split_view.assert_matches_runtime(ds.observed)
         summary = _spec_summary(runtime_spec, ti, caps)
         summary["runtime"] = {
             "agg_kinds": list(getattr(G, "agg_kinds", ())),

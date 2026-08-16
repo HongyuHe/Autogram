@@ -11,7 +11,7 @@ import pytest
 
 from autogram.config import DiscoveryConfig
 from autogram.discovery.evaluate import DataOnlyEvaluator
-from autogram.discovery import synth
+from autogram.discovery import synth, validate as validation
 from autogram.discovery.known import KnownInvariant, _signature, recover_known, shapes_for_invariant
 from autogram.discovery.loop import build_dataframe_grammar
 from autogram.discovery.propose import EnumerationProposer, normalize_rule
@@ -28,7 +28,14 @@ from autogram.dsl.typecheck import is_admissible
 from autogram.loader.gtib import profile_dataframe
 from autogram.logic.solver import is_trivial
 from autogram.logic.solver import equivalent
-from autogram.schema.spec import CellCodec, ColumnPattern, GrammarSpec, RoleOntology
+from autogram.schema.spec import (
+    CellCodec,
+    ColumnPattern,
+    FamilySelector,
+    GrammarSpec,
+    RefTemplate,
+    RoleOntology,
+)
 
 
 def _base_spec() -> GrammarSpec:
@@ -129,6 +136,65 @@ def test_condition_domains_and_masks_preserve_typed_identity():
     assert in_mask is not None
     assert int(np.count_nonzero(in_mask)) == 80
     assert not np.any(in_mask & masks[1])
+
+
+def test_overlapping_add_aggregate_does_not_emit_set_valued_sum_alias():
+    frame = pd.DataFrame({
+        "a": np.arange(1.0, 21.0),
+        "b": np.arange(2.0, 22.0),
+        "c": 2.0 * np.arange(1.0, 21.0) + np.arange(2.0, 22.0),
+    })
+    spec = GrammarSpec(
+        name="overlapping-family",
+        patterns=(
+            ColumnPattern("a", "regex", "tabular", "a", regex=r"^a$"),
+            ColumnPattern("b", "regex", "tabular", "b", regex=r"^b$"),
+            ColumnPattern("c", "regex", "tabular", "c", regex=r"^c$"),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("a_ref", "c_ref")},
+            fam_roles={"record": ("fam",)},
+            agg_kinds=("SUM",),
+        ),
+        ref_templates=(
+            RefTemplate("record", "a_ref", "a"),
+            RefTemplate("record", "c_ref", "c"),
+        ),
+        family_selectors=(
+            FamilySelector(
+                "record",
+                "fam",
+                "tabular",
+                columns=("a", "b"),
+            ),
+        ),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        spec,
+        name="overlapping_sum_alias",
+    )
+    rule = A.Rule(
+        "record",
+        A.Compare(
+            A.Add((A.Ref("a_ref"), A.Agg("SUM", "fam"))),
+            "==",
+            A.Ref("c_ref"),
+        ),
+    )
+
+    relations = validation.rule_relations(rule, dataset)
+
+    assert not any(
+        (
+            isinstance(relation, tuple)
+            and "sum_balance" in str(relation)
+        )
+        for relation in relations
+    )
 
 
 def test_nullable_string_condition_domain_drops_all_missing_scalars():

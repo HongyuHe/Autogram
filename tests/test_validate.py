@@ -84,6 +84,52 @@ def test_additional_sum_balance_preserves_exactness(dataset):
     )
 
 
+def test_exact_proxy_shapes_require_exact_learned_witnesses(monkeypatch):
+    balance = frozenset({
+        frozenset({"a", "b"}),
+        frozenset({"c", "d"}),
+    })
+    condition = (
+        "regime",
+        "==",
+        (("category_value", ("str", "paired")),),
+    )
+    pair = ("pair", frozenset({"x", "y"}))
+    planted = {
+        "sum_balance": {balance},
+        "conditional_pair": {(condition, pair)},
+    }
+    result = SimpleNamespace(portfolio=[])
+
+    monkeypatch.setattr(V, "portfolio_relations", lambda _result: {
+        ("equality", "approximate", ("sum_balance", balance)),
+        (
+            "conditional",
+            (
+                condition,
+                ("equality", "approximate", pair),
+            ),
+        ),
+    })
+    approximate = V.score_recovery(result, planted)
+    assert approximate.sum_balance == 0.0
+    assert approximate.conditional_pair == 0.0
+
+    monkeypatch.setattr(V, "portfolio_relations", lambda _result: {
+        ("equality", "exact", ("sum_balance", balance)),
+        (
+            "conditional",
+            (
+                condition,
+                ("equality", "exact", pair),
+            ),
+        ),
+    })
+    exact = V.score_recovery(result, planted)
+    assert exact.sum_balance == 1.0
+    assert exact.conditional_pair == 1.0
+
+
 def test_nonpos_proxy_plants_only_nonpositivity():
     data = synth.make_synthetic(n_entities=3, n_snapshots=80, noise=0.0, seed=0,
                                 families=("nonpos",))

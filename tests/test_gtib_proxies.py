@@ -570,6 +570,31 @@ def test_all_new_shapes_jointly_tune_under_all_null_guards():
     assert all(proxy["recovery"] == 1.0 for proxy in tuned["per_proxy"])
 
 
+def test_sum_balance_null_grammar_contains_sum_vs_sum_candidates():
+    suite = prepare_proxy_suite(
+        RegimeSpec(entries=[
+            ProxyEntry(
+                "sum_balance",
+                noise=0.0,
+                n_entities=3,
+                n_snapshots=80,
+            ),
+        ]),
+        seed=0,
+        inducer=_SyntheticInducer(),
+    )
+
+    assert "demand_row" in suite.null.G.fams_for("node")
+    assert "demand_col" in suite.null.G.fams_for("node")
+    assert any(
+        isinstance(rule.atom, A.Compare)
+        and isinstance(rule.atom.left, A.Agg)
+        and isinstance(rule.atom.right, A.Agg)
+        and rule.atom.left.kind == rule.atom.right.kind == "SUM"
+        for rule in suite.null.proposer.propose()
+    )
+
+
 @pytest.mark.parametrize("shape", ["ratio", "windowed_ratio"])
 def test_wide_aggregate_vocabulary_does_not_starve_ratio_proxy(shape):
     suite = prepare_proxy_suite(

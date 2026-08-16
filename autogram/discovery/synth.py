@@ -405,9 +405,64 @@ def make_synthetic(n_entities: int = 6, n_snapshots: int = 400, noise: float = 0
                     enabled & {"ratio", "windowed_ratio"}
                     and name.endswith("_" + vocab.destination)
                 )
+                and not (
+                    "conditional_pair" in enabled
+                    and name.endswith((
+                        "_" + vocab.source,
+                        "_" + vocab.destination,
+                    ))
+                )
             ):
                 matrix[:, k] = matrix[:, k] * (1.0 + noise * rng.standard_normal(T))
         matrix = np.maximum(matrix, 0.0)
+
+    # Boolean-definition targets are derived columns. Recompute them from the final observed
+    # operands so measurement noise cannot silently invalidate the exact planted definition.
+    if enabled & {"sustained", "conjunction"}:
+        index_by_name = {
+            name: index
+            for index, name in enumerate(cols)
+        }
+        for entity in ents:
+            source_index = index_by_name[
+                f"{vocab.measurement}_{entity}_{vocab.source}"
+            ]
+            destination = matrix[
+                :,
+                index_by_name[
+                    f"{vocab.measurement}_{entity}_{vocab.destination}"
+                ],
+            ]
+            if "conjunction" in enabled:
+                demand_self = matrix[
+                    :,
+                    index_by_name[f"{vocab.demand}_{entity}_{entity}"],
+                ]
+                deficit = pd.Series(
+                    destination - demand_self
+                ).rolling(
+                    temporal_window,
+                    min_periods=temporal_window,
+                ).sum().to_numpy()
+                slope = pd.Series(destination).diff(
+                    temporal_window
+                ).to_numpy()
+                target = (
+                    (destination < 0.5)
+                    & (deficit > 0.0)
+                    & (slope <= 0.0)
+                )
+            else:
+                target = np.zeros(T, dtype=bool)
+                below = destination < 0.5
+                for snapshot in range(temporal_window - 1, T):
+                    target[snapshot] = bool(np.all(
+                        below[
+                            snapshot - temporal_window + 1:
+                            snapshot + 1
+                        ]
+                    ))
+            matrix[:, source_index] = target.astype(float)
 
     # explicit one-sided proxies (item: nonneg/nonpos).  When the run enables *only* a one-sided
     # family, sign-constrain every column and apply an independent per-cell dropout to exact zeros.

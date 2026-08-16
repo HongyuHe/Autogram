@@ -28,7 +28,13 @@ from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
 from autogram.loader.gtib import profile_dataframe
 from autogram.logic.solver import atom_expr
-from autogram.schema.spec import CellCodec, ColumnPattern, GrammarSpec, RoleOntology
+from autogram.schema.spec import (
+    CellCodec,
+    ColumnPattern,
+    GrammarSpec,
+    RefTemplate,
+    RoleOntology,
+)
 
 
 def _base_spec(max_degree: int = 1) -> GrammarSpec:
@@ -54,6 +60,83 @@ def _base_spec(max_degree: int = 1) -> GrammarSpec:
         cell_codec=CellCodec(kind="scalar"),
         max_degree=max_degree,
     )
+
+
+def test_lag_known_recovery_resolves_structured_binder_role_and_binding():
+    n = 80
+    frame = pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=n,
+            freq="1min",
+        ),
+        "series_id": ["s"] * n,
+        "metric_n0": np.arange(1.0, n + 1.0),
+        "metric_n1": np.arange(2.0, n + 2.0),
+    })
+    spec = GrammarSpec(
+        name="structured-temporal",
+        patterns=(
+            ColumnPattern(
+                name="metric",
+                matcher="regex",
+                kind="measurement",
+                direction="value",
+                regex=r"^metric_(?P<source>n\d+)$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("node",),
+            ref_roles={"node": ("measurement",)},
+            fam_roles={"node": ()},
+        ),
+        ref_templates=(
+            RefTemplate("node", "measurement", "metric_{X}"),
+        ),
+        family_selectors=(),
+        binder_enumerate={"node": "per_node"},
+        cell_codec=CellCodec(kind="scalar"),
+        temporal_enabled=True,
+        max_lag=2,
+        time_index="timestamp",
+        group_keys=("series_id",),
+        metadata_columns=("timestamp", "series_id"),
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        spec,
+        name="structured_lag_recovery",
+    )
+    atomic = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(
+        A.Rule(
+            "node",
+            A.Compare(A.Ref("measurement"), ">=", A.Const(0)),
+        )
+    )
+    result = SimpleNamespace(dataset=dataset, portfolio=[atomic])
+
+    recovered = recover_known(
+        result,
+        [
+            KnownInvariant(
+                "lag",
+                ">=",
+                {"lag": ["metric_n0", 1]},
+                0,
+            ),
+        ],
+    )
+
+    assert recovered["recovered"] == 1
 
 
 def _profile(
@@ -994,4 +1077,3 @@ def test_zero_support_lag_law_is_not_credited_by_implication():
     assert recover_known(result, [reachable])["recall"] == 1.0
     # The 100-step lag grounds no row on a 50-row series, so it must NOT be credited.
     assert recover_known(result, [unreachable])["recall"] == 0.0
-

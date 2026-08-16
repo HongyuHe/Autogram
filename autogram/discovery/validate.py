@@ -385,10 +385,30 @@ def _additional_operand_sigs(rule, binder, binding, nm):
         return set()
     if rule.atom.op not in ("~=", "=="):
         return set()
-    left = _ground_term_columns(rule.atom.left, binder, binding, nm)
-    right = _ground_term_columns(rule.atom.right, binder, binding, nm)
-    if not left or not right:
+    left_items = _ground_term_column_items(
+        rule.atom.left,
+        binder,
+        binding,
+        nm,
+    )
+    right_items = _ground_term_column_items(
+        rule.atom.right,
+        binder,
+        binding,
+        nm,
+    )
+    if not left_items or not right_items:
         return set()
+    # The persisted signature is set-valued. If one expression references the same concrete column
+    # twice (`a + SUM({a,b})`), converting it to a set changes 2a+b into a+b and can falsely recover
+    # a ref-sum known. Do not emit an alias the representation cannot state honestly.
+    if (
+        len(set(left_items)) != len(left_items)
+        or len(set(right_items)) != len(right_items)
+    ):
+        return set()
+    left = frozenset(left_items)
+    right = frozenset(right_items)
     if not isinstance(
         rule.atom.left,
         (A.Add, A.Agg),
@@ -405,21 +425,31 @@ def _additional_operand_sigs(rule, binder, binding, nm):
     }
 
 
-def _ground_term_columns(term, binder, binding, nm):
+def _ground_term_column_items(term, binder, binding, nm):
     if isinstance(term, A.Ref):
         column = resolve_ref(term.role, binder, binding, nm)
-        return frozenset({column}) if column is not None else frozenset()
+        return [column] if column is not None else []
     if isinstance(term, A.Agg) and term.kind == "SUM":
-        return frozenset(resolve_family(term.family_role, binder, binding, nm))
+        return list(resolve_family(
+            term.family_role,
+            binder,
+            binding,
+            nm,
+        ))
     if isinstance(term, A.Add):
-        columns = frozenset()
+        columns = []
         for child in term.terms:
-            child_columns = _ground_term_columns(child, binder, binding, nm)
+            child_columns = _ground_term_column_items(
+                child,
+                binder,
+                binding,
+                nm,
+            )
             if not child_columns:
-                return frozenset()
-            columns |= child_columns
+                return []
+            columns.extend(child_columns)
         return columns
-    return frozenset()
+    return []
 
 
 def portfolio_relations(result: DiscoveryResult) -> set:
@@ -689,7 +719,11 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
     ratios, proportionals = _ratios(rels), _proportionals(rels)
     delta_bounds, windowed_ratios = _delta_bounds(rels), _windowed_ratios(rels)
     lag_bounds = _relation_payloads(rels, "lag_bound")
-    sum_balances = _relation_payloads(rels, "sum_balance")
+    sum_balances = _relation_payloads(
+        rels,
+        "sum_balance",
+        strengths=("exact",),
+    )
     conditional_positive_found = _conditionals(rels, "delta_bound")
     conditional_zero_found = _conditionals(
         rels,
@@ -703,6 +737,7 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
     conditional_pair_found = _conditionals(
         rels,
         "pair",
+        strengths=("exact",),
     )
     related_found = _relation_payloads(
         rels,
@@ -1754,6 +1789,7 @@ def prepare_proxy_suite(regime, seed: int = 0,
             "proportional",
             "conditional_proportional",
             "conditional_pair",
+            "sum_balance",
             "healthy_band",
             "cross_grain",
         }

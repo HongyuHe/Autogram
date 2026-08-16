@@ -2,9 +2,48 @@
 
 from __future__ import annotations
 
+import pytest
+
 from autogram.dsl import ast as A
 from autogram.dsl.render import parse_rule_line, render_rule
 from autogram.schema.spec import FamilySelector
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[forall record] x ~band nan",
+        "[forall record] x ~band inf",
+        "[forall record] target := x < nan",
+        "[forall record] target := x >= inf",
+        "[forall record] x == nan",
+        "[forall record] x == -inf",
+        "[forall record] x == nan*y",
+    ],
+)
+def test_surface_parser_rejects_nonfinite_numbers(text):
+    with pytest.raises(ValueError, match="finite number"):
+        parse_rule_line(text)
+
+
+def test_surface_parser_round_trips_scientific_notation():
+    rules = (
+        A.Rule(
+            "record",
+            A.Compare(A.Ref("x"), "==", A.Const(1e20)),
+        ),
+        A.Rule(
+            "record",
+            A.Compare(
+                A.Scale(1e-20, A.Ref("x")),
+                ">=",
+                A.Const(-2.5e-12),
+            ),
+        ),
+    )
+
+    for rule in rules:
+        assert parse_rule_line(rule.unparse()) == rule
 
 
 class _StubAdapter:

@@ -1491,6 +1491,51 @@ def test_advanced_proxy_generators_plant_each_definition_shape():
             }
 
 
+def test_noisy_conjunction_proxy_target_matches_observed_operands():
+    window = 5
+    data = synth.make_synthetic(
+        n_entities=3,
+        n_snapshots=120,
+        noise=0.02,
+        seed=5,
+        families=("conjunction",),
+        temporal_window=window,
+    )
+    index_by_name = {
+        name: index
+        for index, name in enumerate(data.columns)
+    }
+
+    for entity in data.entities:
+        destination = data.matrix[
+            :,
+            index_by_name[
+                f"{data.vocab.measurement}_{entity}_{data.vocab.destination}"
+            ],
+        ]
+        demand_self = data.matrix[
+            :,
+            index_by_name[f"{data.vocab.demand}_{entity}_{entity}"],
+        ]
+        deficit = pd.Series(
+            destination - demand_self
+        ).rolling(window, min_periods=window).sum().to_numpy()
+        slope = pd.Series(destination).diff(window).to_numpy()
+        expected = (
+            (destination < 0.5)
+            & (deficit > 0.0)
+            & (slope <= 0.0)
+        )
+        target = data.matrix[
+            :,
+            index_by_name[
+                f"{data.vocab.measurement}_{entity}_{data.vocab.source}"
+            ],
+        ].astype(bool)
+
+        np.testing.assert_array_equal(target, expected)
+
+
 def test_conjunction_is_decided_when_an_observed_conjunct_is_false():
     # Round-24: a conjunction whose operands are not all evaluable is still DECIDED when some
     # conjunct we could evaluate is already False -- a missing operand cannot rescue it. Dropping

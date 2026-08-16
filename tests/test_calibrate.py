@@ -19,6 +19,7 @@ from autogram.calibrate import (
 from autogram.discovery.known import KnownInvariant, load_known
 from autogram.discovery.known import _signature as _known_signature
 from autogram.discovery.induce import SchemaInducer
+from autogram.discovery.loop import build_dataframe_grammar
 from autogram.discovery.regime import ProxyEntry, RegimeSpec
 from autogram.loader.gtib import profile_dataframe
 from autogram.schema.spec import (
@@ -459,7 +460,14 @@ def _fake_calibrate_env(monkeypatch, *, recall_fn, null_fn, tune=None):
     monkeypatch.setattr(C, "tune_joint", tune or default_tune)
     monkeypatch.setattr(C, "induce_spec", lambda cols, inducer, *a, **k: _mini_spec())
     monkeypatch.setattr(C, "build_dataframe_grammar",
-                        lambda df, spec, search_cfg=None, name="": (object(), object()))
+                        lambda df, spec, search_cfg=None, name="": (
+                            SimpleNamespace(
+                                observed=SimpleNamespace(
+                                    has=lambda _column: False,
+                                ),
+                            ),
+                            object(),
+                        ))
     monkeypatch.setattr(C, "run_prepared",
                         lambda ds, G, discovery_cfg=None, search_cfg=None, proposer=None:
                         SimpleNamespace(portfolio=[], _dcfg=discovery_cfg))
@@ -670,7 +678,15 @@ def test_calibrate_scores_each_runtime_grammar_with_memoized_rungs(monkeypatch, 
 
     def fake_build(df, spec, search_cfg=None, name=""):
         tier_counter["n"] += 1
-        return (SimpleNamespace(tier=tier_counter["n"]), object())
+        return (
+            SimpleNamespace(
+                tier=tier_counter["n"],
+                observed=SimpleNamespace(
+                    has=lambda _column: False,
+                ),
+            ),
+            object(),
+        )
 
     def fake_run(ds, G, discovery_cfg=None, search_cfg=None, proposer=None):
         return SimpleNamespace(portfolio=[], _dcfg=discovery_cfg, _tier=ds.tier)
@@ -829,12 +845,34 @@ def test_known_split_keeps_atomic_and_lag_sign_aliases_together():
         KnownInvariant("other", "==", "a", "b"),
         KnownInvariant("third", ">=", "y", 0),
     ]
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "timestamp": pd.date_range(
+                "2026-01-01",
+                periods=20,
+                freq="1min",
+            ),
+            "x": np.arange(1.0, 21.0),
+            "a": np.arange(20.0),
+            "b": np.arange(20.0),
+            "y": np.arange(1.0, 21.0),
+        }),
+        time_index="timestamp",
+        max_lag=3,
+    )
+    split_dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _mini_spec(),
+        name="lag_split",
+    )
 
     for seed in range(25):
         calibration, validation = _split_known(
             known,
             frac=0.4,
             seed=seed,
+            frame=split_dataset.observed,
+            recovery_dataset=split_dataset,
         )
         calibration_names = {item.name for item in calibration}
         validation_names = {item.name for item in validation}
@@ -847,8 +885,6 @@ def test_known_split_keeps_atomic_and_lag_sign_aliases_together():
 
 
 def test_known_split_only_merges_strict_lag_when_data_is_strictly_signed():
-    from autogram.calibrate import _ColumnScaleView
-
     known = [
         KnownInvariant("atomic", ">=", "x", 0),
         KnownInvariant("lag_strict", ">", {"lag": ["x", 2]}, 0),
@@ -864,11 +900,32 @@ def test_known_split_only_merges_strict_lag_when_data_is_strictly_signed():
     positive = with_zero.copy()
     positive["x"] = [1.0, 2.0, 3.0]
 
+    def split_dataset(frame):
+        profiled = profile_dataframe(
+            frame.assign(
+                timestamp=pd.date_range(
+                    "2026-01-01",
+                    periods=len(frame),
+                    freq="1min",
+                ),
+            ),
+            time_index="timestamp",
+            max_lag=2,
+        )
+        return build_dataframe_grammar(
+            profiled,
+            _mini_spec(),
+            name="strict_lag_split",
+        )[0]
+    zero_dataset = split_dataset(with_zero)
+    positive_dataset = split_dataset(positive)
+
     split_with_zero = _split_known(
         known,
         frac=0.5,
         seed=0,
-        frame=_ColumnScaleView(with_zero),
+        frame=zero_dataset.observed,
+        recovery_dataset=zero_dataset,
     )
     calibration_zero = {item.name for item in split_with_zero[0]}
     assert (
@@ -881,13 +938,54 @@ def test_known_split_only_merges_strict_lag_when_data_is_strictly_signed():
             known,
             frac=0.5,
             seed=seed,
-            frame=_ColumnScaleView(positive),
+            frame=positive_dataset.observed,
+            recovery_dataset=positive_dataset,
         )
         names = {item.name for item in calibration}
         assert (
             ("atomic" in names)
             == ("lag_strict" in names)
         ), seed
+
+
+def test_known_split_does_not_merge_nonstrict_lag_on_mixed_sign_data():
+    known = [
+        KnownInvariant("atomic", ">=", "x", 0),
+        KnownInvariant("lag", ">=", {"lag": ["x", 1]}, 0),
+        KnownInvariant("other", "==", "a", "b"),
+        KnownInvariant("third", ">=", "y", 0),
+    ]
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "timestamp": pd.date_range(
+                "2026-01-01",
+                periods=6,
+                freq="1min",
+            ),
+            "x": [1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
+            "a": np.arange(6.0),
+            "b": np.arange(6.0)[::-1],
+            "y": np.arange(1.0, 7.0),
+        }),
+        time_index="timestamp",
+        max_lag=1,
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _mini_spec(),
+        name="mixed_sign_lag_split",
+    )
+
+    calibration, _validation = _split_known(
+        known,
+        frac=0.5,
+        seed=0,
+        frame=dataset.observed,
+        recovery_dataset=dataset,
+    )
+    names = {item.name for item in calibration}
+
+    assert ("atomic" in names) != ("lag" in names)
 
 
 def test_known_split_keeps_singleton_sum_balance_aliases_together():

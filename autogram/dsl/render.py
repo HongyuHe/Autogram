@@ -22,8 +22,19 @@ used to re-render already-saved ``.dl`` portfolios in the explicit form.
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import List, Optional, Tuple
+
+
+def _finite_number(text: str, label: str) -> float:
+    try:
+        value = float(text)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} must be a finite number") from error
+    if not math.isfinite(value):
+        raise ValueError(f"{label} must be a finite number")
+    return value
 
 from . import ast as A
 
@@ -181,8 +192,15 @@ def render_rule(rule: A.Rule, adapter=None) -> str:
 
 _OPS = (" <|> ", " ~∝ ", " ~= ", " == ", " != ", " <= ", " >= ", " < ", " > ")
 _AGG_RE = re.compile(r"^(SUM|MIN|MAX|AVG)\((\w+)\)$")
-_SCALE_RE = re.compile(r"^(-?\d+(?:\.\d+)?)\*(.+)$")
-_NUM_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_FINITE_TOKEN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+_NONFINITE_TOKEN = r"[+-]?(?:nan|inf(?:inity)?)"
+_SCALE_RE = re.compile(rf"^({_FINITE_TOKEN})\*(.+)$")
+_NONFINITE_SCALE_RE = re.compile(
+    rf"^({_NONFINITE_TOKEN})\*(.+)$",
+    re.IGNORECASE,
+)
+_NUM_RE = re.compile(rf"^{_FINITE_TOKEN}$")
+_NONFINITE_RE = re.compile(rf"^{_NONFINITE_TOKEN}$", re.IGNORECASE)
 _LAG_RE = re.compile(r"^LAG_(\d+)\((.*)\)$")
 _DIFF_RE = re.compile(r"^DELTA_(\d+)\((.*)\)$")
 _ROLL_RE = re.compile(r"^ROLL_(SUM|MIN|MAX|AVG)_(\d+)\((.*)\)$")
@@ -247,11 +265,19 @@ def _parse_primary(s: str) -> A.Term:
     m = _RELATED_RE.match(s)
     if m:
         return A.RelatedAgg(m.group(1))
+    m = _NONFINITE_SCALE_RE.match(s)
+    if m:
+        _finite_number(m.group(1), "scale coefficient")
+    if _NONFINITE_RE.match(s):
+        _finite_number(s, "constant")
     m = _SCALE_RE.match(s)
     if m:
-        return A.Scale(float(m.group(1)), _parse_primary(m.group(2)))
+        return A.Scale(
+            _finite_number(m.group(1), "scale coefficient"),
+            _parse_primary(m.group(2)),
+        )
     if _NUM_RE.match(s):
-        return A.Const(float(s))
+        return A.Const(_finite_number(s, "constant"))
     return A.Ref(s)
 
 
@@ -289,7 +315,11 @@ def parse_rule_line(text: str) -> A.Rule:
         return A.Rule(binder, atom, condition=condition)
     band = _split_top(body, " ~band ")
     if len(band) == 2:
-        center = None if band[1].strip() == "?" else float(band[1].strip())
+        center = (
+            None
+            if band[1].strip() == "?"
+            else _finite_number(band[1].strip(), "band center")
+        )
         return A.Rule(
             binder,
             A.BandDefinition(_parse_term(band[0]), center),
@@ -355,7 +385,14 @@ def _parse_predicate(text: str) -> A.Predicate:
     for operator in (" <= ", " >= ", " < ", " > "):
         parts = _split_top(text, operator)
         if len(parts) == 2:
-            threshold = None if parts[1].strip() == "?" else float(parts[1].strip())
+            threshold = (
+                None
+                if parts[1].strip() == "?"
+                else _finite_number(
+                    parts[1].strip(),
+                    "predicate threshold",
+                )
+            )
             return A.Bound(_parse_term(parts[0]), operator.strip(), threshold)
     raise ValueError(f"invalid Boolean predicate: {text!r}")
 
@@ -402,7 +439,7 @@ def _parse_scalar(text: str):
     if text == "None":
         return None
     if _NUM_RE.match(text):
-        value = float(text)
+        value = _finite_number(text, "categorical scalar")
         return int(value) if value.is_integer() else value
     return text
 
