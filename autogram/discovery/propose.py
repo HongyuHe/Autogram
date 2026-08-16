@@ -782,7 +782,7 @@ class EnumerationProposer:
             if values and not typed_binary_domain(values)
         ]
         for target_column in category_columns:
-            target_values = tuple(conditions[target_column])
+            target_values = typed_unique(conditions[target_column])
             for default in target_values:
                 default_key = typed_group_key(default)
                 labels = tuple(
@@ -807,7 +807,10 @@ class EnumerationProposer:
         out: List[A.Condition] = []
         cap = max(1, int(self.G.max_condition_values))
         ranked = sorted(
-            self.G.condition_columns.items(),
+            (
+                (column, typed_unique(values))
+                for column, values in self.G.condition_columns.items()
+            ),
             key=lambda item: item[0],
         )
         # Fail loud *before* materialising a combinatorial blow-up: the subset ("in") enumeration is
@@ -848,9 +851,9 @@ class EnumerationProposer:
                 f"ceiling {ceiling}; tighten the declared condition domains or value cap"
             )
         for column, raw_values in ranked:
-            if len(raw_values) <= 1:
+            values = typed_unique(raw_values)
+            if len(values) <= 1:
                 continue
-            values = tuple(raw_values)
             for value in values:
                 out.append(A.Condition(column, "==", (value,)))
             max_subset = min(cap, len(values) - 1)

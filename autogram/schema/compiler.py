@@ -91,6 +91,12 @@ def _validate_typed_unique(label: str, values) -> None:
         seen.add(key)
 
 
+def _canonical_typed_values(values) -> tuple:
+    from ..dsl.evaluate import typed_unique
+
+    return typed_unique(values)
+
+
 def _validate_names(label: str, values) -> None:
     values = tuple(values)
     for value in values:
@@ -367,6 +373,17 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
                 f"related template {template.role!r}: span filter values "
                 "require a filter column"
             )
+        if template.mode == "span_any" and template.filter_values:
+            try:
+                _validate_typed_unique(
+                    f"span filter value for {template.role!r}",
+                    template.filter_values,
+                )
+            except TypeError as error:
+                raise CompileError(
+                    f"related template {template.role!r} contains "
+                    "an unhashable span filter value"
+                ) from error
         key = (template.binder, template.role)
         if key in related_templates:
             raise CompileError(
@@ -427,7 +444,10 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
         fam_glyphs=dict(onto.fam_glyphs),
         time_index=spec.time_index,
         group_keys=tuple(spec.group_keys),
-        condition_columns={k: tuple(v) for k, v in spec.condition_columns.items()},
+        condition_columns={
+            key: _canonical_typed_values(values)
+            for key, values in spec.condition_columns.items()
+        },
         temporal_enabled=bool(spec.temporal_enabled),
         max_lag=int(spec.max_lag),
         windows=tuple(sorted({int(window) for window in spec.windows})),

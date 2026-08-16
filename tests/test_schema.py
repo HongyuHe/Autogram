@@ -12,6 +12,7 @@ from autogram.schema.spec import (
     ColumnPattern,
     GrammarSpec,
     RefTemplate,
+    RelatedTemplate,
     RoleOntology,
 )
 
@@ -20,6 +21,52 @@ def test_induced_spec_compiles(adapter):
     # the session adapter is a compiled induced spec; it exposes the induced ontology
     assert "link" in adapter.binders and "node" in adapter.binders
     assert adapter.noisy_kind == "measurement" and adapter.demand_kind == "flow"
+
+
+def test_compiler_rejects_unhashable_span_filter_values():
+    spec = GrammarSpec(
+        name="span-filter",
+        patterns=(
+            ColumnPattern(
+                name="placeholder",
+                matcher="regex",
+                kind="unused",
+                direction="unused",
+                regex=r"^does_not_match$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ()},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        related_templates=(
+            RelatedTemplate(
+                binder="record",
+                role="event",
+                relation="events",
+                column="flag",
+                mode="span_any",
+                parent_keys=(),
+                child_keys=(),
+                partition_keys=(),
+                parent_time="timestamp",
+                child_time="timestamp",
+                window_seconds=60,
+                span_start="span_start",
+                span_end="span_end",
+                filter_column="kind",
+                filter_values=([],),
+            ),
+        ),
+        cell_codec=CellCodec(kind="scalar"),
+    )
+
+    with pytest.raises(CompileError, match="unhashable span filter"):
+        compile_spec(spec)
 
 
 def test_infer_tokens_requires_full_column_match():

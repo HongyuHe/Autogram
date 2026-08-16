@@ -33,12 +33,16 @@ import numbers
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
+import numpy as np
+
 # Operator and aggregation vocabularies are intrinsic to the DSL (not dataset-specific).
 OPS = ("~=", "==", "<=", ">=", "<", ">", "!=", "<|>", "~∝")
 AGG_KINDS = ("SUM", "MIN", "MAX", "AVG")
 
 
 def _scalar_unparse(value: object) -> str:
+    if isinstance(value, np.generic):
+        value = value.item()
     if value is None or isinstance(value, (str, bool)):
         scalar = value
     elif isinstance(value, numbers.Integral):

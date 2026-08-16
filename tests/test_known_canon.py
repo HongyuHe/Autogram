@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from autogram.dsl import ast as A
-from autogram.dsl.evaluate import typed_group_key
+from autogram.dsl.evaluate import typed_group_key, typed_signature_value
 from autogram.loader.loader import Frame
 from autogram.discovery.known import (
     _canonicalize,
@@ -97,13 +97,30 @@ def test_typed_categorical_signatures_are_stable_and_distinct():
 
     float_category = (
         "categorical_definition",
-        ("label", (("flag", typed_group_key(1.0)),), typed_group_key("none")),
+        (
+            "label",
+            (("flag", typed_signature_value(1.0)),),
+            typed_signature_value("none"),
+        ),
     )
     int_category = (
         "categorical_definition",
-        ("label", (("flag", typed_group_key(1)),), typed_group_key("none")),
+        (
+            "label",
+            (("flag", typed_signature_value(1)),),
+            typed_signature_value("none"),
+        ),
     )
     assert not relation_signature_matches(float_category, int_category)
+    nearby_float = (
+        "categorical_definition",
+        (
+            "label",
+            (("flag", typed_signature_value(1.005)),),
+            typed_signature_value("none"),
+        ),
+    )
+    assert not relation_signature_matches(float_category, nearby_float)
 
 
 def _bimodal_frame():

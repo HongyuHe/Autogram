@@ -7,6 +7,8 @@ import pandas as pd
 import pytest
 
 from autogram.cli import _load_dataframe
+from autogram.config import DiscoveryConfig
+from autogram.discovery.evaluate import DataOnlyEvaluator
 from autogram.discovery.loop import build_dataframe_grammar
 from autogram.dsl import ast as A
 from autogram.dsl.evaluate import eval_term
@@ -300,6 +302,54 @@ def test_materialized_names_reserve_literal_ids_and_existing_columns():
     assert np.allclose(total[1:], [360.0, 360.0])
 
 
+def test_secondary_name_suffix_does_not_rename_an_ordinary_shard():
+    """Collision suffix allocation must reserve every unique preferred spelling up front."""
+    derived, raw = _tables()
+    base_raw = raw.loc[raw["shard_id"] == "shard_000_0"].copy()
+    raw_parts = []
+    for consumer, shard in (
+        ("c1", "s"),
+        ("c2", "s"),
+        ("z0", "c1__s"),
+        ("z0", "c1__s#2"),
+    ):
+        part = base_raw.copy()
+        part["consumer_id"] = consumer
+        part["shard_id"] = shard
+        if shard == "c1__s#2":
+            part[
+                ["collector_input_counted", "presenter_output_counted"]
+            ] *= 4.0
+        raw_parts.append(part)
+    derived_parts = []
+    for consumer in ("c1", "c2", "z0"):
+        part = derived.copy()
+        part["consumer_id"] = consumer
+        derived_parts.append(part)
+
+    prepared = prepare_gtib(
+        pd.concat(derived_parts, ignore_index=True),
+        pd.concat(raw_parts, ignore_index=True),
+    )
+    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]
+
+    assert "c1__s#2_input_increment" in family
+    assert len(family) == len(set(family)) == 4
+    assert _increments(prepared["c1__s#2_input_increment"]) == [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        None,
+        240.0,
+        240.0,
+    ]
+
+
 def test_missing_consumer_identity_agrees_between_materialized_and_streaming():
     """``pd.NA`` and ``None`` denote the same missing consumer on both join paths."""
     derived, raw = _tables()
@@ -341,6 +391,42 @@ def test_missing_consumer_identity_agrees_between_materialized_and_streaming():
     assert np.array_equal(materialized, streaming, equal_nan=True)
 
 
+def test_materialization_sorts_scalar_and_composite_consumer_ids():
+    """Mixed scalar/composite typed IDs must have mutually comparable deterministic sort keys."""
+    derived, raw = _tables()
+    raw = raw.loc[raw["shard_id"] == "shard_000_0"].copy()
+    first_raw = raw.copy()
+    first_raw["consumer_id"] = pd.Series(
+        [1] * len(first_raw),
+        dtype=object,
+    )
+    second_raw = raw.copy()
+    second_raw["consumer_id"] = pd.Series(
+        [(1, 2)] * len(second_raw),
+        dtype=object,
+    )
+    first_derived = derived.copy()
+    first_derived["consumer_id"] = pd.Series(
+        [1] * len(first_derived),
+        dtype=object,
+    )
+    second_derived = derived.copy()
+    second_derived["consumer_id"] = pd.Series(
+        [(1, 2)] * len(second_derived),
+        dtype=object,
+    )
+
+    prepared = prepare_gtib(
+        pd.concat([first_derived, second_derived], ignore_index=True),
+        pd.concat([first_raw, second_raw], ignore_index=True),
+    )
+
+    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]
+    assert len(family) == len(set(family)) == 2
+
+
 def test_materialization_fails_loudly_on_finite_counter_subtraction_overflow():
     """A finite subtraction overflow cannot be hidden as an invalid zero contribution."""
     derived, raw = _tables()
@@ -362,6 +448,42 @@ def test_materialization_preserves_original_minute_indices_after_slice():
 
     assert frame["shard_000_0_input_increment"].tolist() == [60.0, 60.0]
     assert frame["shard_000_1_input_increment"].tolist() == [120.0, 120.0]
+
+
+def test_materialized_windows_keep_a_non_aligned_derived_origin():
+    """Materialized minute windows must be the same intervals the streaming join evaluates."""
+    derived, raw = _tables()
+    derived = derived.copy()
+    derived["timestamp"] += pd.Timedelta(seconds=30)
+    derived["input_rate_bytes_per_min"] = [180.0, 180.0, 180.0]
+
+    prepared = prepare_gtib(derived, raw)
+    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]
+    materialized = prepared[family].sum(
+        axis=1,
+        min_count=len(family),
+    ).to_numpy(dtype=float)
+
+    streaming_frame = prepared.drop(columns=family)
+    streaming_frame.attrs = prepared.attrs
+    dataset, _grammar = build_dataframe_grammar(
+        streaming_frame,
+        _base_spec(),
+        name="non_aligned_streaming",
+    )
+    streaming = eval_term(
+        A.RelatedAgg("raw_input_rate"),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert streaming is not None
+    assert np.array_equal(materialized, streaming, equal_nan=True)
+    assert np.allclose(streaming, [180.0, 180.0, 90.0])
 
 
 def test_materialization_does_not_bridge_missing_raw_minute():
@@ -409,6 +531,43 @@ def test_generic_profile_does_not_group_by_unique_identifier():
 
     assert unique.attrs[AUTOGRAM_PROFILE_ATTR]["group_keys"] == []
     assert repeated.attrs[AUTOGRAM_PROFILE_ATTR]["group_keys"] == ["tenant_id"]
+
+
+def test_generic_profile_infers_typed_distinct_groups_and_enforces_their_gate():
+    n = 400
+    consumers = np.empty(n, dtype=object)
+    consumers[: n // 2] = True
+    consumers[n // 2 :] = 1
+    x = np.ones(n)
+    y = np.ones(n)
+    # Pooled hold rate 0.90 (acceptable); integer-group hold rate 0.80 (not acceptable).
+    failing = np.arange(n // 2, n // 2 + n // 10)
+    y[failing] = 2.0
+    frame = infer_tabular_profile(pd.DataFrame({
+        "consumer_id": pd.Series(consumers, dtype=object),
+        "x": x,
+        "y": y,
+    }))
+
+    assert frame.attrs[AUTOGRAM_PROFILE_ATTR]["group_keys"] == ["consumer_id"]
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="typed_inferred_groups",
+    )
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.05,
+            hold_rate_threshold=0.85,
+            band_mode="global",
+        ),
+    ).evaluate(
+        A.Rule("record", A.Compare(A.Ref("x"), "~=", A.Ref("y")))
+    )
+
+    assert not result.accepted
+    assert len(result.parameters["group_hold_rates"]) == 2
 
 
 def test_profiled_gtib_builds_record_grammar_and_row_context():

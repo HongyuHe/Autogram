@@ -14,6 +14,33 @@ from autogram.discovery import regime as R
 from autogram.discovery import validate as V
 from autogram.discovery.loop import discover
 from autogram.dsl import ast as A
+from autogram.dsl.evaluate import typed_group_key
+
+
+def test_runtime_null_covers_each_typed_condition_domain_when_product_is_too_large():
+    adapter = SimpleNamespace(condition_columns={
+        f"c{column}": tuple(
+            f"c{column}-v{value}"
+            for value in range(10)
+        )
+        for column in range(3)
+    })
+
+    context = V._runtime_condition_context(
+        adapter,
+        100,
+        np.random.default_rng(0),
+        randomize=True,
+    )
+
+    for name, domain in adapter.condition_columns.items():
+        assert {
+            typed_group_key(value)
+            for value in context[name].tolist()
+        } == {
+            typed_group_key(value)
+            for value in domain
+        }
 
 
 def test_nonneg_proxy_plants_only_nonnegativity():

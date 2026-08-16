@@ -21,8 +21,9 @@ from ..dsl.binders import enumerate_bindings, resolve_family, resolve_ref
 from ..dsl.evaluate import (
     robust_median,
     typed_binary_domain,
-    typed_condition_key,
     typed_group_key,
+    typed_signature_value,
+    typed_sort_key,
     typed_unique,
 )
 from ..loader.loader import Dataset, Frame
@@ -95,10 +96,10 @@ def _operand_sig(rule, binder, binding, nm, parameters=None):
                 (
                     rule.atom.target_column,
                     tuple(
-                        (column, typed_group_key(value))
+                        (column, typed_signature_value(value))
                         for column, value in rule.atom.cases
                     ),
-                    typed_group_key(rule.atom.default),
+                    typed_signature_value(rule.atom.default),
                 ),
             ),
         )
@@ -122,7 +123,23 @@ def _operand_sig(rule, binder, binding, nm, parameters=None):
 
 
 def _condition_signature(condition: A.Condition):
-    return typed_condition_key(condition)
+    if condition.op == "all":
+        return (
+            "all",
+            tuple(sorted(
+                (
+                    _condition_signature(child)
+                    for child in condition.values
+                    if isinstance(child, A.Condition)
+                ),
+                key=str,
+            )),
+        )
+    values = tuple(sorted(
+        (typed_signature_value(value) for value in condition.values),
+        key=lambda item: typed_sort_key(item[1]),
+    ))
+    return (condition.column, condition.op, values)
 
 
 def _operand_sig_base(rule, binder, binding, nm):
@@ -573,6 +590,15 @@ def _portfolio_one_sided_columns(result: DiscoveryResult, op: str) -> set:
 
 
 def relation_signature_matches(expected, actual) -> bool:
+    if (
+        isinstance(expected, tuple)
+        and isinstance(actual, tuple)
+        and expected[:1] == ("category_value",)
+        and actual[:1] == ("category_value",)
+    ):
+        # Categorical identity is exact. The generic numeric tolerance below is only for fitted
+        # thresholds/centres, never for the payload inside a typed category tag.
+        return expected == actual
     # Booleans and strings are exact categorical identities, never fitted thresholds: a Boolean
     # must match only a Boolean of the same value (so ``True`` never spuriously matches ``1``), and
     # a string only an equal string. Numeric tolerance is reserved for genuine numeric quantities
@@ -1074,6 +1100,7 @@ def _runtime_condition_context(
     rng,
     *,
     randomize: bool,
+    group_identities=None,
 ) -> dict[str, np.ndarray]:
     domains = {
         name: tuple(values)
@@ -1094,19 +1121,50 @@ def _runtime_condition_context(
     context = {}
     stride = 1
     boolean_index = 0
-    rows = np.arange(n_rows, dtype=np.int64)
-    for name in ordered:
+    if group_identities is None:
+        buckets = [np.arange(n_rows, dtype=int)]
+    else:
+        grouped: dict[tuple, list[int]] = {}
+        for row, identity in enumerate(group_identities):
+            grouped.setdefault(identity, []).append(row)
+        buckets = [
+            np.asarray(rows, dtype=int)
+            for rows in grouped.values()
+        ]
+    for column_index, name in enumerate(ordered):
         values = np.asarray(domains[name], dtype=object)
         categorical = not typed_binary_domain(domains[name])
+        generated = np.empty(n_rows, dtype=object)
+        global_offset = 0
+        for rows in buckets:
+            local = np.arange(rows.size, dtype=np.int64)
+            if categorical and rows.size >= stride * len(values):
+                indexes = (local // stride) % len(values)
+            else:
+                # Once a Cartesian stride no longer fits, cycle this domain independently instead
+                # of freezing at its first value. The offset advances across groups so many small
+                # groups still cover the complete declared domain globally.
+                indexes = (
+                    local
+                    + global_offset
+                    + column_index
+                    + (boolean_index if not categorical else 0)
+                ) % len(values)
+            local_values = values[indexes]
+            if randomize:
+                local_values = rng.permutation(local_values)
+            generated[rows] = local_values
+            global_offset += rows.size
         if categorical:
-            indexes = (rows // stride) % len(values)
             stride *= len(values)
         else:
-            indexes = (rows + boolean_index) % len(values)
             boolean_index += 1
-        generated = values[indexes]
-        if randomize:
-            generated = rng.permutation(generated)
+        expected = {typed_group_key(value) for value in values.tolist()}
+        observed = {typed_group_key(value) for value in generated.tolist()}
+        if n_rows >= len(expected) and not expected <= observed:
+            raise RuntimeError(
+                f"runtime null failed to cover condition domain {name!r}"
+            )
         context[name] = generated
     return context
 
@@ -1156,11 +1214,28 @@ def _runtime_null_dataset(
         matrix[:, index] = generated
         generated_columns[name] = generated
 
+    group_identities = None
+    if dataset.group_keys and all(
+        key in dataset.observed.row_context
+        for key in dataset.group_keys
+    ):
+        arrays = [
+            np.asarray(
+                dataset.observed.row_context[key],
+                dtype=object,
+            )
+            for key in dataset.group_keys
+        ]
+        group_identities = [
+            tuple(typed_group_key(array[row]) for array in arrays)
+            for row in range(dataset.observed.n_rows)
+        ]
     condition_context = _runtime_condition_context(
         adapter,
         dataset.observed.n_rows,
         rng,
         randomize=definition_targets,
+        group_identities=group_identities,
     )
     templates = tuple(
         getattr(adapter, "related_templates", {}).values()

@@ -339,6 +339,15 @@ def _time_vector(frame: Frame, time_index: str) -> np.ndarray:
 _MISSING_GROUP = "__missing__"
 
 
+def canonical_typed_value(value):
+    """Canonical Python representation of one categorical/group value."""
+    if isinstance(value, tuple):
+        return tuple(canonical_typed_value(item) for item in value)
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def is_missing_scalar(value) -> bool:
     """Whether one scalar is a missing categorical/group value.
 
@@ -368,6 +377,7 @@ def typed_group_key(label):
     would fragment every missing-labelled row into a group of its own, and a group of one is split
     entirely into the evaluation half where it can neither be fitted nor meaningfully gated.
     """
+    label = canonical_typed_value(label)
     if isinstance(label, tuple):
         return ("tuple", tuple(typed_group_key(item) for item in label))
     if is_missing_scalar(label):
@@ -391,13 +401,22 @@ def typed_unique(values, *, drop_missing: bool = False) -> tuple:
         if key in seen:
             continue
         seen.add(key)
-        result.append(value)
+        result.append(canonical_typed_value(value))
     return tuple(result)
 
 
 def typed_equal(left, right) -> bool:
     """Type-sensitive scalar equality, recursive through tuple values."""
     return typed_group_key(left) == typed_group_key(right)
+
+
+def typed_signature_value(value):
+    """Tagged categorical value for persisted/recovery signatures.
+
+    The outer tag tells the generic signature matcher this is an identity, not a fitted numeric
+    threshold. Numeric tolerance must never turn category ``1.0`` into ``1.005``.
+    """
+    return ("category_value", typed_group_key(value))
 
 
 def typed_binary_domain(values) -> bool:
@@ -448,16 +467,22 @@ def typed_sort_key(typed):
     falls back to the rendered form only for values that cannot be compared.
     """
     if isinstance(typed, tuple) and typed and typed[0] == "tuple":
-        return tuple(typed_sort_key(item) for item in typed[1])
+        return (
+            1,
+            "tuple",
+            0,
+            0.0,
+            tuple(typed_sort_key(item) for item in typed[1]),
+        )
     kind, value = typed
     try:
         if isinstance(value, (bool, int, float)):
-            return (kind, 0, float(value), "")
+            return (0, kind, 0, float(value), "")
         if isinstance(value, str):
-            return (kind, 1, 0.0, value)
+            return (0, kind, 1, 0.0, value)
     except (TypeError, ValueError):
         pass
-    return (kind, 2, 0.0, repr(value))
+    return (0, kind, 2, 0.0, repr(value))
 
 
 def _ordered_groups(frame: Frame, nm: NameModel):

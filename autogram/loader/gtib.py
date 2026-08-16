@@ -200,6 +200,19 @@ def _is_regime_column(counts: pd.Series, n_rows: int, cfg: DiscoveryConfig | Non
     return n_thin <= max(1, n_rows // max(1, floor))
 
 
+def _typed_value_counts(series: pd.Series) -> pd.Series:
+    """Value counts under Autogram's typed categorical identity."""
+    from ..dsl.evaluate import typed_group_key
+
+    counts: dict[tuple, int] = {}
+    for value in series.to_numpy(dtype=object):
+        key = typed_group_key(value)
+        if key[0] == "missing":
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return pd.Series(counts, dtype=np.int64)
+
+
 def infer_tabular_profile(
     frame: pd.DataFrame,
     discovery_cfg: DiscoveryConfig | None = None,
@@ -213,7 +226,7 @@ def infer_tabular_profile(
             column.endswith("_id") or column in {"consumer_id", "shard_id"}
         ):
             continue
-        cardinality = int(frame[column].nunique(dropna=True))
+        cardinality = int(_typed_value_counts(frame[column]).size)
         if 1 < cardinality and cardinality <= max(1, len(frame) // 3):
             groups.append(column)
     conditions = []
@@ -230,7 +243,7 @@ def infer_tabular_profile(
         # A condition has to name a *regime*, so its values must be able to carry evidence. The bar
         # is the evaluator's own condition-support floor, and the shape test lives in
         # `_is_regime_column`; a bounded-domain check alone is not enough.
-        counts = frame[c].value_counts(dropna=True)
+        counts = _typed_value_counts(frame[c])
         distinct = int(counts.size)
         if distinct < 1 or distinct > _MAX_CONDITION_DOMAIN:
             continue
@@ -479,9 +492,21 @@ def _materialize_raw(
         return result
 
     def unique_group_names(group_order, preferred) -> dict:
-        result = {}
-        used = set()
+        counts: dict[str, int] = {}
+        for name in preferred.values():
+            counts[name] = counts.get(name, 0) + 1
+        result = {
+            key: preferred[key]
+            for key in group_order
+            if counts[preferred[key]] == 1
+        }
+        # Reserve all unambiguous literal/preferred names before assigning suffixes to collisions.
+        # Otherwise a duplicate `c1__s` may claim `c1__s#2` before the real `c1__s#2` shard is
+        # visited, forcing the ordinary shard to move.
+        used = set(result.values())
         for key in group_order:
+            if key in result:
+                continue
             base = preferred[key]
             candidate = base
             suffix = 2
@@ -619,7 +644,10 @@ def _materialize_raw(
                 "GTIB raw table references consumer absent from derived table: "
                 f"{raw_consumer_by_key[consumer_key]!r}"
             )
-        consumer_start = pd.Timestamp(parent_start[consumer_key]).floor("min")
+        # `minute_index` is relative to the derived series' exact origin, which need not be aligned
+        # to a wall-clock minute. Flooring shifts every materialized window while the streaming join
+        # keeps the true `[parent_time, parent_time + 60s)` interval, making the two paths disagree.
+        consumer_start = pd.Timestamp(parent_start[consumer_key])
         group["_minute_index"] = (
             (group["timestamp"] - consumer_start).dt.total_seconds() // 60
         ).astype(int)

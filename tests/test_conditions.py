@@ -16,7 +16,11 @@ from autogram.discovery.loop import build_dataframe_grammar
 from autogram.discovery.propose import EnumerationProposer, normalize_rule
 from autogram.discovery.validate import score_recovery
 from autogram.dsl import ast as A
-from autogram.dsl.evaluate import _condition_mask, typed_group_key
+from autogram.dsl.evaluate import (
+    _condition_mask,
+    typed_group_key,
+    typed_signature_value,
+)
 from autogram.dsl.grammar import Grammar
 from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
@@ -143,6 +147,31 @@ def test_nullable_string_condition_domain_drops_all_missing_scalars():
     assert grammar.condition_columns["kind"] == ("a", "b")
     # Most importantly, proposal does not try to hash/sort pd.NA.
     list(EnumerationProposer(grammar).propose())
+
+
+def test_numpy_condition_scalars_canonicalize_before_dedup_and_render():
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "kind": pd.Series(
+                [np.float64(1.0), 1.0, np.float64(2.0), 2.0],
+                dtype=object,
+            ),
+            "x": np.arange(4, dtype=float),
+        }),
+        condition_columns=("kind",),
+    )
+    _dataset, grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="numpy_scalar_conditions",
+    )
+
+    assert grammar.condition_columns["kind"] == (1.0, 2.0)
+    assert all(type(value) is float for value in grammar.condition_columns["kind"])
+    assert (
+        A.Condition("kind", "==", (np.bool_(True),)).unparse()
+        == A.Condition("kind", "==", (True,)).unparse()
+    )
 
 
 def test_solver_and_membership_enumeration_preserve_typed_conditions():
@@ -686,7 +715,7 @@ def test_conditional_known_membership_preserves_scalar_types():
     assert _known_condition_signature({"code_in": [1, 2]}) == (
         "code",
         "in",
-        (typed_group_key(1), typed_group_key(2)),
+        (typed_signature_value(1), typed_signature_value(2)),
     )
 
     known = [
@@ -704,7 +733,7 @@ def test_conditional_known_membership_preserves_scalar_types():
             (
                 "code",
                 "in",
-                (typed_group_key(1), typed_group_key(2)),
+                (typed_signature_value(1), typed_signature_value(2)),
             ),
             ("delta_bound", ("loss", 1, ">=")),
         ),
@@ -720,7 +749,7 @@ def test_conditional_known_membership_preserves_scalar_types():
             (
                 "code",
                 "in",
-                (typed_group_key(1), typed_group_key(2)),
+                (typed_signature_value(1), typed_signature_value(2)),
             ),
             ("delta_bound", ("loss", 1, ">=")),
         ),
