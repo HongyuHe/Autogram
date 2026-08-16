@@ -21,7 +21,6 @@ from autogram.discovery.known import _signature as _known_signature
 from autogram.discovery.induce import SchemaInducer
 from autogram.discovery.loop import build_dataframe_grammar
 from autogram.discovery.regime import ProxyEntry, RegimeSpec
-from autogram.dsl import ast as A
 from autogram.loader.gtib import profile_dataframe
 from autogram.loader.loader import build_dataset
 from autogram.schema.compiler import compile_spec
@@ -1025,6 +1024,9 @@ def test_known_split_keeps_bindings_of_one_quantified_rule_together():
         family_selectors=(),
         binder_enumerate={"node": "per_node"},
         cell_codec=CellCodec(kind="scalar"),
+        temporal_enabled=True,
+        max_lag=1,
+        time_index="timestamp",
     )
     dataset = build_dataset(
         frame.columns,
@@ -1035,7 +1037,12 @@ def test_known_split_keeps_bindings_of_one_quantified_rule_together():
     )
     known = [
         KnownInvariant("n0", ">=", "metric_n0_source", 0),
-        KnownInvariant("n1", ">=", "metric_n1_source", 0),
+        KnownInvariant(
+            "n1",
+            ">=",
+            {"lag": ["metric_n1_source", 1]},
+            0,
+        ),
         KnownInvariant(
             "other",
             "==",
@@ -1043,22 +1050,12 @@ def test_known_split_keeps_bindings_of_one_quantified_rule_together():
             "metric_n1_source",
         ),
     ]
-    rule = A.Rule(
-        "node",
-        A.Compare(
-            A.Ref("measurement_source"),
-            ">=",
-            A.Const(0),
-        ),
-    )
-
     calibration, validation = _split_known(
         known,
         frac=0.5,
         seed=0,
         frame=dataset.observed,
         recovery_dataset=dataset,
-        recovery_rules=[rule],
     )
     calibration_names = {item.name for item in calibration}
     validation_names = {item.name for item in validation}
@@ -1067,6 +1064,134 @@ def test_known_split_keeps_bindings_of_one_quantified_rule_together():
         "n0",
         "n1",
     } <= validation_names
+
+
+def test_known_split_groups_later_tier_and_parameterized_bindings():
+    frame = pd.DataFrame({
+        "metric_n0_source": np.arange(1.0, 81.0),
+        "metric_n1_source": np.arange(2.0, 82.0),
+        "alert_n0": np.zeros(80),
+        "alert_n1": np.zeros(80),
+    })
+    spec = GrammarSpec(
+        name="quantified-advanced-split",
+        patterns=(
+            ColumnPattern(
+                "measurement",
+                "regex",
+                "measurement",
+                "source",
+                regex=r"^metric_(?P<source>n\d+)_source$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+            ColumnPattern(
+                "alert",
+                "regex",
+                "boolean",
+                "alert",
+                regex=r"^alert_(?P<source>n\d+)$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("node",),
+            ref_roles={
+                "node": ("measurement_source", "alert"),
+            },
+            fam_roles={"node": ()},
+        ),
+        ref_templates=(
+            RefTemplate(
+                "node",
+                "measurement_source",
+                "metric_{X}_source",
+            ),
+            RefTemplate("node", "alert", "alert_{X}"),
+        ),
+        family_selectors=(),
+        binder_enumerate={"node": "per_node"},
+        cell_codec=CellCodec(kind="scalar"),
+        temporal_enabled=False,
+        time_index="timestamp",
+    )
+    dataset = build_dataset(
+        frame.columns,
+        frame.to_numpy(dtype=float),
+        compile_spec(spec),
+        name="quantified_advanced_split",
+        timestamps=np.arange(len(frame)),
+    )
+    other = KnownInvariant(
+        "other",
+        "==",
+        "metric_n0_source",
+        "metric_n1_source",
+    )
+    catalogues = (
+        [
+            KnownInvariant(
+                "n0",
+                ">=",
+                {"delta": ["metric_n0_source", 1]},
+                0,
+            ),
+            KnownInvariant(
+                "n1",
+                ">=",
+                {"delta": ["metric_n1_source", 1]},
+                0,
+            ),
+            other,
+        ],
+        [
+            KnownInvariant(
+                "n0",
+                ":=",
+                "alert_n0",
+                {
+                    "sustained": {
+                        "term": "metric_n0_source",
+                        "op": "<",
+                        "threshold": 40.0,
+                        "window": 2,
+                    },
+                },
+            ),
+            KnownInvariant(
+                "n1",
+                ":=",
+                "alert_n1",
+                {
+                    "sustained": {
+                        "term": "metric_n1_source",
+                        "op": "<",
+                        "threshold": 40.0,
+                        "window": 2,
+                    },
+                },
+            ),
+            other,
+        ],
+    )
+
+    for known in catalogues:
+        calibration, validation = _split_known(
+            known,
+            frac=0.5,
+            seed=0,
+            frame=dataset.observed,
+            recovery_dataset=dataset,
+        )
+        calibration_names = {item.name for item in calibration}
+        validation_names = {item.name for item in validation}
+        assert {"n0", "n1"} <= calibration_names or {
+            "n0",
+            "n1",
+        } <= validation_names
 
 
 def test_known_split_keeps_singleton_sum_balance_aliases_together():

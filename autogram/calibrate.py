@@ -551,6 +551,104 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
         if a != b:
             parent[b] = a
 
+    if (
+        recovery_dataset is not None
+        and hasattr(recovery_dataset, "name_model")
+    ):
+        from .dsl.binders import enumerate_bindings, resolve_ref
+
+        name_model = recovery_dataset.name_model
+        adapter = name_model.adapter
+        column_roles: dict[str, set[tuple[str, str]]] = {}
+        for binder in adapter.binders:
+            bindings = enumerate_bindings(binder, name_model)
+            for role in adapter.refs_for(binder):
+                for binding in bindings:
+                    column = resolve_ref(
+                        role,
+                        binder,
+                        binding,
+                        name_model,
+                    )
+                    if column is not None:
+                        column_roles.setdefault(column, set()).add(
+                            (binder, role)
+                        )
+
+        def abstract_column(value):
+            if not isinstance(value, str):
+                return value
+            roles = column_roles.get(value)
+            if roles:
+                return (
+                    "quantified_ref",
+                    tuple(sorted(roles)),
+                )
+            semantics = name_model.by_name.get(value)
+            if semantics is not None:
+                return (
+                    "quantified_semantics",
+                    semantics.kind,
+                    semantics.direction,
+                )
+            return value
+
+        def quantified_signature(value):
+            if isinstance(value, frozenset):
+                return frozenset(
+                    quantified_signature(item)
+                    for item in value
+                )
+            if isinstance(value, tuple):
+                if (
+                    len(value) == 3
+                    and value[0] == "one_sided"
+                ):
+                    return (
+                        "quantified_sign",
+                        abstract_column(value[1]),
+                        ">=" if value[2] in (">", ">=") else "<=",
+                    )
+                if (
+                    len(value) == 2
+                    and value[0] == "lag_bound"
+                ):
+                    column, steps, op = value[1]
+                    normalized_op = (
+                        ">=" if op in (">", ">=") else "<="
+                    )
+                    if (
+                        frame_satisfies(column, op)
+                        and lag_grounds(column, steps)
+                    ):
+                        return (
+                            "quantified_sign",
+                            abstract_column(column),
+                            normalized_op,
+                        )
+                    return (
+                        "quantified_lag_sign",
+                        abstract_column(column),
+                        int(steps),
+                        normalized_op,
+                    )
+                return tuple(
+                    quantified_signature(item)
+                    for item in value
+                )
+            return abstract_column(value)
+
+        quantified_groups = {}
+        for index, signature in enumerate(signatures):
+            if signature is None:
+                continue
+            key = quantified_signature(signature)
+            previous = quantified_groups.get(key)
+            if previous is None:
+                quantified_groups[key] = index
+            else:
+                union(previous, index)
+
     if recovery_dataset is not None and recovery_rules is not None:
         # A quantified rule is one recovery witness even though each binding emits a different
         # concrete-column signature. Every known relation that one candidate rule can recover must
@@ -1057,18 +1155,12 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
         search_cfg=scfg,
         name=f"{name}_split",
     )
-    split_rules = (
-        EnumerationProposer(_split_grammar).propose()
-        if hasattr(_split_grammar, "max_condition_values")
-        else ()
-    )
     calib, valid = _split_known(
         known,
         cfg.validation_frac,
         cfg.seed,
         frame=split_dataset.observed,
         recovery_dataset=split_dataset,
-        recovery_rules=split_rules,
     )
 
     # 1) proxy suite -- a caller-supplied regime is authoritative; otherwise it is derived from the
