@@ -755,6 +755,52 @@ def test_timeless_shard_is_absent_from_both_related_join_paths():
     assert np.allclose(streaming[1:], [60.0, 60.0])
 
 
+def test_timeless_only_consumer_is_ungradeable_on_both_join_paths():
+    derived, raw = _tables()
+    raw = raw.loc[raw["shard_id"] == "shard_000_0"].copy()
+    extra_derived = derived.copy()
+    extra_derived["consumer_id"] = "timeless_consumer"
+    extra_raw = raw.iloc[:3].copy()
+    extra_raw["consumer_id"] = "timeless_consumer"
+    extra_raw["shard_id"] = "timeless"
+    extra_raw["timestamp"] = pd.NaT
+    combined_derived = pd.concat(
+        [derived, extra_derived],
+        ignore_index=True,
+    )
+    combined_raw = pd.concat(
+        [raw, extra_raw],
+        ignore_index=True,
+    )
+
+    prepared = prepare_gtib(combined_derived, combined_raw)
+    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]
+    materialized = prepared[family].sum(
+        axis=1,
+        min_count=len(family),
+    ).to_numpy(dtype=float)
+    streaming_frame = prepared.drop(columns=family)
+    streaming_frame.attrs = prepared.attrs
+    dataset, _grammar = build_dataframe_grammar(
+        streaming_frame,
+        _base_spec(),
+        name="timeless_consumer",
+    )
+    streaming = eval_term(
+        A.RelatedAgg("raw_input_rate"),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+    extra = prepared["consumer_id"] == "timeless_consumer"
+
+    assert np.isnan(materialized[extra]).all()
+    assert np.isnan(streaming[extra]).all()
+
+
 def test_load_dataframe_accepts_csv_and_auto_prepares_gtib(tmp_path):
     derived, raw = _tables()
     derived_path = tmp_path / "timeseries_derived.csv"

@@ -1076,6 +1076,73 @@ def test_categorical_proxy_vocabulary_is_parameterized():
     }
 
 
+def test_known_categorical_recovery_requires_exact_full_mask():
+    n = 400
+    first = np.resize(
+        np.array([False, True, True, False]),
+        n,
+    )
+    second = np.resize(
+        np.array([False, True, False, True]),
+        n,
+    )
+    label = np.full(n, "normal", dtype=object)
+    label[second] = "second"
+    label[first] = "first"
+    label[200] = "wrong"
+    frame = _profile(pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=n,
+            freq="1min",
+        ),
+        "series_id": "a",
+        "is_first": first,
+        "is_second": second,
+        "label": label,
+    }))
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="inexact_categorical_known",
+    )
+    rule = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            target_column="label",
+            cases=(
+                ("is_first", "first"),
+                ("is_second", "second"),
+            ),
+            default="normal",
+        ),
+    )
+    evaluation = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(hold_rate_threshold=0.9),
+    ).evaluate(rule)
+    result = SimpleNamespace(
+        dataset=dataset,
+        portfolio=[evaluation],
+    )
+    known = KnownInvariant(
+        "category",
+        ":=",
+        "label",
+        {
+            "priority": [
+                {"when": "is_first", "value": "first"},
+                {"when": "is_second", "value": "second"},
+            ],
+            "default": "normal",
+        },
+    )
+
+    assert evaluation.accepted
+    assert evaluation.hold_rate < 1.0
+    assert recover_known(result, [known])["recall"] == 0.0
+
+
 def test_categorical_priority_requires_overlapping_cases():
     n = 120
     is_true_loss = np.resize(
@@ -1485,12 +1552,12 @@ def test_advanced_known_signatures_and_recovery_fields():
         recovery = score_recovery(result, planted)
     finally:
         validation.portfolio_relations = original
-    # Structural signatures alone no longer earn sustained/conjunction credit: the scorer requires
-    # an actual Evaluation whose predictions match the planted spans exactly. Dedicated live tests
-    # above cover that path; this mocked portfolio has no dataset/predictions, so credit stays zero.
+    # Structural signatures alone no longer earn exact-definition credit: the scorer requires an
+    # actual Evaluation whose predictions match the target mask. Dedicated live tests above cover
+    # that path; this mocked portfolio has no dataset/predictions, so all three stay zero.
     assert recovery.sustained == 0.0
     assert recovery.conjunction == 0.0
-    assert recovery.categorical == 1.0
+    assert recovery.categorical == 0.0
 
 
 def test_known_definition_matching_checks_fitted_threshold_value():

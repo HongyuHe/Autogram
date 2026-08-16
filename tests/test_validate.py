@@ -55,6 +55,39 @@ def test_runtime_null_covers_each_typed_condition_domain_when_product_is_too_lar
         }
 
 
+def test_runtime_null_preserves_joint_condition_support():
+    regime = np.array(
+        ["v0"] * 40
+        + ["v1"] * 10
+        + ["v2"] * 10
+        + ["v3"] * 10
+        + ["v4"] * 10,
+        dtype=object,
+    )
+    state = np.where(regime == "v0", "focus", "other")
+    adapter = SimpleNamespace(condition_columns={
+        "regime": ("v0", "v1", "v2", "v3", "v4"),
+        "state": ("focus", "other"),
+    })
+
+    context = V._runtime_condition_context(
+        adapter,
+        regime.size,
+        np.random.default_rng(0),
+        randomize=False,
+        source_context={
+            "regime": regime,
+            "state": state,
+        },
+    )
+
+    assert np.count_nonzero(context["regime"] == "v0") == 40
+    assert np.count_nonzero(
+        (context["regime"] == "v0")
+        & (context["state"] == "focus")
+    ) == 40
+
+
 def test_runtime_null_envelope_accounts_for_wide_family_products():
     width = 1024
     rows = 400
@@ -323,13 +356,14 @@ def test_runtime_null_selects_and_scores_presence_rules(rows, seed):
         seed=seed,
         rules=[rule],
     )
-    null = controls.null.ds.observed
+    assert controls.presence_null is not None
+    null = controls.presence_null.ds.observed
 
     assert controls.candidate_counts["equalities"] == 1
     assert 0 < np.count_nonzero(np.abs(null.col("x")) <= 1e-12) < rows
     assert 0 < np.count_nonzero(np.abs(null.col("y")) <= 1e-12) < rows
     assert V.null_equalities_at(
-        controls.null,
+        controls.presence_null,
         DiscoveryConfig(
             hold_rate_threshold=0.9,
             band_mode="global",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import numpy as np
 import pytest
 
 from autogram.config import DiscoveryConfig
@@ -592,6 +593,31 @@ def test_sum_balance_null_grammar_contains_sum_vs_sum_candidates():
         and isinstance(rule.atom.right, A.Agg)
         and rule.atom.left.kind == rule.atom.right.kind == "SUM"
         for rule in suite.null.proposer.propose()
+    )
+
+
+def test_presence_proxy_null_has_balanced_independent_absence_masks():
+    suite = prepare_proxy_suite(
+        RegimeSpec(entries=[
+            ProxyEntry(
+                "presence_pair",
+                noise=0.0,
+                n_entities=3,
+                n_snapshots=80,
+            ),
+        ]),
+        seed=0,
+        inducer=_SyntheticInducer(),
+    )
+    assert suite.presence_null is not None
+    matrix = suite.presence_null.ds.observed.matrix
+    absent = np.abs(matrix) <= 1e-12
+
+    assert np.all(absent.sum(axis=0) == matrix.shape[0] // 2)
+    assert any(
+        not np.array_equal(absent[:, left], absent[:, right])
+        for left in range(matrix.shape[1])
+        for right in range(left + 1, matrix.shape[1])
     )
 
 

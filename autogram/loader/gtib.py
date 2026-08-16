@@ -658,6 +658,7 @@ def _materialize_raw(
         for consumer_key, shard_key in group_order
     }
     safe_group_names = unique_group_names(group_order, preferred_group_names)
+    active_groups = set()
 
     for consumer_key, shard_key in group_order:
         group = child.iloc[groups[(consumer_key, shard_key)]]
@@ -677,6 +678,7 @@ def _materialize_raw(
         present = group_times != nat_ns
         if not np.any(present):
             continue
+        active_groups.add((consumer_key, shard_key))
         group = group.loc[present].copy()
         group_times = group_times[present]
         group["_minute_index"] = np.asarray(
@@ -832,7 +834,7 @@ def _materialize_raw(
     # zero, while the streaming join correctly returns NaN because it finds no child partitions.
     raw_consumers = {
         consumer_key
-        for consumer_key, _shard_key in groups
+        for consumer_key, _shard_key in active_groups
     }
     for consumer_key in set(own_rows) - raw_consumers:
         rows = own_rows[consumer_key]

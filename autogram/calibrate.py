@@ -1118,6 +1118,18 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
                         runtime_nulls.null,
                         dcfg,
                         cfg.seed,
+                    ) + (
+                        null_equalities_at(
+                            runtime_nulls.presence_null,
+                            dcfg,
+                            cfg.seed,
+                        )
+                        if getattr(
+                            runtime_nulls,
+                            "presence_null",
+                            None,
+                        ) is not None
+                        else 0
                     ),
                     null_temporal_at(
                         runtime_nulls.temporal_null,

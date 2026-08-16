@@ -6,7 +6,7 @@ same pipeline on CrossCheck DataFrames without reading clean frames or a target-
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import itertools
 import math
 import numbers
@@ -464,10 +464,15 @@ def portfolio_relations(
     for ev in result.portfolio:
         if (
             require_exact_definition_masks
-            and isinstance(ev.rule.atom, A.BooleanDefinition)
-            and isinstance(
-                ev.rule.atom.predicate,
-                (A.Sustained, A.Conjunction),
+            and (
+                isinstance(ev.rule.atom, A.CategoryDefinition)
+                or (
+                    isinstance(ev.rule.atom, A.BooleanDefinition)
+                    and isinstance(
+                        ev.rule.atom.predicate,
+                        (A.Sustained, A.Conjunction),
+                    )
+                )
             )
             and not _definition_matches_planted_mask(ev, result)
         ):
@@ -698,13 +703,57 @@ def relation_signature_matches(expected, actual) -> bool:
 
 
 def _definition_matches_planted_mask(evaluation, result) -> bool:
-    """Whether one sustained/conjunction rule reproduces its full planted Boolean mask."""
-    from .evaluate import _boolean_population, _learned_bounds
+    """Whether one exact definition reproduces its full gradeable target mask."""
+    from .evaluate import (
+        _boolean_population,
+        _condition_mask,
+        _learned_bounds,
+        _typed_equal_array,
+    )
 
     rule = evaluation.rule
-    if not isinstance(rule.atom, A.BooleanDefinition):
-        return False
-    if not isinstance(rule.atom.predicate, (A.Sustained, A.Conjunction)):
+    if isinstance(rule.atom, A.CategoryDefinition):
+        frame = result.dataset.observed
+        atom = rule.atom
+        if atom.target_column not in frame.row_context:
+            return False
+        target = np.asarray(
+            frame.row_context[atom.target_column],
+            dtype=object,
+        )
+        valid = ~pd.isna(target)
+        if rule.condition is not None:
+            condition = _condition_mask(rule.condition, frame)
+            if condition is None:
+                return False
+            valid &= condition
+        predicted = np.full(target.size, atom.default, dtype=object)
+        case_masks = []
+        for column, value in atom.cases:
+            if column not in frame.row_context:
+                return False
+            raw = np.asarray(frame.row_context[column], dtype=object)
+            present = ~pd.isna(raw)
+            active = np.zeros(target.size, dtype=bool)
+            active[present] = raw[present].astype(bool)
+            valid &= present
+            case_masks.append((active, value))
+        for active, value in reversed(case_masks):
+            predicted[active] = value
+        return bool(
+            np.any(valid)
+            and np.all(_typed_equal_array(
+                target[valid],
+                predicted[valid],
+            ))
+        )
+    if (
+        not isinstance(rule.atom, A.BooleanDefinition)
+        or not isinstance(
+            rule.atom.predicate,
+            (A.Sustained, A.Conjunction),
+        )
+    ):
         return False
     reported = dict(
         getattr(evaluation, "parameters", {}).get("thresholds", {})
@@ -777,7 +826,10 @@ def score_recovery(result: DiscoveryResult, planted: dict, frac: float = 0.8) ->
         exact_definition_relations,
         "conjunction_definition",
     )
-    categorical_found = _payloads(rels, "categorical_definition")
+    categorical_found = _payloads(
+        exact_definition_relations,
+        "categorical_definition",
+    )
     healthy_band_found = _payloads(rels, "healthy_band")
     conditional_band_found = _conditionals(rels, "healthy_band")
 
@@ -1113,6 +1165,7 @@ class ProxySuite:
     """The selected positive proxies plus the always-on null control, each prepared once."""
     positives: List[PreparedProxy]
     null: PreparedProxy
+    presence_null: Optional[PreparedProxy] = None
     temporal_null: Optional[PreparedProxy] = None
     definition_null: Optional[PreparedProxy] = None
     candidate_counts: dict[str, int] = field(default_factory=dict)
@@ -1187,6 +1240,25 @@ def _balanced_null_numeric(
         generated = magnitudes * signs
     output[positions] = generated
     return output
+
+
+def _presence_masked(values, rng) -> np.ndarray:
+    generated = np.asarray(values, dtype=float).copy()
+    finite_positions = np.flatnonzero(np.isfinite(generated))
+    if finite_positions.size >= 2:
+        absent_count = finite_positions.size // 2
+        absent = rng.choice(
+            finite_positions,
+            size=absent_count,
+            replace=False,
+        )
+        absent_sign = np.where(
+            np.signbit(generated[absent]),
+            -1.0,
+            1.0,
+        )
+        generated[absent] = absent_sign * 1e-12
+    return generated
 
 
 def _runtime_relation_null(
@@ -1436,6 +1508,7 @@ def _runtime_condition_context(
     *,
     randomize: bool,
     group_identities=None,
+    source_context=None,
 ) -> dict[str, np.ndarray]:
     domains = {
         name: tuple(values)
@@ -1446,6 +1519,14 @@ def _runtime_condition_context(
         ).items()
         if values
     }
+    if (
+        source_context is not None
+        and all(name in source_context for name in domains)
+    ):
+        return {
+            name: _typed_object_array(source_context[name]).copy()
+            for name in domains
+        }
     ordered = sorted(
         domains,
         key=lambda name: (
@@ -1550,19 +1631,7 @@ def _runtime_null_dataset(
             magnitude_ceiling=magnitude_ceiling,
         )
         if presence_masks and not binary:
-            generated = generated.copy()
-            finite_positions = np.flatnonzero(np.isfinite(generated))
-            if finite_positions.size >= 2:
-                absent_count = min(
-                    finite_positions.size - 1,
-                    max(1, int(round(0.25 * finite_positions.size))),
-                )
-                absent = rng.choice(
-                    finite_positions,
-                    size=absent_count,
-                    replace=False,
-                )
-                generated[absent] = 1e-12
+            generated = _presence_masked(generated, rng)
         matrix[:, index] = generated
         generated_columns[name] = generated
 
@@ -1585,6 +1654,7 @@ def _runtime_null_dataset(
         rng,
         randomize=definition_targets,
         group_identities=group_identities,
+        source_context=dataset.observed.row_context,
     )
     templates = tuple(
         getattr(adapter, "related_templates", {}).values()
@@ -1733,6 +1803,17 @@ def prepare_runtime_null_controls(
         rule for rule in all_rules
         if _is_null_equality_candidate(rule)
     ]
+    presence_rules = [
+        rule
+        for rule in equality_rules
+        if isinstance(rule.atom, A.Compare)
+        and rule.atom.op == "<|>"
+    ]
+    ordinary_equality_rules = [
+        rule
+        for rule in equality_rules
+        if rule not in presence_rules
+    ]
     temporal_rules = [
         rule for rule in all_rules
         if _rule_has_temporal(rule)
@@ -1749,18 +1830,22 @@ def prepare_runtime_null_controls(
         grammar,
         all_rules,
     )
-    presence_masks = any(
-        isinstance(rule.atom, A.Compare)
-        and rule.atom.op == "<|>"
-        for rule in equality_rules
-    )
-
     equality_dataset = _runtime_null_dataset(
         dataset,
         seed=seed + 10_001,
         definition_targets=False,
         magnitude_ceiling=magnitude_ceiling,
-        presence_masks=presence_masks,
+    )
+    presence_dataset = (
+        _runtime_null_dataset(
+            dataset,
+            seed=seed + 40_009,
+            definition_targets=False,
+            magnitude_ceiling=magnitude_ceiling,
+            presence_masks=True,
+        )
+        if presence_rules
+        else None
     )
     temporal_dataset = (
         _runtime_null_dataset(
@@ -1789,8 +1874,20 @@ def prepare_runtime_null_controls(
             equality_dataset,
             grammar,
             {},
-            _PreparedRuleProposer(grammar, equality_rules),
+            _PreparedRuleProposer(grammar, ordinary_equality_rules),
             search_cfg,
+        ),
+        presence_null=(
+            PreparedProxy(
+                "runtime_presence_null",
+                presence_dataset,
+                grammar,
+                {},
+                _PreparedRuleProposer(grammar, presence_rules),
+                search_cfg,
+            )
+            if presence_dataset is not None
+            else None
         ),
         temporal_null=(
             PreparedProxy(
@@ -1921,6 +2018,41 @@ def prepare_proxy_suite(regime, seed: int = 0,
         }
     ):
         _enable_shape_capabilities(nG, shape, nds)
+    presence_rules_by_signature = {
+        rule.signature(): rule
+        for rule in EnumerationProposer(nG)._candidate_rules()
+        if isinstance(rule.atom, A.Compare)
+        and rule.atom.op == "<|>"
+    }
+    presence_rules = list(
+        presence_rules_by_signature.values()
+    )
+    presence_null = None
+    if "presence_pair" in control_shapes and presence_rules:
+        pdata = replace(ndata, matrix=ndata.matrix.copy())
+        presence_rng = np.random.default_rng(int(seed) + 40_009)
+        for column in range(pdata.matrix.shape[1]):
+            pdata.matrix[:, column] = _presence_masked(
+                pdata.matrix[:, column],
+                presence_rng,
+            )
+        pds, pG, _pspec = prepare_columns(
+            pdata.columns,
+            pdata.matrix,
+            inducer=inducer,
+            search_cfg=null_search_cfg,
+            name="presence_null_proxy",
+            timestamps=pdata.timestamps,
+        )
+        _attach_proxy_context(pds, pdata)
+        presence_null = PreparedProxy(
+            "presence_null",
+            pds,
+            pG,
+            {},
+            _PreparedRuleProposer(pG, presence_rules),
+            null_search_cfg,
+        )
     temporal_null = None
     temporal_shapes = {
         "monotone",
@@ -2015,13 +2147,20 @@ def prepare_proxy_suite(regime, seed: int = 0,
             EnumerationProposer(nG),
             null_search_cfg,
         ),
+        presence_null=presence_null,
         temporal_null=temporal_null,
         definition_null=definition_null,
     )
 
 
-def null_equalities_at(prepared_null: PreparedProxy, dcfg: DiscoveryConfig, seed: int = 0) -> int:
+def null_equalities_at(
+    prepared_null: PreparedProxy | None,
+    dcfg: DiscoveryConfig,
+    seed: int = 0,
+) -> int:
     """Count algebraic, one-sided, or fitted-band laws accepted on the random null."""
+    if prepared_null is None:
+        return 0
     res = run_prepared(prepared_null.ds, prepared_null.G, discovery_cfg=dcfg,
                        search_cfg=prepared_null.search_cfg or _small_search(seed),
                        proposer=prepared_null.proposer)
@@ -2121,7 +2260,14 @@ def evaluate_grid_candidate(suite: ProxySuite, tolerance: float, hold_rate_thres
         tolerance,
         hold_rate_threshold,
         proxies,
-        null_equalities_at(suite.null, ndcfg, seed),
+        (
+            null_equalities_at(suite.null, ndcfg, seed)
+            + null_equalities_at(
+                getattr(suite, "presence_null", None),
+                ndcfg,
+                seed,
+            )
+        ),
         null_temporal_at(getattr(suite, "temporal_null", None), ndcfg, seed),
         null_definitions_at(getattr(suite, "definition_null", None), ndcfg, seed),
     )
@@ -2832,6 +2978,10 @@ def run_all(seed: int = 0) -> dict:
         "runtime_recovery": tuned["runtime_recovery"],
         "null_equalities_accepted": null_equalities_at(
             null_suite.null,
+            null_config,
+            seed,
+        ) + null_equalities_at(
+            getattr(null_suite, "presence_null", None),
             null_config,
             seed,
         ),
