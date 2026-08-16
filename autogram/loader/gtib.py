@@ -675,6 +675,8 @@ def _materialize_raw(
             group["timestamp"].to_numpy()
         )
         present = group_times != nat_ns
+        if not np.any(present):
+            continue
         group = group.loc[present].copy()
         group_times = group_times[present]
         group["_minute_index"] = np.asarray(

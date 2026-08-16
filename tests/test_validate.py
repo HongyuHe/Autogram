@@ -148,7 +148,6 @@ def test_runtime_null_envelope_accounts_for_wide_family_products():
             ),
         ),
     )
-
     assert ground(
         rule,
         dataset.observed,
@@ -219,7 +218,7 @@ def test_runtime_null_normalizes_tiny_division_denominators():
     )
     grammar = Grammar(
         binders=("record",),
-        ops=("==",),
+        ops=("==", "<|>"),
         ref_roles={
             "record": ("num", "den", "target"),
         },
@@ -235,6 +234,10 @@ def test_runtime_null_normalizes_tiny_division_denominators():
             A.Div(A.Ref("num"), A.Ref("den")),
         ),
     )
+    presence_rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("num"), "<|>", A.Ref("den")),
+    )
 
     real = ground(
         rule,
@@ -246,7 +249,7 @@ def test_runtime_null_normalizes_tiny_division_denominators():
         grammar,
         SearchConfig(seed=0),
         seed=0,
-        rules=[rule],
+        rules=[rule, presence_rule],
     )
     null = ground(
         rule,
@@ -260,8 +263,11 @@ def test_runtime_null_normalizes_tiny_division_denominators():
     assert null.graded_points == rows
 
 
-def test_runtime_null_selects_and_scores_presence_rules():
-    rows = 401
+@pytest.mark.parametrize(
+    ("rows", "seed"),
+    [(401, 0), (10, 1230)],
+)
+def test_runtime_null_selects_and_scores_presence_rules(rows, seed):
     frame = pd.DataFrame({
         "x": np.linspace(1.0, 2.0, rows),
         "y": np.linspace(2.0, 3.0, rows),
@@ -314,14 +320,14 @@ def test_runtime_null_selects_and_scores_presence_rules():
         dataset,
         grammar,
         SearchConfig(seed=0),
-        seed=0,
+        seed=seed,
         rules=[rule],
     )
     null = controls.null.ds.observed
 
     assert controls.candidate_counts["equalities"] == 1
-    assert 0 < np.count_nonzero(null.col("x") == 0.0) < rows
-    assert 0 < np.count_nonzero(null.col("y") == 0.0) < rows
+    assert 0 < np.count_nonzero(np.abs(null.col("x")) <= 1e-12) < rows
+    assert 0 < np.count_nonzero(np.abs(null.col("y")) <= 1e-12) < rows
     assert V.null_equalities_at(
         controls.null,
         DiscoveryConfig(

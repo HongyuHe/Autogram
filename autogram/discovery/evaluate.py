@@ -108,6 +108,13 @@ def _finite_ulp(values: np.ndarray) -> np.ndarray:
     return np.where(np.isfinite(spacing), spacing, inward)
 
 
+def _positive_scale_floor(values: np.ndarray) -> float:
+    return max(
+        1e-6 * (robust_median(values) if values.size else 1.0),
+        float(np.nextafter(0.0, 1.0)),
+    )
+
+
 def _group_labels(frame, name_model, row_indices=None):
     keys = tuple(
         getattr(
@@ -590,7 +597,7 @@ class DataOnlyEvaluator:
                 if support_rejection is not None:
                     return support_rejection
             positive = scale[scale > 0]
-            floor = 1e-6 * (robust_median(positive) if positive.size else 1.0)
+            floor = _positive_scale_floor(positive)
             scale = np.maximum(scale, floor)
             parameters = {
                 "coefficient": float(robust_median(np.asarray(list(coefficients.values()), dtype=float))),
@@ -1422,7 +1429,7 @@ class DataOnlyEvaluator:
         observed = population[evaluation_mask]
         scale = np.maximum(np.abs(observed), abs(center))
         positive = scale[scale > 0]
-        floor = 1e-6 * (robust_median(positive) if positive.size else 1.0)
+        floor = _positive_scale_floor(positive)
         scale = np.maximum(scale, floor)
         with np.errstate(over="ignore", invalid="ignore"):
             relative = np.abs(observed - center) / scale

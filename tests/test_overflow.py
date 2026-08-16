@@ -548,6 +548,33 @@ def test_band_definition_support_reports_the_graded_population():
     assert abs(result.support - 0.1) < 1e-9
 
 
+def test_fixed_zero_band_handles_zero_and_subnormal_scales():
+    minimum = np.nextafter(0.0, 1.0)
+    values = np.concatenate((
+        np.zeros(396),
+        np.full(4, minimum),
+    ))
+    dataset = _dataset(
+        pd.DataFrame({"x": values}),
+        "subnormal_fixed_band",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.05,
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.BandDefinition(A.Ref("x"), 0.0),
+    ))
+
+    assert result.accepted
+    assert result.hold_rate == pytest.approx(0.99)
+
+
 def test_null_control_magnitudes_stay_finite_at_ceiling_scale():
     """Round-29 review: a finite median was not enough to keep the null control finite.
 

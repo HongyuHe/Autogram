@@ -719,6 +719,42 @@ def test_materialized_boundary_treats_pdna_as_missing():
     assert values.iloc[2] == 17.0
 
 
+def test_timeless_shard_is_absent_from_both_related_join_paths():
+    derived, raw = _tables()
+    raw = raw.loc[raw["shard_id"] == "shard_000_0"].copy()
+    timeless = raw.iloc[:3].copy()
+    timeless["shard_id"] = "timeless"
+    timeless["timestamp"] = pd.NaT
+    combined = pd.concat([raw, timeless], ignore_index=True)
+
+    prepared = prepare_gtib(derived, combined)
+    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]
+    materialized = prepared[family].sum(
+        axis=1,
+        min_count=len(family),
+    ).to_numpy(dtype=float)
+    streaming_frame = prepared.drop(columns=family)
+    streaming_frame.attrs = prepared.attrs
+    dataset, _grammar = build_dataframe_grammar(
+        streaming_frame,
+        _base_spec(),
+        name="timeless_shard",
+    )
+    streaming = eval_term(
+        A.RelatedAgg("raw_input_rate"),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert len(family) == 1
+    assert np.array_equal(materialized, streaming, equal_nan=True)
+    assert np.allclose(streaming[1:], [60.0, 60.0])
+
+
 def test_load_dataframe_accepts_csv_and_auto_prepares_gtib(tmp_path):
     derived, raw = _tables()
     derived_path = tmp_path / "timeseries_derived.csv"

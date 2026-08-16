@@ -1552,8 +1552,17 @@ def _runtime_null_dataset(
         if presence_masks and not binary:
             generated = generated.copy()
             finite_positions = np.flatnonzero(np.isfinite(generated))
-            absent = rng.random(finite_positions.size) < 0.25
-            generated[finite_positions[absent]] = 0.0
+            if finite_positions.size >= 2:
+                absent_count = min(
+                    finite_positions.size - 1,
+                    max(1, int(round(0.25 * finite_positions.size))),
+                )
+                absent = rng.choice(
+                    finite_positions,
+                    size=absent_count,
+                    replace=False,
+                )
+                generated[absent] = 1e-12
         matrix[:, index] = generated
         generated_columns[name] = generated
 
