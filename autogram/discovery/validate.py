@@ -1234,8 +1234,6 @@ def _balanced_null_numeric(
             magnitudes = scale * multipliers
         signs = np.ones(positions.size, dtype=float)
         signs[:positions.size // 2] = -1.0
-        if positions.size % 2:
-            signs[-1] = 0.0
         rng.shuffle(signs)
         generated = magnitudes * signs
     output[positions] = generated

@@ -45,7 +45,8 @@ from .discovery.regime import RegimeSpec, abstract_from_shapes
 from .discovery.subagent import HARNESSES, configured_harness
 from .discovery.validate import (
     CalibrationGridError, null_definitions_at, null_equalities_at, null_temporal_at,
-    prepare_proxy_suite, prepare_runtime_null_controls, relation_signature_matches, tune_joint,
+    prepare_proxy_suite, prepare_runtime_null_controls, relation_signature_matches, rule_relations,
+    tune_joint,
 )
 from .schema.adapter import decode_observed_cell
 from .schema.compiler import compile_spec
@@ -377,7 +378,7 @@ def _validate_split_inputs(known: List[KnownInvariant], frac: float) -> None:
 
 def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                  frame=None, zero_tol: float = 1e-4,
-                 recovery_dataset=None):
+                 recovery_dataset=None, recovery_rules=None):
     """Partition known invariants into a calibration set and a structurally disjoint validation set.
 
     The split is by *recovery equivalence*, not by list position and not by exact signature. Two
@@ -549,6 +550,97 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
         a, b = find(left), find(right)
         if a != b:
             parent[b] = a
+
+    if recovery_dataset is not None and recovery_rules is not None:
+        # A quantified rule is one recovery witness even though each binding emits a different
+        # concrete-column signature. Every known relation that one candidate rule can recover must
+        # stay on the same side of the split, or calibration on one binding predetermines held-out
+        # recall on another.
+        for rule in recovery_rules:
+            relations = set(rule_relations(
+                rule,
+                recovery_dataset,
+            ))
+            from .dsl import ast as A
+            from .dsl.binders import (
+                enumerate_bindings,
+                resolve_ref,
+            )
+
+            atom = rule.atom
+            if (
+                rule.condition is None
+                and isinstance(atom, A.Compare)
+                and atom.op in (">=", "<=", ">", "<")
+            ):
+                reverse = {
+                    ">=": "<=",
+                    "<=": ">=",
+                    ">": "<",
+                    "<": ">",
+                }
+                for measured, zero, op in (
+                    (atom.left, atom.right, atom.op),
+                    (atom.right, atom.left, reverse[atom.op]),
+                ):
+                    if not (
+                        isinstance(measured, A.Ref)
+                        and isinstance(zero, A.Const)
+                        and float(zero.value) == 0.0
+                    ):
+                        continue
+                    known_op = {
+                        ">": ">=",
+                        "<": "<=",
+                    }.get(op, op)
+                    for binding in enumerate_bindings(
+                        rule.binder,
+                        recovery_dataset.name_model,
+                    ):
+                        column = resolve_ref(
+                            measured.role,
+                            rule.binder,
+                            binding,
+                            recovery_dataset.name_model,
+                        )
+                        if column is not None:
+                            relations.add((
+                                "one_sided",
+                                column,
+                                known_op,
+                            ))
+            if not relations:
+                continue
+            learned_by_tolerance = {
+                exact: [
+                    sum_balance_recovery_alias(
+                        _known_canonicalize(
+                            relation,
+                            frame,
+                            zero_tol,
+                            exact=exact,
+                        )
+                    )
+                    for relation in relations
+                ]
+                for exact in (False, True)
+            }
+            matched = []
+            for index, candidates in enumerate(expansions):
+                if candidates is None:
+                    continue
+                exact = _known_is_exact(signatures[index])
+                if any(
+                    relation_signature_matches(
+                        sum_balance_recovery_alias(candidate),
+                        learned,
+                    )
+                    for candidate in candidates
+                    for learned in learned_by_tolerance[exact]
+                ):
+                    matched.append(index)
+            for index in matched[1:]:
+                union(matched[0], index)
 
     for i in range(len(known)):
         if expansions[i] is None:
@@ -965,12 +1057,18 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
         search_cfg=scfg,
         name=f"{name}_split",
     )
+    split_rules = (
+        EnumerationProposer(_split_grammar).propose()
+        if hasattr(_split_grammar, "max_condition_values")
+        else ()
+    )
     calib, valid = _split_known(
         known,
         cfg.validation_frac,
         cfg.seed,
         frame=split_dataset.observed,
         recovery_dataset=split_dataset,
+        recovery_rules=split_rules,
     )
 
     # 1) proxy suite -- a caller-supplied regime is authoritative; otherwise it is derived from the

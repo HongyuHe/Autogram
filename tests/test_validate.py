@@ -232,7 +232,7 @@ def test_runtime_null_envelope_accounts_for_wide_family_products():
 
 
 def test_runtime_null_normalizes_tiny_division_denominators():
-    rows = 400
+    rows = 401
     numerator = np.full(rows, 1e-10)
     denominator = np.full(rows, 1e-318)
     target = numerator / denominator
@@ -312,7 +312,7 @@ def test_runtime_null_normalizes_tiny_division_denominators():
         seed=0,
         rules=[rule, presence_rule],
     )
-    null = ground(
+    null_grounded = ground(
         rule,
         controls.null.ds.observed,
         controls.null.ds.name_model,
@@ -320,8 +320,11 @@ def test_runtime_null_normalizes_tiny_division_denominators():
 
     assert real.overflow_points == 0
     assert real.graded_points == rows
-    assert null.overflow_points == 0
-    assert null.graded_points == rows
+    assert null_grounded.overflow_points == 0
+    assert null_grounded.graded_points == rows
+    assert not np.any(
+        controls.null.ds.observed.col("den") == 0.0
+    )
 
 
 @pytest.mark.parametrize(
@@ -388,8 +391,8 @@ def test_runtime_null_selects_and_scores_presence_rules(rows, seed):
     null = controls.presence_null.ds.observed
 
     assert controls.candidate_counts["equalities"] == 1
-    assert 0 < np.count_nonzero(np.abs(null.col("x")) <= 1e-12) < rows
-    assert 0 < np.count_nonzero(np.abs(null.col("y")) <= 1e-12) < rows
+    assert np.count_nonzero(np.abs(null.col("x")) <= 1e-12) == rows // 2
+    assert np.count_nonzero(np.abs(null.col("y")) <= 1e-12) == rows // 2
     assert V.null_equalities_at(
         controls.presence_null,
         DiscoveryConfig(

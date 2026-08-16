@@ -21,7 +21,10 @@ from autogram.discovery.known import _signature as _known_signature
 from autogram.discovery.induce import SchemaInducer
 from autogram.discovery.loop import build_dataframe_grammar
 from autogram.discovery.regime import ProxyEntry, RegimeSpec
+from autogram.dsl import ast as A
 from autogram.loader.gtib import profile_dataframe
+from autogram.loader.loader import build_dataset
+from autogram.schema.compiler import compile_spec
 from autogram.schema.spec import (
     CellCodec, ColumnPattern, FamilySelector, GrammarSpec, RefTemplate, RelatedTemplate,
     RoleOntology,
@@ -986,6 +989,84 @@ def test_known_split_does_not_merge_nonstrict_lag_on_mixed_sign_data():
     names = {item.name for item in calibration}
 
     assert ("atomic" in names) != ("lag" in names)
+
+
+def test_known_split_keeps_bindings_of_one_quantified_rule_together():
+    frame = profile_dataframe(pd.DataFrame({
+        "metric_n0_source": np.arange(1.0, 81.0),
+        "metric_n1_source": np.arange(2.0, 82.0),
+    }))
+    spec = GrammarSpec(
+        name="quantified-split",
+        patterns=(
+            ColumnPattern(
+                name="measurement",
+                matcher="regex",
+                kind="measurement",
+                direction="source",
+                regex=r"^metric_(?P<source>n\d+)_source$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("node",),
+            ref_roles={"node": ("measurement_source",)},
+            fam_roles={"node": ()},
+        ),
+        ref_templates=(
+            RefTemplate(
+                "node",
+                "measurement_source",
+                "metric_{X}_source",
+            ),
+        ),
+        family_selectors=(),
+        binder_enumerate={"node": "per_node"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    dataset = build_dataset(
+        frame.columns,
+        frame.to_numpy(dtype=float),
+        compile_spec(spec),
+        name="quantified_split",
+        timestamps=np.arange(len(frame)),
+    )
+    known = [
+        KnownInvariant("n0", ">=", "metric_n0_source", 0),
+        KnownInvariant("n1", ">=", "metric_n1_source", 0),
+        KnownInvariant(
+            "other",
+            "==",
+            "metric_n0_source",
+            "metric_n1_source",
+        ),
+    ]
+    rule = A.Rule(
+        "node",
+        A.Compare(
+            A.Ref("measurement_source"),
+            ">=",
+            A.Const(0),
+        ),
+    )
+
+    calibration, validation = _split_known(
+        known,
+        frac=0.5,
+        seed=0,
+        frame=dataset.observed,
+        recovery_dataset=dataset,
+        recovery_rules=[rule],
+    )
+    calibration_names = {item.name for item in calibration}
+    validation_names = {item.name for item in validation}
+
+    assert {"n0", "n1"} <= calibration_names or {
+        "n0",
+        "n1",
+    } <= validation_names
 
 
 def test_known_split_keeps_singleton_sum_balance_aliases_together():
