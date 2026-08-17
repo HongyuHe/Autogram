@@ -312,6 +312,16 @@ def test_term_cache_charges_both_members_of_a_cached_pair():
     assert 0 < len(cache) <= 8
 
 
+def test_term_cache_skips_single_oversized_value():
+    cache = TermCache(max_entries=8, max_bytes=100)
+    value = np.ones(20, dtype=float)
+
+    cache["oversized"] = value
+
+    assert "oversized" not in cache
+    assert len(cache) == 0
+
+
 def _definition_dataset(name: str):
     """A Boolean target defined by a ratio whose denominator underflows on most rows.
 

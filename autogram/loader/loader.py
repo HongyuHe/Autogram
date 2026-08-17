@@ -52,10 +52,13 @@ class TermCache:
         return value
 
     def __setitem__(self, key, value) -> None:
+        value_size = self._size(value)
+        if value_size > self.max_bytes:
+            return
         if key in self._data:
             self.total_bytes -= self._size(self._data.pop(key))
         self._data[key] = value
-        self.total_bytes += self._size(value)
+        self.total_bytes += value_size
         while (
             len(self._data) > self.max_entries
             or self.total_bytes > self.max_bytes

@@ -12,6 +12,7 @@ tolerance band, reads the operating coverage, and runs the acceptance tests.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import numbers
 from dataclasses import dataclass
@@ -375,9 +376,11 @@ def _time_vector(frame: Frame, time_index: str) -> np.ndarray:
     """Return checked nanoseconds so ordering and cadence share one interpretation."""
     key = ("time_vector", time_index)
     if key not in frame.temporal_cache:
-        frame.temporal_cache[key] = _datetime_ns(
+        computed = _datetime_ns(
             frame.row_context[time_index]
         )
+        frame.temporal_cache[key] = computed
+        return computed
     return frame.temporal_cache[key]
 
 
@@ -600,7 +603,10 @@ def _consecutive_window_ends(
     cache_key = (
         "consecutive",
         time_index,
-        id(rows),
+        hashlib.blake2b(
+            np.asarray(rows, dtype=np.int64).tobytes(),
+            digest_size=16,
+        ).digest(),
         int(window),
     )
     if cache_key in frame.temporal_cache:

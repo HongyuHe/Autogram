@@ -252,6 +252,51 @@ def test_nat_timestamp_cannot_complete_a_temporal_window():
     assert np.isnan(lagged[2])
 
 
+def test_consecutive_window_cache_uses_stable_row_content():
+    frame = _profile(pd.DataFrame({
+        "timestamp": pd.to_datetime([
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:01:00",
+            "2026-01-01 00:02:00",
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:01:00",
+            "2026-01-01 00:10:00",
+        ]),
+        "series_id": ["a"] * 3 + ["b"] * 3,
+        "x": np.arange(6.0),
+    }))
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="stable_temporal_cache_key",
+    )
+    first = np.array([0, 1, 2], dtype=int)
+    second = np.array([3, 4, 5], dtype=int)
+
+    contiguous = _consecutive_window_ends(
+        dataset.observed,
+        dataset.name_model,
+        first,
+        2,
+    )
+    gapped = _consecutive_window_ends(
+        dataset.observed,
+        dataset.name_model,
+        second,
+        2,
+    )
+    repeated = _consecutive_window_ends(
+        dataset.observed,
+        dataset.name_model,
+        first.copy(),
+        2,
+    )
+
+    assert contiguous.tolist() == [False, True, True]
+    assert gapped.tolist() == [False, True, False]
+    assert np.array_equal(repeated, contiguous)
+
+
 def test_temporal_cadence_rejects_wide_unit_timestamp_wrap():
     timestamps = np.array(
         [
