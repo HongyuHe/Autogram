@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from .config import EmulatorConfig
+from .deriver import derive_consumer, trajectory_alert
 
 
 @dataclass
@@ -93,6 +94,79 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
     results.append(_hard(
         "derived_rates_non_negative", neg_rates == 0,
         f"{neg_rates} negative derived rate values (should be 0)."))
+
+    # -- Hard: every emitted derived identity is reproducible ----------------
+    derived_bad = 0
+    static_bad = 0
+    trajectory_bad = 0
+    label_bad = 0
+    for rec in records:
+        frame = rec["frame"]
+        expected = derive_consumer(
+            cfg,
+            rec["consumer"],
+            rec["obs"],
+            rec["phys"],
+        )
+        for column in (
+            "input_rate_bytes_per_min",
+            "output_rate_bytes_per_min",
+            "completeness_ratio",
+            "completeness_ratio_1h",
+            "backlog_bytes",
+            "cum_lost_bytes",
+        ):
+            if not np.allclose(
+                frame[column].to_numpy(dtype=float),
+                expected[column].to_numpy(dtype=float),
+                rtol=1e-12,
+                atol=1e-9,
+                equal_nan=True,
+            ):
+                derived_bad += 1
+        static_bad += int(np.count_nonzero(
+            frame["static_alert"].to_numpy(dtype=bool)
+            != expected["static_alert"].to_numpy(dtype=bool)
+        ))
+        trajectory_bad += int(np.count_nonzero(
+            frame["traj_alert"].to_numpy(dtype=bool)
+            != trajectory_alert(cfg, frame)
+        ))
+        true_loss = frame["is_true_loss"].to_numpy(dtype=bool)
+        benign = frame["is_benign_burst"].to_numpy(dtype=bool)
+        artifact = frame["is_artifact"].to_numpy(dtype=bool)
+        expected_label = np.full(len(frame), "normal", dtype=object)
+        expected_label[artifact] = "artifact"
+        expected_label[benign] = "benign_burst"
+        expected_label[true_loss] = "true_loss"
+        label_bad += int(np.count_nonzero(
+            frame["label"].to_numpy(dtype=object) != expected_label
+        ))
+        label_bad += int(np.count_nonzero(
+            frame["oracle_alert"].to_numpy(dtype=bool) != true_loss
+        ))
+    results.extend((
+        _hard(
+            "derived_signal_identities",
+            derived_bad == 0,
+            f"{derived_bad} emitted derived columns disagree with re-derivation.",
+        ),
+        _hard(
+            "static_alert_definition",
+            static_bad == 0,
+            f"{static_bad} static-alert rows disagree with the sustained rule.",
+        ),
+        _hard(
+            "trajectory_alert_definition",
+            trajectory_bad == 0,
+            f"{trajectory_bad} trajectory-alert rows disagree with the target rule.",
+        ),
+        _hard(
+            "label_priority_definition",
+            label_bad == 0,
+            f"{label_bad} label/oracle rows disagree with priority identities.",
+        ),
+    ))
 
     # -- Soft: normal-operation ratio sits in the healthy band ---------------
     # Scoped to STEADY consumers and the *instantaneous* 1 min ratio: calm

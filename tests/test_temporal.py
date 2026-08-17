@@ -822,6 +822,50 @@ def test_temporal_terms_are_invalid_across_timestamp_gaps():
     assert np.isnan(rolling[2])
 
 
+def test_calibration_pins_profile_capabilities_to_current_tier():
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "timestamp": pd.date_range(
+                "2026-01-01",
+                periods=20,
+                freq="1min",
+            ),
+            "series_id": "a",
+            "x": np.arange(20.0),
+            "flag": np.resize([False, True], 20),
+        }),
+        time_index="timestamp",
+        group_keys=("series_id",),
+        condition_columns=("flag",),
+        temporal_windows=(3,),
+        max_lag=3,
+        advanced=True,
+        max_degree=2,
+    )
+    base = _base_spec(max_degree=1)
+    pinned = replace(
+        base,
+        temporal_enabled=False,
+        conditional_enabled=False,
+        advanced_enabled=False,
+        max_degree=1,
+        temporal_bounds_widened=True,
+        advanced_bounds_widened=True,
+        degree_widened=True,
+    )
+
+    _dataset, grammar = build_dataframe_grammar(
+        frame,
+        pinned,
+        name="pinned_profile_capabilities",
+    )
+
+    assert not grammar.temporal_enabled
+    assert not grammar.conditional_enabled
+    assert not grammar.advanced_enabled
+    assert grammar.max_degree == 1
+
+
 def test_rolling_ratio_and_monotonicity_are_accepted():
     n = 80
     numerator = np.arange(1.0, n + 1.0)

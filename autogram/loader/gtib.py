@@ -258,6 +258,41 @@ def infer_tabular_profile(
     )
 
 
+def _infer_rate_window_seconds(derived: pd.DataFrame) -> int:
+    """Infer the timestamp step represented by one increment of ``minute_index``."""
+    from ..dsl.evaluate import _datetime_ns
+
+    times = _datetime_ns(derived["timestamp"].to_numpy())
+    minutes = derived["minute_index"].to_numpy(dtype=np.int64)
+    steps = set()
+    for left in range(len(derived) - 1):
+        for right in range(left + 1, len(derived)):
+            delta_index = int(minutes[right]) - int(minutes[left])
+            if delta_index == 0:
+                continue
+            delta_time = int(times[right]) - int(times[left])
+            if delta_time % delta_index:
+                raise ValueError(
+                    "GTIB timestamps are not an integral cadence of minute_index"
+                )
+            step = delta_time // delta_index
+            if step > 0:
+                steps.add(step)
+            break
+    if not steps:
+        return 60
+    if len(steps) != 1:
+        raise ValueError(
+            "GTIB timestamps imply inconsistent minute_index cadence"
+        )
+    nanoseconds = steps.pop()
+    if nanoseconds % 1_000_000_000:
+        raise ValueError(
+            "GTIB rate cadence must be an integral number of seconds"
+        )
+    return nanoseconds // 1_000_000_000
+
+
 def prepare_gtib(
     derived: pd.DataFrame,
     raw: pd.DataFrame | None = None,
@@ -287,11 +322,16 @@ def prepare_gtib(
             or pd.api.types.is_string_dtype(out[c])
         )
     ]
+    rate_window_seconds = _infer_rate_window_seconds(out)
     families: dict[str, list[str]] = {}
     related: dict[str, pd.DataFrame] = {}
     if raw is not None:
         raw = _coerce_flag_columns(raw)
-        materialized, families = _materialize_raw(out, raw)
+        materialized, families = _materialize_raw(
+            out,
+            raw,
+            rate_window_seconds=rate_window_seconds,
+        )
         for name, values in materialized.items():
             out[name] = values
         related["raw"] = raw.copy()
@@ -306,7 +346,7 @@ def prepare_gtib(
             "partition_keys": ("consumer_id", "shard_id"),
             "parent_time": "timestamp",
             "child_time": "timestamp",
-            "window_seconds": 60,
+            "window_seconds": rate_window_seconds,
         }
         related_aggregates = {
             "raw_input_rate": {
@@ -456,6 +496,8 @@ def prepare_gtib_raw(raw: pd.DataFrame) -> pd.DataFrame:
 def _materialize_raw(
     derived: pd.DataFrame,
     raw: pd.DataFrame,
+    *,
+    rate_window_seconds: int | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, list[str]]]:
     # Local import avoids making loader initialisation depend on the DSL module. Identity-sensitive
     # grouping must use the same recursive rule as streaming related joins: pandas groupby merges
@@ -575,7 +617,11 @@ def _materialize_raw(
     # a total of 0 in the fast path while the join calls the row ungradeable.
     consumer_covered: dict[tuple, set] = {}
     consumer_any_valid: dict[tuple, set] = {}
-    minute_ns = 60 * 1_000_000_000
+    minute_ns = (
+        int(rate_window_seconds)
+        if rate_window_seconds is not None
+        else _infer_rate_window_seconds(derived)
+    ) * 1_000_000_000
     parent_timestamps = _datetime_ns(
         derived["timestamp"].to_numpy()
     )

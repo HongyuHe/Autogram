@@ -42,6 +42,28 @@ def test_hard_invariants_pass(result):
     assert not hard_failures, [f"{r.name}: {r.detail}" for r in hard_failures]
 
 
+def test_hard_checks_detect_corrupted_static_alert(result):
+    records = [
+        {
+            **record,
+            "frame": record["frame"].copy(),
+        }
+        for record in result.records
+    ]
+    records[0]["frame"]["static_alert"] = ~records[0][
+        "frame"
+    ]["static_alert"]
+
+    checks = check_all(result.config, records, result.events)
+    static = next(
+        check
+        for check in checks
+        if check.name == "static_alert_definition"
+    )
+
+    assert not static.passed
+
+
 def test_byte_conservation_is_exact(result):
     for rec in result.records:
         phys = rec["phys"]

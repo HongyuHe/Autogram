@@ -636,6 +636,41 @@ def test_gtib_materialization_accepts_mixed_valid_timestamp_formats():
     assert prepared["shard_input_increment"].tolist() == [10.0, 10.0]
 
 
+def test_gtib_materialization_infers_two_minute_rate_cadence():
+    derived = pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=3,
+            freq="2min",
+        ),
+        "consumer_id": ["consumer"] * 3,
+        "minute_index": [0, 1, 2],
+        "input_rate_bytes_per_min": [np.nan, 10.0, 10.0],
+    })
+    raw = pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01 00:00:10",
+            periods=3,
+            freq="2min",
+        ),
+        "consumer_id": ["consumer"] * 3,
+        "shard_id": ["shard"] * 3,
+        "collector_input_counted": [0.0, 10.0, 20.0],
+        "presenter_output_counted": [0.0, 10.0, 20.0],
+        "reset_flag": [False] * 3,
+    })
+
+    prepared = prepare_gtib(derived, raw)
+    related = prepared.attrs[AUTOGRAM_PROFILE_ATTR][
+        "related_aggregates"
+    ]
+
+    values = prepared["shard_input_increment"]
+    assert pd.isna(values.iloc[0])
+    assert values.iloc[1:].tolist() == [10.0, 10.0]
+    assert related["raw_input_rate"]["window_seconds"] == 120
+
+
 def test_materialization_preserves_original_minute_indices_after_slice():
     derived, raw = _tables()
     sliced = derived.loc[derived["minute_index"].isin([1, 2])].copy()
