@@ -316,7 +316,7 @@ def test_merge_specs_unions_all_capability_fields():
     assert merged.conditional_enabled
     assert merged.max_condition_values == 6
     assert merged.related_templates == (related,)
-    assert merged.boolean_roles == {"node": ("a",)}
+    assert merged.boolean_roles == {"node": ()}
     assert merged.advanced_enabled
     assert merged.run_lengths == (3, 5)
     assert merged.max_conjunction_terms == 4
@@ -1178,7 +1178,7 @@ def test_known_split_groups_later_tier_and_parameterized_bindings():
         ],
     )
 
-    for known in catalogues:
+    for catalogue_index, known in enumerate(catalogues):
         calibration, validation = _split_known(
             known,
             frac=0.5,
@@ -1191,7 +1191,7 @@ def test_known_split_groups_later_tier_and_parameterized_bindings():
         assert {"n0", "n1"} <= calibration_names or {
             "n0",
             "n1",
-        } <= validation_names
+        } <= validation_names, catalogue_index
 
 
 def test_known_split_matches_alternative_roles_and_family_witnesses():
@@ -1305,7 +1305,7 @@ def test_known_split_matches_alternative_roles_and_family_witnesses():
         ],
     )
 
-    for known in catalogues:
+    for catalogue_index, known in enumerate(catalogues):
         calibration, validation = _split_known(
             known,
             frac=0.5,
@@ -1318,7 +1318,19 @@ def test_known_split_matches_alternative_roles_and_family_witnesses():
         assert {"n0", "n1"} <= calibration_names or {
             "n0",
             "n1",
-        } <= validation_names
+        } <= validation_names, catalogue_index
+
+
+def test_merge_specs_does_not_reclassify_existing_numeric_role():
+    base = _mini_spec()
+    later = replace(
+        base,
+        boolean_roles={"node": ("a",)},
+    )
+
+    merged = _merge_specs(base, later)
+
+    assert "a" not in merged.boolean_roles.get("node", ())
 
 
 def test_known_split_keeps_singleton_sum_balance_aliases_together():

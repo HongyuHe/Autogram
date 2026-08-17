@@ -515,6 +515,27 @@ def test_compiler_requires_plain_binder_identifiers(binder):
         compile_spec(invalid)
 
 
+@pytest.mark.parametrize("role", ["nan", "inf", "infinity"])
+def test_compiler_rejects_reserved_numeric_role_tokens(role):
+    base = _node_template_spec()
+    invalid = GrammarSpec(
+        **{
+            **base.__dict__,
+            "ontology": RoleOntology(
+                binders=("node",),
+                ref_roles={"node": (role,)},
+                fam_roles={"node": ()},
+            ),
+            "ref_templates": (
+                RefTemplate("node", role, "metric_{X}"),
+            ),
+        }
+    )
+
+    with pytest.raises(CompileError, match="reserved numeric token"):
+        compile_spec(invalid)
+
+
 @pytest.mark.parametrize(
     "column",
     ["a == 1, b", "b == 2, c", "a::b", "a\n"],

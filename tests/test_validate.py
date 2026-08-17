@@ -610,16 +610,23 @@ def test_odd_sparse_null_columns_balance_each_quantified_role():
             ),
         ),
         ontology=RoleOntology(
-            binders=("node",),
-            ref_roles={"node": ("x", "y")},
-            fam_roles={"node": ()},
+            binders=("cell", "node"),
+            ref_roles={
+                "cell": ("self",),
+                "node": ("x", "y"),
+            },
+            fam_roles={"cell": (), "node": ()},
         ),
         ref_templates=(
+            RefTemplate("cell", "self", "{col}"),
             RefTemplate("node", "x", "x_{X}"),
             RefTemplate("node", "y", "y_{X}"),
         ),
         family_selectors=(),
-        binder_enumerate={"node": "per_node"},
+        binder_enumerate={
+            "cell": "per_measured_col",
+            "node": "per_node",
+        },
         cell_codec=CellCodec(kind="scalar"),
     )
     dataset = build_dataset(

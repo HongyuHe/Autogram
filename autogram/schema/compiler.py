@@ -144,6 +144,10 @@ def _validate_role_names(label: str, values) -> None:
             raise CompileError(
                 f"{label} {value!r} must be a plain identifier (letters, digits, underscore)"
             )
+        if value.lower() in {"nan", "inf", "infinity"}:
+            raise CompileError(
+                f"{label} {value!r} is a reserved numeric token"
+            )
 
 
 def _validate_positive_int(label: str, value, *, minimum: int = 1) -> None:

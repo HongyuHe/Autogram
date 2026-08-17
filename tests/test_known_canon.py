@@ -584,6 +584,40 @@ def test_singleton_sum_balance_canonicalizes_to_ref_sum_alias():
     )
 
 
+def test_singleton_sums_canonicalize_to_scalar_pair():
+    frame = Frame(
+        np.column_stack((
+            np.ones(40),
+            np.ones(40),
+        )),
+        ["a", "c"],
+    )
+    pair = (
+        "equality",
+        "exact",
+        ("pair", frozenset({"a", "c"})),
+    )
+    ref_sum = (
+        "equality",
+        "exact",
+        ("ref_sum", ("a", frozenset({"c"}))),
+    )
+    balance = (
+        "equality",
+        "exact",
+        (
+            "sum_balance",
+            frozenset({
+                frozenset({"a"}),
+                frozenset({"c"}),
+            }),
+        ),
+    )
+
+    assert _canonicalize(ref_sum, frame, 1e-4) == pair
+    assert _canonicalize(balance, frame, 1e-4) == pair
+
+
 def test_conditional_exactness_is_detected_through_the_nesting():
     """Round-36 review: a conditioned exact equality is still exact.
 

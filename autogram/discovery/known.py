@@ -806,18 +806,35 @@ def _canonicalize(sig, frame, zero_tol: float, exact: bool | None = None):
         )
     if sig[0] == "ref_sum":
         ref_col, cols = sig[1]
+        canonical = _drop_negligible(
+            cols, ref_col, frame, zero_tol, exact=bool(exact),
+        )
+        if len(canonical) == 1:
+            return (
+                "pair",
+                frozenset({
+                    ref_col,
+                    next(iter(canonical)),
+                }),
+            )
         return (
             "ref_sum",
             (
                 ref_col,
-                _drop_negligible(
-                    cols, ref_col, frame, zero_tol, exact=bool(exact),
-                ),
+                canonical,
             ),
         )
     if sig[0] == "sum_balance":
         groups = tuple(sig[1])
         singletons = [group for group in groups if len(group) == 1]
+        if len(groups) == 2 and len(singletons) == 2:
+            return (
+                "pair",
+                frozenset(
+                    next(iter(group))
+                    for group in groups
+                ),
+            )
         if len(groups) == 2 and len(singletons) == 1:
             singleton = frozenset(singletons[0])
             anchor = next(iter(singleton))
@@ -829,6 +846,14 @@ def _canonicalize(sig, frame, zero_tol: float, exact: bool | None = None):
                 zero_tol,
                 exact=bool(exact),
             )
+            if len(canonical_other) == 1:
+                return (
+                    "pair",
+                    frozenset({
+                        anchor,
+                        next(iter(canonical_other)),
+                    }),
+                )
             return (
                 "ref_sum",
                 (anchor, canonical_other),

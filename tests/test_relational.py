@@ -852,7 +852,7 @@ def test_span_runtime_null_preserves_python_datetime_keys_and_string_times():
 
 @pytest.mark.parametrize(
     ("groups", "rows_per_group"),
-    [(100, 2), (1, 400)],
+    [(100, 1), (100, 2), (1, 400)],
 )
 def test_span_runtime_null_varies_typed_filter_roles_on_short_groups(
     groups,

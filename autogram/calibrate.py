@@ -631,12 +631,30 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                         (),
                     )
                 }
-                if variants:
-                    return variants
                 options = [
                     quantified_variants(item)
                     for item in value
                 ]
+                if variants:
+                    canonical_members = []
+                    for item, item_variants in zip(value, options):
+                        semantics = [
+                            variant
+                            for variant in item_variants
+                            if (
+                                isinstance(variant, tuple)
+                                and variant[:1]
+                                == ("quantified_semantics",)
+                            )
+                        ]
+                        canonical_members.append(
+                            min(
+                                semantics or list(item_variants),
+                                key=str,
+                            )
+                        )
+                    variants.add(frozenset(canonical_members))
+                    return variants
                 combinations = math.prod(
                     len(option)
                     for option in options
@@ -680,7 +698,7 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                         frame_satisfies(column, op)
                         and lag_grounds(column, steps)
                     ):
-                        return {
+                        alias_variants = {
                             (
                                 "quantified_sign",
                                 abstract,
@@ -690,6 +708,16 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                                 column
                             )
                         }
+                        alias_variants.update({
+                            (
+                                "quantified_lag_sign",
+                                abstract,
+                                int(steps),
+                                normalized_op,
+                            )
+                            for abstract in abstract_column_variants(column)
+                        })
+                        return alias_variants
                     return {
                         (
                             "quantified_lag_sign",
@@ -730,8 +758,13 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
             return abstract_column_variants(value)
 
         abstracted = []
-        for candidates in expansions:
+        for signature in signatures:
             variants = set()
+            candidates = (
+                None
+                if signature is None
+                else _known_matching_signatures(signature)
+            )
             if candidates is not None:
                 for candidate in candidates:
                     candidate = sum_balance_recovery_alias(candidate)
@@ -1105,9 +1138,18 @@ def _merge_specs(base, new):
         for template in new.related_templates
         if (template.binder, template.role) not in seen_related
     )
+    filtered_boolean = {}
+    for binder, roles in new.boolean_roles.items():
+        base_numeric = set(
+            base.ontology.ref_roles.get(binder, ())
+        ) - set(base.boolean_roles.get(binder, ()))
+        filtered_boolean[binder] = tuple(
+            role for role in roles
+            if role not in base_numeric
+        )
     boolean_roles = _union_roles(
         base.boolean_roles,
-        new.boolean_roles,
+        filtered_boolean,
     )
 
     return replace(

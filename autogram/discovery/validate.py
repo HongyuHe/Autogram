@@ -1360,7 +1360,16 @@ def _runtime_relation_null(
                         )
                         span_end_ns = int(shifted[0])
                     else:
-                        span_end_ns = int(times[row])
+                        step = max(
+                            1,
+                            int(template.window_seconds)
+                            * 1_000_000_000,
+                        )
+                        shifted, _saturated = _saturating_add_ns(
+                            np.asarray([times[row]], dtype=np.int64),
+                            step,
+                        )
+                        span_end_ns = int(shifted[0])
                     record[template.span_end] = pd.Timestamp(
                         span_end_ns
                     )
@@ -1609,6 +1618,7 @@ def _runtime_null_dataset(
     generated_columns = {}
     adapter = dataset.name_model.adapter
     odd_sign_by_column = {}
+    role_columns = []
     for binder in adapter.binders:
         bindings = enumerate_bindings(binder, dataset.name_model)
         for role in adapter.refs_for(binder):
@@ -1622,11 +1632,14 @@ def _runtime_null_dataset(
                 )
                 if column is not None and column not in columns:
                     columns.append(column)
-            for position, column in enumerate(columns):
-                odd_sign_by_column.setdefault(
-                    column,
-                    1 if position % 2 == 0 else -1,
-                )
+            if columns:
+                role_columns.append(columns)
+    for columns in sorted(role_columns, key=len):
+        for position, column in enumerate(columns):
+            odd_sign_by_column.setdefault(
+                column,
+                1 if position % 2 == 0 else -1,
+            )
     boolean_columns = set()
     for binder in adapter.binders:
         for binding in enumerate_bindings(
