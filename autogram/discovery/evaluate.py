@@ -473,14 +473,29 @@ class DataOnlyEvaluator:
         overflow_rejection = self._overflow_rejection(rule, g)
         if overflow_rejection is not None:
             return overflow_rejection
+        condition_rows = (
+            g.full_row_indices
+            if g.full_row_indices is not None
+            else g.row_indices
+        )
+        unique_condition_points = int(
+            np.unique(condition_rows).size
+        )
+        unique_condition_support = (
+            float(unique_condition_points)
+            / float(frame.n_rows)
+            if frame.n_rows
+            else 0.0
+        )
         if rule.condition is not None and (
-            g.graded_points < int(cfg.min_condition_points)
-            or g.graded_condition_support < float(cfg.min_condition_fraction)
+            unique_condition_points < int(cfg.min_condition_points)
+            or unique_condition_support < float(cfg.min_condition_fraction)
         ):
             return self._reject(
                 rule,
                 "condition support below minimum "
-                f"({g.graded_points} points, {g.graded_condition_support:.3f} of rows)",
+                f"({unique_condition_points} source rows, "
+                f"{unique_condition_support:.3f} of rows)",
             )
         if g.degenerate or g.n_points == 0:
             return self._reject(
@@ -592,7 +607,10 @@ class DataOnlyEvaluator:
                         )
                 overflow_support = self._support_excluding(g, fit_blown)
                 support_rejection = self._graded_support_rejection(
-                    rule, g, fit_blown,
+                    rule,
+                    g,
+                    fit_blown,
+                    excluded_mask=fit_overflow,
                 )
                 if support_rejection is not None:
                     return support_rejection
@@ -872,13 +890,27 @@ class DataOnlyEvaluator:
         remaining = max(0, graded - int(blown))
         return float(g.support) * (float(remaining) / float(graded))
 
-    def _graded_support_rejection(self, rule: A.Rule, g, blown: int):
+    def _graded_support_rejection(
+        self,
+        rule: A.Rule,
+        g,
+        blown: int,
+        *,
+        excluded_mask=None,
+    ):
         """Re-apply the conditioned support floor after overflowed rows are excluded, else ``None``."""
         if rule.condition is None:
             return None
-        graded = max(0, int(g.graded_points) - int(blown))
-        attempted = int(g.n_bindings) * int(self.ds.observed.n_rows)
-        support = (float(graded) / float(attempted)) if attempted else 0.0
+        rows = (
+            g.full_row_indices
+            if g.full_row_indices is not None
+            else g.row_indices
+        )
+        if excluded_mask is not None:
+            rows = rows[~np.asarray(excluded_mask, dtype=bool)]
+        graded = int(np.unique(rows).size)
+        attempted = int(self.ds.observed.n_rows)
+        support = float(graded) / float(attempted) if attempted else 0.0
         if (
             graded < int(self.cfg.min_condition_points)
             or support < float(self.cfg.min_condition_fraction)

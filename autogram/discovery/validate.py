@@ -1295,6 +1295,11 @@ def _runtime_relation_null(
             times = _datetime_ns(
                 parent_context[template.parent_time]
             )
+            if times.size < 2:
+                raise RuntimeError(
+                    "runtime span null needs at least two parent rows"
+                )
+            selected_rows = np.zeros(times.size, dtype=bool)
             key_arrays = [
                 _typed_object_array(parent_context[key])
                 for key in template.parent_keys
@@ -1308,24 +1313,30 @@ def _runtime_relation_null(
                     {"raw_key": raw_key, "rows": []},
                 )
                 bucket["rows"].append(row)
+            for bucket in groups.values():
+                rows = np.asarray(bucket["rows"], dtype=int)
+                if rows.size == 1:
+                    selected_rows[rows[0]] = bool(
+                        rng.integers(0, 2)
+                    )
+                    continue
+                selected_rows[
+                    rng.choice(
+                        rows,
+                        size=rows.size // 2,
+                        replace=False,
+                    )
+                ] = True
             filter_value = (
                 template.filter_values[0]
                 if template.filter_values
                 else "__null__"
             )
-            pattern_width = max(
-                2,
-                (len(span_templates) + 1).bit_length(),
-            )
             for group_index, (key, bucket) in enumerate(groups.items()):
                 rows = bucket["rows"]
                 ordered = sorted(rows, key=lambda row: times[row])
                 for position, row in enumerate(ordered):
-                    selected = (
-                        (template_index + 1)
-                        >> (int(row) % pattern_width)
-                    ) & 1
-                    if not selected:
+                    if not selected_rows[row]:
                         continue
                     signature = (
                         tuple(key),

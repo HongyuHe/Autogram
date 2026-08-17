@@ -875,7 +875,10 @@ def _canonicalize(sig, frame, zero_tol: float, exact: bool | None = None):
                 "ref_sum",
                 (anchor, canonical_other),
             )
-        return sig
+        return (
+            "sum_balance",
+            frozenset(groups),
+        )
     if sig[0] == "agg_ref_balance":
         if any(ref in fam for ref, fam in sig[1]):
             return sig

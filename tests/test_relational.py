@@ -849,8 +849,7 @@ def test_span_runtime_null_preserves_temporal_parent_keys_through_join():
 
     assert generated["consumer_id"].dtype.kind == "O"
     assert values is not None
-    assert values[:2].sum() == 1.0
-    assert values[2:].sum() == 1.0
+    assert 0 < values.sum() < values.size
 
 
 def test_span_runtime_null_preserves_python_datetime_keys_and_string_times():
@@ -909,8 +908,7 @@ def test_span_runtime_null_preserves_python_datetime_keys_and_string_times():
         for value in generated["consumer_id"]
     )
     assert values is not None
-    assert values[:2].sum() == 1.0
-    assert values[2:].sum() == 1.0
+    assert 0 < values.sum() < values.size
 
 
 @pytest.mark.parametrize(
