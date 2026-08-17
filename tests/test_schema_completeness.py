@@ -148,7 +148,7 @@ def test_empty_optional_kind_and_list_condition_fields_use_safe_defaults():
     assert spec.max_conjunction_terms == 3
 
 
-def test_too_small_conjunction_bound_is_clamped():
+def test_too_small_conjunction_bound_is_rejected():
     data = synth.make_synthetic(
         n_entities=3,
         n_snapshots=8,
@@ -158,15 +158,14 @@ def test_too_small_conjunction_bound_is_clamped():
     payload = _broken_peer_payload(peer_group="destination")
     payload["max_conjunction_terms"] = 1
 
-    spec = induce_spec(
-        data.columns,
-        SubagentSchemaInducer(
-            responder=lambda _prompt: json.dumps(payload),
-            max_attempts=1,
-        ),
-    )
-
-    assert spec.max_conjunction_terms == 2
+    with pytest.raises(RuntimeError, match="invalid or incomplete"):
+        induce_spec(
+            data.columns,
+            SubagentSchemaInducer(
+                responder=lambda _prompt: json.dumps(payload),
+                max_attempts=1,
+            ),
+        )
 
 
 def test_subagent_preserves_declared_proportional_operator():
@@ -451,6 +450,26 @@ def test_dotted_demand_row_col_families_recover_across_repaired_inductions():
                 rec.as_dict(),
                 [e.rule.unparse() for e in res.portfolio],
                 res.diagnostics,
+            )
+
+
+def test_string_capability_boolean_is_rejected():
+    data = synth.make_synthetic(
+            n_entities=3,
+            n_snapshots=8,
+            noise=0.0,
+            seed=0,
+    )
+    payload = _broken_peer_payload(peer_group="destination")
+    payload["temporal_enabled"] = "false"
+
+    with pytest.raises(RuntimeError, match="invalid or incomplete"):
+            induce_spec(
+                data.columns,
+                SubagentSchemaInducer(
+                    responder=lambda _prompt: json.dumps(payload),
+                    max_attempts=1,
+                ),
             )
 
 

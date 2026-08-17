@@ -472,11 +472,7 @@ def _augment_profiled_dataframe_spec(df, spec):
             if advanced_enabled
             else ()
         ),
-        boolean_roles=(
-            boolean_roles
-            if advanced_enabled
-            else {}
-        ),
+        boolean_roles=boolean_roles,
         role_exclusions=tuple(
             exclusion
             for exclusion in getattr(spec, "role_exclusions", ())

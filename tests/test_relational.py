@@ -1025,7 +1025,7 @@ def test_span_runtime_null_saturates_extrapolated_end():
     )
     second = replace(template, role="event_second")
 
-    with pytest.raises(RuntimeError, match="positive duration"):
+    with pytest.raises(RuntimeError, match="runtime span null"):
         _runtime_relation_null(
             relation,
             [template, second],

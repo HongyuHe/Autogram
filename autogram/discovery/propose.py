@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import re
 from typing import Dict, List, Sequence
 
 from ..dsl import ast as A
@@ -171,7 +172,18 @@ def _self_conditioned(rule: A.Rule) -> bool:
         roles = _term_ref_roles(rule.atom.term)
     else:
         return False
-    return bool(roles & _condition_columns(rule.condition))
+    normalize = lambda value: re.sub(
+        r"[^A-Za-z0-9_]",
+        "_",
+        value,
+    )
+    return bool(
+        {normalize(role) for role in roles}
+        & {
+            normalize(column)
+            for column in _condition_columns(rule.condition)
+        }
+    )
 
 
 class EnumerationProposer:
@@ -577,7 +589,11 @@ class EnumerationProposer:
         out: List[A.Rule] = []
         seen = set()
         conditioned_emitted = 0
-        conditions = self._conditions()
+        conditions = (
+            self._conditions()
+            if self.G.conditional_enabled
+            else []
+        )
         precount = bool(
             conditions
             and self.G.conditional_enabled

@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from typing import Any, Mapping
 
 import yaml
+import pandas as pd
 
 
 # --------------------------------------------------------------------------- #
@@ -348,6 +349,18 @@ def _validate(cfg: EmulatorConfig) -> None:
 
     if cfg.time.duration_hours <= 0:
         raise ValueError("time.duration_hours must be > 0")
+    try:
+        start = pd.Timestamp(cfg.time.start_timestamp)
+        end = start + pd.to_timedelta(
+            cfg.time.duration_hours,
+            unit="h",
+        )
+        start.as_unit("ns")
+        end.as_unit("ns")
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            "generated timestamps must fit datetime64[ns]"
+        ) from error
     if cfg.time.rate_window_seconds % cfg.time.raw_scrape_seconds != 0:
         raise ValueError("rate_window_seconds must be a multiple of raw_scrape_seconds")
     if cfg.time.smoothing_window_seconds % cfg.time.rate_window_seconds != 0:

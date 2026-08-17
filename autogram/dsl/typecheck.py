@@ -160,6 +160,30 @@ def _leaf_set(term: A.Term) -> set:
     return set()
 
 
+def _predicate_leaf_set(predicate: A.Predicate) -> set:
+    if isinstance(predicate, A.Bound):
+        return _leaf_set(predicate.term)
+    if isinstance(predicate, A.Sustained):
+        return _predicate_leaf_set(predicate.predicate)
+    if isinstance(predicate, A.Conjunction):
+        return set().union(*(
+            _predicate_leaf_set(item)
+            for item in predicate.predicates
+        ))
+    return set()
+
+
+def _excluded_roles(leaves, G) -> bool:
+    roles = {
+        leaf[1] if leaf[0] == "r" else leaf[-1]
+        for leaf in leaves
+    }
+    return any(
+        len(pair) == 2 and set(pair) <= roles
+        for pair in getattr(G, "role_exclusions", ())
+    )
+
+
 def _leaf_list(term: A.Term) -> list:
     """Measured leaves with multiplicity, used to reject algebraically reducible terms."""
     if isinstance(term, A.Ref):
@@ -262,6 +286,12 @@ def is_admissible(rule: A.Rule, G) -> tuple:
             return False, "Boolean predicate is outside the bounded definition grammar"
         if _learned_bound_count(atom.predicate) > 2:
             return False, "Boolean definition has too many learned thresholds"
+        if _excluded_roles(
+            _leaf_set(atom.target)
+            | _predicate_leaf_set(atom.predicate),
+            G,
+        ):
+            return False, "excluded role co-occurrence"
         if rule.complexity() > G.complexity_cap(rule.binder):
             return False, "exceeds max complexity"
         return True, ""
@@ -339,14 +369,11 @@ def is_admissible(rule: A.Rule, G) -> tuple:
             return False, "ratio denominator must be a measured term"
         if isinstance(side, A.Mul) and not (_has_measured(side.left) and _has_measured(side.right)):
             return False, "product operands must both be measured"
-    excl = getattr(G, "role_exclusions", ())
-    if excl:
-        roles = set()
-        for leaf in (_leaf_set(atom.left) | _leaf_set(atom.right)):
-            roles.add(leaf[1] if leaf[0] == "r" else leaf[-1])
-        for pair in excl:
-            if len(pair) == 2 and set(pair) <= roles:
-                return False, "excluded role co-occurrence"
+    if _excluded_roles(
+        _leaf_set(atom.left) | _leaf_set(atom.right),
+        G,
+    ):
+        return False, "excluded role co-occurrence"
     # dimensional: every comparison needs at least one measured side.  A bare constant may only
     # be the additive identity 0, which admits one-sided non-negativity / non-positivity laws.
     lm, rm = _has_measured(atom.left), _has_measured(atom.right)

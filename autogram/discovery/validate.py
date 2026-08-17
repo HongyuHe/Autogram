@@ -1282,9 +1282,25 @@ def _runtime_relation_null(
         template for template in templates
         if template.mode == "span_any"
     ]
+    seen_span_filters = set()
+    for template in span_templates:
+        key = (
+            template.relation,
+            template.filter_column,
+            tuple(
+                typed_group_key(value)
+                for value in template.filter_values
+            ),
+        )
+        if key in seen_span_filters:
+            raise RuntimeError(
+                "runtime span null cannot isolate templates sharing one filter"
+            )
+        seen_span_filters.add(key)
     if span_templates:
         records = []
         emitted = set()
+        used_masks = set()
         for template_index, template in enumerate(span_templates):
             required = {
                 template.parent_time,
@@ -1299,7 +1315,6 @@ def _runtime_relation_null(
                 raise RuntimeError(
                     "runtime span null needs at least two parent rows"
                 )
-            selected_rows = np.zeros(times.size, dtype=bool)
             key_arrays = [
                 _typed_object_array(parent_context[key])
                 for key in template.parent_keys
@@ -1313,20 +1328,42 @@ def _runtime_relation_null(
                     {"raw_key": raw_key, "rows": []},
                 )
                 bucket["rows"].append(row)
-            for bucket in groups.values():
-                rows = np.asarray(bucket["rows"], dtype=int)
-                if rows.size == 1:
-                    selected_rows[rows[0]] = bool(
-                        rng.integers(0, 2)
-                    )
-                    continue
-                selected_rows[
-                    rng.choice(
-                        rows,
-                        size=rows.size // 2,
+            singleton_rows = [
+                bucket["rows"][0]
+                for bucket in groups.values()
+                if len(bucket["rows"]) == 1
+            ]
+            if len(singleton_rows) == 1:
+                raise RuntimeError(
+                    "runtime span null cannot vary one singleton parent"
+                )
+            for _attempt in range(100):
+                selected_rows = np.zeros(times.size, dtype=bool)
+                for bucket in groups.values():
+                    rows = np.asarray(bucket["rows"], dtype=int)
+                    if rows.size > 1:
+                        selected_rows[
+                            rng.choice(
+                                rows,
+                                size=rows.size // 2,
+                                replace=False,
+                            )
+                        ] = True
+                if singleton_rows:
+                    chosen = rng.choice(
+                        singleton_rows,
+                        size=len(singleton_rows) // 2,
                         replace=False,
                     )
-                ] = True
+                    selected_rows[chosen] = True
+                mask_key = selected_rows.tobytes()
+                if mask_key not in used_masks:
+                    used_masks.add(mask_key)
+                    break
+            else:
+                raise RuntimeError(
+                    "runtime span null could not generate distinct role masks"
+                )
             filter_value = (
                 template.filter_values[0]
                 if template.filter_values
@@ -1430,6 +1467,13 @@ def _runtime_relation_null(
             if len(span_templates) == len(templates):
                 return span_frame
     output = relation.copy(deep=True)
+    for template in span_templates:
+        if template.span_start in output:
+            output[template.span_start] = pd.NaT
+        if template.span_end in output:
+            output[template.span_end] = pd.NaT
+        if template.filter_column in output:
+            output[template.filter_column] = pd.NA
     structural = set()
     binary_columns = set()
     monotone_columns = {}

@@ -102,6 +102,51 @@ def test_conjunction_cap_enumerates_every_arity_from_two():
         assert set(range(2, cap + 1)) <= arities
 
 
+def test_boolean_definition_respects_role_exclusions():
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=", "=="),
+        ref_roles={"record": ("a", "b")},
+        fam_roles={"record": ()},
+        boolean_roles={"record": ("a",)},
+        advanced_enabled=True,
+        role_exclusions=(frozenset({"a", "b"}),),
+        max_complexity=12,
+    )
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("a"),
+            A.Bound(A.Ref("b"), ">", 0.0),
+        ),
+    )
+
+    ok, reason = is_admissible(rule, grammar)
+
+    assert not ok
+    assert "excluded role" in reason
+
+
+def test_disabled_conditions_do_not_expand_large_domains():
+    grammar = Grammar(
+        binders=("record",),
+        ops=("==",),
+        ref_roles={"record": ("x", "y")},
+        fam_roles={"record": ()},
+        conditional_enabled=False,
+        condition_columns={
+            "unused": tuple(range(60)),
+        },
+        max_condition_values=60,
+        max_complexity=6,
+    )
+
+    rules = EnumerationProposer(grammar).propose()
+
+    assert rules
+    assert all(rule.condition is None for rule in rules)
+
+
 def test_proposer_enumerates_nonstrict_sustained_and_generic_conjunctions():
     grammar = Grammar(
         binders=("record",),

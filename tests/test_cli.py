@@ -275,6 +275,31 @@ def test_advanced_discovery_requires_finite_rule_budget():
         _enforce_capability_rule_budget(args)
 
 
+def test_effective_profile_advanced_requires_rule_budget(monkeypatch):
+    import autogram.cli as cli_module
+    import autogram.discovery.loop as loop_module
+
+    frame = pd.DataFrame({"x": [1.0]})
+    frame.attrs["autogram_profile"] = {"advanced": True}
+    monkeypatch.setattr(
+        cli_module,
+        "_load_dataframe",
+        lambda *_args, **_kwargs: frame,
+    )
+    monkeypatch.setattr(
+        loop_module,
+        "prepare_dataframe",
+        lambda *_args, **_kwargs: (
+            object(),
+            SimpleNamespace(advanced_enabled=True),
+            SimpleNamespace(),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="effective advanced"):
+        main(["discover", "--input", "unused.pkl"])
+
+
 def test_automatic_advanced_calibration_rejects_explicit_unbounded_budget():
     args = build_parser().parse_args([
         "calibrate",

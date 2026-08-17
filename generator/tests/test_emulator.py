@@ -147,6 +147,16 @@ def test_determinism_same_seed():
         assert np.allclose(x, y, equal_nan=True)
 
 
+def test_generator_rejects_out_of_range_timestamps():
+    with pytest.raises(ValueError, match="datetime64\\[ns\\]"):
+        load_config(overrides={
+            "time": {
+                "start_timestamp": "3000-01-01T00:00:00Z",
+                "duration_hours": 1.0,
+            },
+        })
+
+
 def test_derived_schema(result):
     expected = {
         "timestamp", "consumer_id", "minute_index",

@@ -1451,6 +1451,14 @@ def _spec_from_json(payload) -> GrammarSpec:
             ))
         return tuple(output)
 
+    def json_bool(name: str, default: bool = False) -> bool:
+        value = payload.get(name, default)
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"induced schema field {name!r} must be a JSON boolean"
+            )
+        return value
+
     onto = payload["ontology"]
     noisy_kind = str(payload.get("noisy_kind") or "measurement")
     demand_kind = str(payload.get("demand_kind") or "demand")
@@ -1471,7 +1479,7 @@ def _spec_from_json(payload) -> GrammarSpec:
                                  ((t.binder, t.role) for t in ref_templates))
     fam_roles = _canonical_roles(_role_map(onto["fam_roles"], "fam_roles"), binders,
                                  ((s.binder, s.family_role) for s in family_selectors))
-    temporal_enabled = bool(payload.get("temporal_enabled", False))
+    temporal_enabled = json_bool("temporal_enabled")
     agg_kinds = tuple(onto.get("agg_kinds", ("SUM",)))
     if has_demand:
         agg_kinds = tuple(dict.fromkeys((
@@ -1518,7 +1526,7 @@ def _spec_from_json(payload) -> GrammarSpec:
         temporal_enabled=temporal_enabled,
         max_lag=json_int("max_lag", 0, minimum=0),
         windows=json_ints("windows", minimum=1),
-        conditional_enabled=bool(payload.get("conditional_enabled", False)),
+        conditional_enabled=json_bool("conditional_enabled"),
         max_condition_values=json_int(
             "max_condition_values",
             4,
@@ -1554,7 +1562,7 @@ def _spec_from_json(payload) -> GrammarSpec:
             for template in (payload.get("related_templates", ()) or ())
         ),
         boolean_roles=_role_map(payload.get("boolean_roles", {}), "boolean_roles"),
-        advanced_enabled=bool(payload.get("advanced_enabled", False)),
+        advanced_enabled=json_bool("advanced_enabled"),
         run_lengths=json_ints("run_lengths", minimum=1),
         max_conjunction_terms=json_int(
             "max_conjunction_terms",
@@ -1565,20 +1573,12 @@ def _spec_from_json(payload) -> GrammarSpec:
         metadata_columns=tuple(
             str(column) for column in (payload.get("metadata_columns", ()) or ())
         ),
-        band_enabled=bool(payload.get("band_enabled", False)),
-        aggregations_widened=bool(
-            payload.get("aggregations_widened", False)
-        ),
-        temporal_bounds_widened=bool(
-            payload.get("temporal_bounds_widened", False)
-        ),
-        advanced_bounds_widened=bool(
-            payload.get("advanced_bounds_widened", False)
-        ),
-        degree_widened=bool(payload.get("degree_widened", False)),
-        proportional_widened=bool(
-            payload.get("proportional_widened", False)
-        ),
+        band_enabled=json_bool("band_enabled"),
+        aggregations_widened=json_bool("aggregations_widened"),
+        temporal_bounds_widened=json_bool("temporal_bounds_widened"),
+        advanced_bounds_widened=json_bool("advanced_bounds_widened"),
+        degree_widened=json_bool("degree_widened"),
+        proportional_widened=json_bool("proportional_widened"),
     )
 
 

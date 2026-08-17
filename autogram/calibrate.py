@@ -1482,6 +1482,13 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             search_cfg=scfg,
             name=name,
         )
+        if G.advanced_enabled and not (
+            1 <= int(scfg.max_rules) <= 500_000
+        ):
+            raise ValueError(
+                "effective advanced calibration requires max_rules "
+                "between 1 and 500000"
+            )
         summary = _spec_summary(runtime_spec, ti, caps)
         summary["runtime"] = {
             "agg_kinds": list(getattr(G, "agg_kinds", ())),
