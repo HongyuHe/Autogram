@@ -39,6 +39,8 @@ class TermCache:
             # Term evaluation caches ``(value, overflow_mask)`` pairs; charging only the first
             # member would under-count the cache and let it grow past ``max_bytes``.
             return sum(TermCache._size(member) for member in value)
+        if isinstance(value, list):
+            return sum(TermCache._size(member) for member in value)
         return 0
 
     def __contains__(self, key) -> bool:
@@ -98,8 +100,14 @@ class Frame:
         self.related_cache = {}
         self.related_index_cache = {}
         self.term_cache = TermCache()
-        self.condition_cache = {}
-        self.temporal_cache = {}
+        self.condition_cache = TermCache(
+            max_entries=4_096,
+            max_bytes=32 * 1024 * 1024,
+        )
+        self.temporal_cache = TermCache(
+            max_entries=4_096,
+            max_bytes=32 * 1024 * 1024,
+        )
 
     @property
     def n_rows(self) -> int:

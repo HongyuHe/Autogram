@@ -600,7 +600,7 @@ def _consecutive_window_ends(
     cache_key = (
         "consecutive",
         time_index,
-        rows.tobytes(),
+        id(rows),
         int(window),
     )
     if cache_key in frame.temporal_cache:

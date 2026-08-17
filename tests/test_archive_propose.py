@@ -5,7 +5,10 @@ from __future__ import annotations
 import pytest
 
 from autogram.config import DiscoveryConfig
-from autogram.discovery.archive import ParetoArchive
+from autogram.discovery.archive import (
+    ParetoArchive,
+    _same_fitted_semantics,
+)
 from autogram.discovery.evaluate import DataOnlyEvaluator, Evaluation
 from autogram.discovery.propose import (
     EnumerationProposer,
@@ -74,6 +77,38 @@ def test_archive_keeps_rules_with_typed_distinct_conditions(monkeypatch):
 
     kept = archive.portfolio(non_redundant=False)
     assert len(kept) == 2
+
+
+def test_archive_fitted_semantics_distinguish_typed_categories():
+    def evaluation(value):
+        return Evaluation(
+            rule=A.Rule(
+                "record",
+                A.CategoryDefinition(
+                    "target",
+                    (("flag", value),),
+                    value,
+                ),
+            ),
+            accepted=True,
+            reason="test",
+            eps=0.0,
+            hold_rate=1.0,
+            hold_rate_lo=0.99,
+            hold_rate_hi=1.0,
+            statistic="hold_rate",
+            support=1.0,
+            n_points=100,
+            n_bindings=1,
+            mdl_gain=1.0,
+            strictness="definition",
+            descriptor=("record", 2),
+        )
+
+    assert not _same_fitted_semantics(
+        evaluation(True),
+        evaluation(1),
+    )
 
 
 def test_archive_retains_lag_shadow_unless_exact_atomic_suppresses_it(dataset):

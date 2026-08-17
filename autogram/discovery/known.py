@@ -830,7 +830,19 @@ def _canonicalize(sig, frame, zero_tol: float, exact: bool | None = None):
             ),
         )
     if sig[0] == "sum_balance":
-        groups = tuple(sig[1])
+        groups = tuple(
+            frozenset(
+                column
+                for column in group
+                if not (
+                    len(group) > 1
+                    and frame.has(column)
+                    and np.all(np.isfinite(frame.col(column)))
+                    and not np.any(frame.col(column) != 0.0)
+                )
+            ) or group
+            for group in sig[1]
+        )
         singletons = [group for group in groups if len(group) == 1]
         if len(groups) == 2 and len(singletons) == 2:
             return (

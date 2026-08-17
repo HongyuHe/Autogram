@@ -357,8 +357,7 @@ def test_secondary_name_suffix_does_not_rename_an_ordinary_shard():
     ]
 
 
-def test_missing_consumer_identity_agrees_between_materialized_and_streaming():
-    """``pd.NA`` and ``None`` denote the same missing consumer on both join paths."""
+def test_missing_consumer_identity_is_rejected_before_joining():
     derived, raw = _tables()
     derived = derived.copy()
     raw = raw.copy()
@@ -371,31 +370,8 @@ def test_missing_consumer_identity_agrees_between_materialized_and_streaming():
         dtype=object,
     )
 
-    prepared = prepare_gtib(derived, raw)
-    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
-        "shard_input_increment"
-    ]
-    materialized = prepared[family].sum(
-        axis=1,
-        min_count=len(family),
-    ).to_numpy(dtype=float)
-    streaming_frame = prepared.drop(columns=family)
-    streaming_frame.attrs = prepared.attrs
-    dataset, _grammar = build_dataframe_grammar(
-        streaming_frame,
-        _base_spec(),
-        name="missing_consumer_streaming",
-    )
-    streaming = eval_term(
-        A.RelatedAgg("raw_input_rate"),
-        "record",
-        {},
-        dataset.observed,
-        dataset.name_model,
-    )
-
-    assert streaming is not None
-    assert np.array_equal(materialized, streaming, equal_nan=True)
+    with pytest.raises(ValueError, match="nonmissing consumer_id"):
+        prepare_gtib(derived, raw)
 
 
 def test_derived_only_consumer_is_ungradeable_on_all_materialized_families():
@@ -740,6 +716,45 @@ def test_derived_only_rejects_duplicate_typed_identity():
 
     with pytest.raises(ValueError, match="duplicate consumer/minute"):
         prepare_gtib(duplicate)
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [
+        ("consumer_id", None),
+        ("timestamp", pd.NaT),
+        ("minute_index", 0.5),
+        ("minute_index", -1),
+    ],
+)
+def test_derived_only_rejects_invalid_identity_values(
+    column,
+    value,
+):
+    derived, _raw = _tables()
+    invalid = derived.iloc[:2].copy()
+    if column == "minute_index":
+        invalid[column] = invalid[column].astype(object)
+    invalid.loc[invalid.index[0], column] = value
+
+    with pytest.raises(ValueError, match="identit|timestamp"):
+        prepare_gtib(invalid)
+
+
+def test_cadence_rejects_backward_consumer_series():
+    frame = pd.DataFrame({
+        "timestamp": pd.to_datetime([
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:01:00",
+            "2026-01-01 00:01:30",
+            "2026-01-01 00:00:30",
+        ]),
+        "consumer_id": ["a", "a", "b", "b"],
+        "minute_index": [0, 1, 0, 1],
+    })
+
+    with pytest.raises(ValueError, match="increase"):
+        _infer_rate_window_seconds(frame)
 
 
 def test_materialized_windows_keep_a_non_aligned_derived_origin():

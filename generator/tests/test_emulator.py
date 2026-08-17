@@ -11,6 +11,7 @@ or from inside ``generator/``::
 
 from __future__ import annotations
 
+import copy
 import numpy as np
 import pytest
 
@@ -102,6 +103,22 @@ def test_hard_checks_reject_missing_boolean_truth(result):
     )
 
     assert not label.passed
+
+
+def test_hard_checks_reject_unflagged_infinite_counter(result):
+    records = copy.deepcopy(result.records)
+    records[0]["obs"].input_counted[0, 0] = np.inf
+    records[0]["obs"].missing_flag[0, 0] = False
+    records[0]["obs"].active_flag[0, 0] = True
+
+    checks = check_all(result.config, records, result.events)
+    finite = next(
+        check
+        for check in checks
+        if check.name == "reported_telemetry_is_finite"
+    )
+
+    assert not finite.passed
 
 
 def test_byte_conservation_is_exact(result):

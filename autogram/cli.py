@@ -273,6 +273,14 @@ def cmd_discover(args: argparse.Namespace) -> int:
         ds, G, runtime_spec = prepare_dataframe(
             input_frame, inducer=inducer, search_cfg=scfg, name=name
         )
+        if G.advanced_enabled and (
+            scfg.max_rules <= 0
+            or scfg.max_rules > 500_000
+        ):
+            raise ValueError(
+                "effective advanced discovery requires --max-rules "
+                "between 1 and 500000"
+            )
         res = run_prepared(ds, G, discovery_cfg=dcfg, search_cfg=scfg)
         normalized_spec = _spec_to_json(runtime_spec)
     else:

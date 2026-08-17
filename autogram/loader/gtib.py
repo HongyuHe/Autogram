@@ -273,6 +273,7 @@ def _infer_rate_window_seconds(derived: pd.DataFrame) -> int:
     steps = set()
     for indices in groups.values():
         ordered = sorted(indices, key=lambda index: minutes[index])
+        group_steps = set()
         for left, right in zip(ordered, ordered[1:]):
             delta_index = int(minutes[right]) - int(minutes[left])
             if delta_index == 0:
@@ -283,8 +284,20 @@ def _infer_rate_window_seconds(derived: pd.DataFrame) -> int:
                     "GTIB timestamps are not an integral cadence of minute_index"
                 )
             step = delta_time // delta_index
-            if step > 0:
-                steps.add(step)
+            if step <= 0:
+                raise ValueError(
+                    "GTIB timestamps must increase with minute_index"
+                )
+            group_steps.add(step)
+        if len(ordered) > 1 and not group_steps:
+            raise ValueError(
+                "GTIB consumer has no positive timestamp cadence"
+            )
+        if len(group_steps) > 1:
+            raise ValueError(
+                "GTIB consumer has inconsistent minute_index cadence"
+            )
+        steps.update(group_steps)
     if not steps:
         return 60
     if len(steps) != 1:
@@ -317,11 +330,27 @@ def prepare_gtib(
     out["timestamp"] = _datetime_ns(
         out["timestamp"].to_numpy()
     ).view("datetime64[ns]")
+    if out["timestamp"].isna().any():
+        raise ValueError(
+            "GTIB derived identities require nonmissing timestamps"
+        )
     seen_identities = set()
+    raw_minutes = out["minute_index"].to_numpy(dtype=object)
     for consumer, minute in zip(
         out["consumer_id"].to_numpy(dtype=object),
-        out["minute_index"].to_numpy(dtype=int),
+        raw_minutes,
     ):
+        if (
+            consumer is None
+            or bool(pd.isna(consumer))
+            or not isinstance(minute, (int, np.integer))
+            or isinstance(minute, (bool, np.bool_))
+            or int(minute) < 0
+        ):
+            raise ValueError(
+                "GTIB derived identities require a nonmissing consumer_id "
+                "and nonnegative integer minute_index"
+            )
         identity = (typed_group_key(consumer), int(minute))
         if identity in seen_identities:
             raise ValueError(

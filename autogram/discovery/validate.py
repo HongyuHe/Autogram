@@ -770,9 +770,9 @@ def _definition_matches_planted_mask(evaluation, result) -> bool:
         thresholds,
     )
     return bool(
-        target.size
+        np.any(valid)
         and target.shape == predicted.shape == valid.shape
-        and np.array_equal(target, predicted)
+        and np.array_equal(target[valid], predicted[valid])
     )
 
 
@@ -1196,7 +1196,10 @@ def _balanced_null_numeric(
     magnitude_ceiling: float = _NULL_MAGNITUDE_CEILING,
     odd_sign: int = 1,
 ) -> np.ndarray:
-    source = np.asarray(values, dtype=float)
+    source = pd.to_numeric(
+        pd.Series(values),
+        errors="coerce",
+    ).to_numpy(dtype=float, na_value=np.nan)
     output = np.full(source.shape, np.nan, dtype=float)
     positions = np.flatnonzero(np.isfinite(source))
     if not positions.size:
@@ -2394,8 +2397,18 @@ def tune_joint(suite, seed: int = 0, band_mode: str = "global", ci_alpha: float 
     """
     evaluate = evaluate or evaluate_grid_candidate
     thresholds = list(thresholds or _BASE_THRESHOLDS)
+    thresholds = sorted({
+        float(threshold)
+        for threshold in thresholds
+        if float(threshold) >= float(null_floor)
+    })
+    if not thresholds:
+        thresholds = [float(null_floor)]
     tolerances = list(tolerances or _BASE_TOLERANCES)
-    if initial_threshold is not None:
+    if (
+        initial_threshold is not None
+        and float(initial_threshold) >= float(null_floor)
+    ):
         thresholds = sorted({
             *thresholds,
             float(initial_threshold),
@@ -2428,6 +2441,7 @@ def tune_joint(suite, seed: int = 0, band_mode: str = "global", ci_alpha: float 
     if (
         initial_tolerance is not None
         and initial_threshold is not None
+        and float(initial_threshold) >= float(null_floor)
     ):
         starting = _cell(
             float(initial_tolerance),

@@ -420,6 +420,34 @@ def test_proportional_fit_overflow_is_refused_not_scored():
     assert "overflow" in result.reason
 
 
+def test_negative_proportional_fit_overflow_is_refused():
+    n = 400
+    x = np.ones(n)
+    y = -x
+    x[-1] = 1.5e308
+    y[-1] = 1.5e308
+    dataset = _dataset(
+        pd.DataFrame({"x": x, "y": y}),
+        "negative_proportional_overflow",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.05,
+            hold_rate_threshold=0.62,
+            band_mode="global",
+            max_overflow_fraction=0.0,
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~\u221d", A.Ref("x")),
+    ))
+
+    assert not result.accepted
+    assert "overflow" in result.reason
+
+
 def test_conditioned_fit_overflow_keeps_full_frame_support_denominator():
     n = 1000
     selected = np.arange(n) < 100

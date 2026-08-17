@@ -1518,6 +1518,47 @@ def test_column_scale_view_decodes_dict_cells_like_the_runtime_frame():
     view.assert_matches_runtime(dataset.observed)     # must not raise
 
 
+def test_known_split_drops_zero_members_before_sum_shape_classification():
+    from autogram.calibrate import _ColumnScaleView
+
+    frame = pd.DataFrame({
+        "total": np.full(60, 10.0),
+        "a": np.full(60, 4.0),
+        "b": np.full(60, 6.0),
+        "z": np.zeros(60),
+        "x": np.arange(60.0),
+    })
+    known = [
+        KnownInvariant(
+            "plain",
+            "==",
+            "total",
+            {"sum": ["a", "b"]},
+        ),
+        KnownInvariant(
+            "padded",
+            "==",
+            {"sum": ["total", "z"]},
+            {"sum": ["a", "b"]},
+        ),
+        KnownInvariant("other", ">=", "x", 0),
+    ]
+
+    calibration, validation = _split_known(
+        known,
+        frac=0.5,
+        seed=0,
+        frame=_ColumnScaleView(frame),
+    )
+    calibration_names = {item.name for item in calibration}
+    validation_names = {item.name for item in validation}
+
+    assert {"plain", "padded"} <= calibration_names or {
+        "plain",
+        "padded",
+    } <= validation_names
+
+
 def test_split_keeps_aliases_together_on_dict_valued_cells():
     """The alias pair must stay on one side of the split for CrossCheck-shaped data too.
 

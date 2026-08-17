@@ -11,7 +11,7 @@ from typing import Dict, List
 
 from .evaluate import Evaluation
 from ..dsl import ast as A
-from ..dsl.evaluate import typed_condition_key
+from ..dsl.evaluate import typed_condition_key, typed_group_key
 from ..logic.solver import (
     equivalent,
     legacy_equivalent,
@@ -107,8 +107,27 @@ def _same_fitted_semantics(a: Evaluation, b: Evaluation) -> bool:
         ).items()
         if key in semantic_keys
     }
+    atom_equal = a.rule.atom == b.rule.atom
+    if (
+        isinstance(a.rule.atom, A.CategoryDefinition)
+        and isinstance(b.rule.atom, A.CategoryDefinition)
+    ):
+        atom_equal = (
+            a.rule.atom.target_column
+            == b.rule.atom.target_column
+            and tuple(
+                (column, typed_group_key(value))
+                for column, value in a.rule.atom.cases
+            )
+            == tuple(
+                (column, typed_group_key(value))
+                for column, value in b.rule.atom.cases
+            )
+            and typed_group_key(a.rule.atom.default)
+            == typed_group_key(b.rule.atom.default)
+        )
     return (
-        a.rule.atom == b.rule.atom
+        atom_equal
         and a.eps == b.eps
         and a.strictness == b.strictness
         and a_parameters == b_parameters

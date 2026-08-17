@@ -149,6 +149,30 @@ def test_runtime_relation_null_preserves_all_false_reset_support():
     assert np.all(np.diff(counter) >= 0.0)
 
 
+def test_runtime_relation_null_coerces_nullable_numeric_columns():
+    relation = pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=3,
+            freq="10s",
+        ),
+        "counter": pd.Series(
+            [1, pd.NA, 3],
+            dtype="Int64",
+        ),
+    })
+
+    output = _runtime_relation_null(
+        relation,
+        [],
+        {},
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+
+    assert output["counter"].isna().sum() == 1
+
+
 def test_runtime_relation_null_orders_mixed_timestamp_formats_chronologically():
     relation = pd.DataFrame({
         "timestamp": [

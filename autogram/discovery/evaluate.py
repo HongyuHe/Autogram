@@ -730,6 +730,7 @@ class DataOnlyEvaluator:
 
         op = rule.atom.op
         rel = np.abs(g.rho) / g.scale
+        holdout_holds = None
         if op == "<|>":
             eps = cfg.presence_tolerance
             floor = np.maximum(g.scale, 1.0) * eps
@@ -765,6 +766,14 @@ class DataOnlyEvaluator:
                     cap=cfg.tolerance,
                 )
                 eps = max(float(band.eps), 1e-9)
+                holdout_holds = (
+                    violation_magnitude(
+                        op,
+                        g.rho[band.eval_indices],
+                        g.scale[band.eval_indices],
+                    )
+                    <= eps + 1e-15
+                )
             else:
                 eps = cfg.tolerance
             holds = (
@@ -786,6 +795,13 @@ class DataOnlyEvaluator:
             eps=eps,
         )
         accepted = lo >= threshold
+        if holdout_holds is not None:
+            holdout_lo, _holdout_hi, _holdout_rate = wilson(
+                int(np.count_nonzero(holdout_holds)),
+                int(holdout_holds.size),
+                z=z,
+            )
+            accepted &= holdout_lo >= threshold
         return Evaluation(
             rule=rule,
             accepted=accepted,
@@ -824,12 +840,19 @@ class DataOnlyEvaluator:
         coefficient, the largest fitted magnitude is used -- an upper bound, so the guard can only
         be conservative.
         """
-        largest = max((abs(value) for value in coefficients.values()), default=0.0)
+        fallback = (
+            next(iter(coefficients.values()))
+            if len(coefficients) == 1
+            else max(
+                (abs(value) for value in coefficients.values()),
+                default=0.0,
+            )
+        )
         rows = g.full_row_indices if g.full_row_indices is not None else g.row_indices
         labels = _group_labels(frame, nm, rows) if rows is not None else None
         if labels is None or labels.size != n_points:
-            return np.full(n_points, largest, dtype=float)
-        mapped = np.full(n_points, largest, dtype=float)
+            return np.full(n_points, fallback, dtype=float)
+        mapped = np.full(n_points, fallback, dtype=float)
         for index, label in enumerate(labels.tolist()):
             typed = _typed_label(label)
             if typed in coefficients:
@@ -1383,11 +1406,15 @@ class DataOnlyEvaluator:
                 else int(np.count_nonzero(condition_mask))
             )
             attempted = max(1, n_bindings * selected_rows)
+            base_blown = sum(
+                int(np.count_nonzero(mask))
+                for mask in (tainted_rows or {}).values()
+            )
             rejection = self._overflow_reject_if(
                 rule,
-                overflow_points=blown,
+                overflow_points=base_blown + blown,
                 graded_points=max(0, int(population.size) - blown),
-                fraction=float(blown) / float(attempted),
+                fraction=float(base_blown + blown) / float(attempted),
             )
             if rejection is not None:
                 return rejection

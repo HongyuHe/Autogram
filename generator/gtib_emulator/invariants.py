@@ -94,6 +94,26 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
         "derived_rates_non_negative", neg_rates == 0,
         f"{neg_rates} negative derived rate values (should be 0)."))
 
+    nonfinite_reported = 0
+    derived_infinite = 0
+    for rec in records:
+        obs = rec["obs"]
+        allowed_missing = obs.missing_flag | ~obs.active_flag
+        for counter in (obs.input_counted, obs.output_counted):
+            nonfinite_reported += int(np.count_nonzero(
+                ~np.isfinite(counter) & ~allowed_missing
+            ))
+        numeric = rec["frame"].select_dtypes(include=[np.number])
+        derived_infinite += int(np.count_nonzero(
+            np.isinf(numeric.to_numpy(dtype=float))
+        ))
+    results.append(_hard(
+        "reported_telemetry_is_finite",
+        nonfinite_reported == 0 and derived_infinite == 0,
+        f"{nonfinite_reported} unflagged nonfinite counter values and "
+        f"{derived_infinite} infinite derived values.",
+    ))
+
     # -- Hard: every emitted derived identity is reproducible ----------------
     derived_bad = 0
     static_bad = 0
