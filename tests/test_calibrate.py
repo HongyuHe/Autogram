@@ -1334,6 +1334,18 @@ def test_known_split_matches_alternative_roles_and_family_witnesses():
 def test_merge_specs_does_not_reclassify_existing_numeric_role():
     base = replace(
         _mini_spec(),
+        patterns=(
+            ColumnPattern(
+                "metric",
+                "regex",
+                "measurement",
+                "value",
+                regex=r"^metric_(?P<source>n\d+)$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+        ),
         ref_templates=(
             RefTemplate("node", "a", "metric_{X}"),
         ),
@@ -1352,7 +1364,7 @@ def test_merge_specs_does_not_reclassify_existing_numeric_role():
             RefTemplate(
                 "node",
                 "boolean_alias",
-                "metric_{X}",
+                "metric_n0",
             ),
         ),
         boolean_roles={
@@ -1360,7 +1372,11 @@ def test_merge_specs_does_not_reclassify_existing_numeric_role():
         },
     )
 
-    merged = _merge_specs(base, later)
+    merged = _merge_specs(
+        base,
+        later,
+        columns=("metric_n0", "metric_n1"),
+    )
 
     assert "a" not in merged.boolean_roles.get("node", ())
     assert "boolean_alias" not in merged.boolean_roles.get(

@@ -1363,6 +1363,11 @@ def _runtime_relation_null(
                                 "runtime span null cannot represent a positive "
                                 "duration at the timestamp ceiling"
                             )
+                        if bool(saturated[0]):
+                            raise RuntimeError(
+                                "runtime span null cannot represent a positive "
+                                "duration at the timestamp ceiling"
+                            )
                         span_end_ns = int(shifted[0])
                     else:
                         step = max(
@@ -1370,10 +1375,15 @@ def _runtime_relation_null(
                             int(template.window_seconds)
                             * 1_000_000_000,
                         )
-                        shifted, _saturated = _saturating_add_ns(
+                        shifted, saturated = _saturating_add_ns(
                             np.asarray([times[row]], dtype=np.int64),
                             step,
                         )
+                        if bool(saturated[0]):
+                            raise RuntimeError(
+                                "runtime span null cannot represent a positive "
+                                "duration at the timestamp ceiling"
+                            )
                         span_end_ns = int(shifted[0])
                     record[template.span_end] = pd.Timestamp(
                         span_end_ns
@@ -1622,10 +1632,7 @@ def _runtime_null_dataset(
     matrix = np.empty_like(dataset.observed.matrix, dtype=float)
     generated_columns = {}
     adapter = dataset.name_model.adapter
-    odd_sign_by_column = {
-        name: 1 if index % 2 == 0 else -1
-        for index, name in enumerate(dataset.observed.names)
-    }
+    odd_sign_by_column = {}
     role_columns = []
     for binder in adapter.binders:
         bindings = enumerate_bindings(binder, dataset.name_model)
@@ -1642,43 +1649,36 @@ def _runtime_null_dataset(
                     columns.append(column)
             if columns:
                 role_columns.append(columns)
-    for _iteration in range(max(1, 10 * len(odd_sign_by_column))):
-        changed = False
+    if role_columns:
+        import z3
+
+        solver = z3.Solver()
+        variables = {
+            column: z3.Int(f"null_sign_{index}")
+            for index, column in enumerate(dataset.observed.names)
+        }
+        for variable in variables.values():
+            solver.add(z3.Or(variable == -1, variable == 1))
         for columns in role_columns:
-            imbalance = sum(
-                odd_sign_by_column[column]
+            total = z3.Sum([
+                variables[column]
                 for column in columns
+            ])
+            solver.add(total >= -1, total <= 1)
+        if solver.check() != z3.sat:
+            raise RuntimeError(
+                "runtime null cannot balance overlapping quantified roles"
             )
-            if abs(imbalance) <= 1:
-                continue
-            target = 1 if imbalance > 0 else -1
-            candidate = next(
-                (
-                    column for column in columns
-                    if odd_sign_by_column[column] == target
-                ),
-                None,
-            )
-            if candidate is not None:
-                odd_sign_by_column[candidate] *= -1
-                changed = True
-        if not changed:
-            break
-    unbalanced = [
-        columns
-        for columns in role_columns
-        if (
-            len(columns) > 1
-            and abs(sum(
-                odd_sign_by_column[column]
-                for column in columns
-            )) > 1
-        )
-    ]
-    if unbalanced:
-        raise RuntimeError(
-            "runtime null cannot balance overlapping quantified roles"
-        )
+        model = solver.model()
+        odd_sign_by_column = {
+            column: model.eval(variable).as_long()
+            for column, variable in variables.items()
+        }
+    if not odd_sign_by_column:
+        odd_sign_by_column = {
+            name: 1 if index % 2 == 0 else -1
+            for index, name in enumerate(dataset.observed.names)
+        }
     boolean_columns = set()
     for binder in adapter.binders:
         for binding in enumerate_bindings(

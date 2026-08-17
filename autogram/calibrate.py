@@ -636,24 +636,19 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                     for item in value
                 ]
                 if variants:
-                    canonical_members = []
-                    for item, item_variants in zip(value, options):
-                        semantics = [
-                            variant
-                            for variant in item_variants
-                            if (
-                                isinstance(variant, tuple)
-                                and variant[:1]
-                                == ("quantified_semantics",)
-                            )
-                        ]
-                        canonical_members.append(
-                            min(
-                                semantics or list(item_variants),
-                                key=str,
-                            )
+                    combinations = math.prod(
+                        len(option)
+                        for option in options
+                    )
+                    if combinations > 10_000:
+                        raise ValueError(
+                            "quantified split abstraction exceeds 10000 "
+                            "role alternatives; tighten the induced schema"
                         )
-                    variants.add(frozenset(canonical_members))
+                    variants.update(
+                        frozenset(items)
+                        for items in itertools.product(*options)
+                    )
                     return variants
                 combinations = math.prod(
                     len(option)
@@ -1069,7 +1064,7 @@ def _widen_spec(spec, *, all_aggs: bool = False, max_degree: Optional[int] = Non
     )
 
 
-def _merge_specs(base, new):
+def _merge_specs(base, new, columns=None):
     """Union two specs' search spaces so re-induction can never *shrink* the grammar (item 2).
 
     A fresh induction each tier is non-deterministic: a role/pattern/family present in an earlier
@@ -1167,7 +1162,7 @@ def _merge_specs(base, new):
         filtered_boolean,
     )
 
-    return replace(
+    merged = replace(
         base,
         patterns=patterns,
         ontology=ontology,
@@ -1232,6 +1227,61 @@ def _merge_specs(base, new):
             or new.proportional_widened
         ),
     )
+    if (
+        columns is None
+        or not base.patterns
+        or not merged.patterns
+    ):
+        return merged
+
+    from .dsl.binders import enumerate_bindings, resolve_ref
+    from .loader.names import NameModel
+
+    base_adapter = compile_spec(base)
+    merged_adapter = compile_spec(merged)
+    base_model = NameModel.from_columns_with_adapter(
+        list(columns),
+        base_adapter,
+    )
+    merged_model = NameModel.from_columns_with_adapter(
+        list(columns),
+        merged_adapter,
+    )
+    numeric_columns = set()
+    for binder in base_adapter.binders:
+        boolean = set(base.boolean_roles.get(binder, ()))
+        for role in base_adapter.refs_for(binder):
+            if role in boolean:
+                continue
+            for binding in enumerate_bindings(binder, base_model):
+                column = resolve_ref(
+                    role,
+                    binder,
+                    binding,
+                    base_model,
+                )
+                if column is not None:
+                    numeric_columns.add(column)
+    filtered = {}
+    for binder, roles in merged.boolean_roles.items():
+        kept = []
+        for role in roles:
+            grounded = {
+                resolve_ref(
+                    role,
+                    binder,
+                    binding,
+                    merged_model,
+                )
+                for binding in enumerate_bindings(
+                    binder,
+                    merged_model,
+                )
+            } - {None}
+            if not grounded & numeric_columns:
+                kept.append(role)
+        filtered[binder] = tuple(kept)
+    return replace(merged, boolean_roles=filtered)
 
 
 def _spec_summary(spec, tier: int, caps: dict) -> dict:
@@ -1311,6 +1361,7 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
         merged_spec = _merge_specs(
             merged_spec,
             induce_spec(list(df.columns), inducer),
+            columns=list(df.columns),
         )
         tier_specs.append(merged_spec)
     split_dataset, _split_grammar = build_dataframe_grammar(
