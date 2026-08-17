@@ -19,6 +19,7 @@ from autogram.discovery.validate import score_recovery
 from autogram.dsl import ast as A
 from autogram.dsl.evaluate import (
     _condition_mask,
+    typed_condition_key,
     typed_group_key,
     typed_signature_value,
 )
@@ -185,6 +186,27 @@ def test_structured_rule_signatures_do_not_collide_on_condition_text():
         ),
     )
     assert category_a.signature() != category_b.signature()
+
+
+def test_condition_masks_are_cached_per_frame():
+    dataset, _grammar = build_dataframe_grammar(
+        _data(),
+        _base_spec(),
+        name="condition_cache",
+    )
+    condition = A.Condition(
+        "label",
+        "==",
+        ("true_loss",),
+    )
+
+    first = _condition_mask(condition, dataset.observed)
+    second = _condition_mask(condition, dataset.observed)
+
+    assert first is second
+    assert typed_condition_key(
+        condition
+    ) in dataset.observed.condition_cache
 
 
 def test_overlapping_add_aggregate_does_not_emit_set_valued_sum_alias():

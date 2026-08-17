@@ -99,6 +99,21 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
     static_bad = 0
     trajectory_bad = 0
     label_bad = 0
+
+    def strict_boolean(series: pd.Series) -> tuple[np.ndarray, int]:
+        raw = series.to_numpy(dtype=object)
+        valid = np.fromiter(
+            (
+                isinstance(value, (bool, np.bool_))
+                for value in raw
+            ),
+            dtype=bool,
+            count=raw.size,
+        )
+        output = np.zeros(raw.size, dtype=bool)
+        output[valid] = np.asarray(raw[valid], dtype=bool)
+        return output, int(np.count_nonzero(~valid))
+
     for rec in records:
         frame = rec["frame"]
         obs = rec["obs"]
@@ -182,9 +197,11 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
             expected_static[index] = (
                 run >= cfg.alerting.alert_duration_minutes
             )
-        static_bad += int(np.count_nonzero(
-            frame["static_alert"].to_numpy(dtype=bool)
-            != expected_static
+        static_actual, invalid = strict_boolean(
+            frame["static_alert"]
+        )
+        static_bad += invalid + int(np.count_nonzero(
+            static_actual != expected_static
         ))
         deficit = input_rate - output_rate
         low = np.where(
@@ -210,9 +227,11 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
                 True,
             )
         )
-        trajectory_bad += int(np.count_nonzero(
-            frame["traj_alert"].to_numpy(dtype=bool)
-            != expected_trajectory
+        trajectory_actual, invalid = strict_boolean(
+            frame["traj_alert"]
+        )
+        trajectory_bad += invalid + int(np.count_nonzero(
+            trajectory_actual != expected_trajectory
         ))
         timestamps = pd.to_datetime(frame["timestamp"])
         true_loss = np.zeros(len(frame), dtype=bool)
@@ -240,18 +259,15 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
                 benign |= active
             elif event_type == "artifact":
                 artifact |= active
-        label_bad += int(np.count_nonzero(
-            frame["is_true_loss"].to_numpy(dtype=bool)
-            != true_loss
-        ))
-        label_bad += int(np.count_nonzero(
-            frame["is_benign_burst"].to_numpy(dtype=bool)
-            != benign
-        ))
-        label_bad += int(np.count_nonzero(
-            frame["is_artifact"].to_numpy(dtype=bool)
-            != artifact
-        ))
+        for column, expected_mask in (
+            ("is_true_loss", true_loss),
+            ("is_benign_burst", benign),
+            ("is_artifact", artifact),
+        ):
+            actual, invalid = strict_boolean(frame[column])
+            label_bad += invalid + int(np.count_nonzero(
+                actual != expected_mask
+            ))
         expected_label = np.full(len(frame), "normal", dtype=object)
         expected_label[artifact] = "artifact"
         expected_label[benign] = "benign_burst"
@@ -259,8 +275,9 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
         label_bad += int(np.count_nonzero(
             frame["label"].to_numpy(dtype=object) != expected_label
         ))
-        label_bad += int(np.count_nonzero(
-            frame["oracle_alert"].to_numpy(dtype=bool) != true_loss
+        oracle, invalid = strict_boolean(frame["oracle_alert"])
+        label_bad += invalid + int(np.count_nonzero(
+            oracle != true_loss
         ))
         label_bad += int(np.count_nonzero(
             frame["consumer_id"].to_numpy(dtype=object)

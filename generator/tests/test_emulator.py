@@ -79,6 +79,31 @@ def test_hard_checks_detect_missing_event_catalogue(result):
     assert not label.passed
 
 
+def test_hard_checks_reject_missing_boolean_truth(result):
+    records = [
+        {
+            **record,
+            "frame": record["frame"].copy(),
+        }
+        for record in result.records
+    ]
+    active = records[0]["frame"]["is_true_loss"]
+    index = active[active].index[0]
+    records[0]["frame"]["is_true_loss"] = records[0][
+        "frame"
+    ]["is_true_loss"].astype(object)
+    records[0]["frame"].loc[index, "is_true_loss"] = np.nan
+
+    checks = check_all(result.config, records, result.events)
+    label = next(
+        check
+        for check in checks
+        if check.name == "label_priority_definition"
+    )
+
+    assert not label.passed
+
+
 def test_byte_conservation_is_exact(result):
     for rec in result.records:
         phys = rec["phys"]

@@ -260,7 +260,7 @@ def infer_tabular_profile(
 
 def _infer_rate_window_seconds(derived: pd.DataFrame) -> int:
     """Infer the timestamp step represented by one increment of ``minute_index``."""
-    from ..dsl.evaluate import _datetime_ns
+    from ..dsl.evaluate import _datetime_ns, typed_group_key
 
     from ..dsl.evaluate import typed_group_key
 
@@ -311,12 +311,24 @@ def prepare_gtib(
     if missing:
         raise ValueError(f"GTIB derived table is missing required columns: {missing}")
 
-    from ..dsl.evaluate import _datetime_ns
+    from ..dsl.evaluate import _datetime_ns, typed_group_key
 
     out = derived.reset_index(drop=True).copy()
     out["timestamp"] = _datetime_ns(
         out["timestamp"].to_numpy()
     ).view("datetime64[ns]")
+    seen_identities = set()
+    for consumer, minute in zip(
+        out["consumer_id"].to_numpy(dtype=object),
+        out["minute_index"].to_numpy(dtype=int),
+    ):
+        identity = (typed_group_key(consumer), int(minute))
+        if identity in seen_identities:
+            raise ValueError(
+                "GTIB derived table has duplicate consumer/minute row "
+                f"for {consumer!r}, minute {minute}"
+            )
+        seen_identities.add(identity)
     out = _coerce_flag_columns(out)
     condition_columns = [
         c for c in out.columns

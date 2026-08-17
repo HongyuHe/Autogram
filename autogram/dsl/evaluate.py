@@ -286,6 +286,7 @@ def _eval_term_uncached(term: A.Term, binder: str, binding: dict, frame: Frame,
             else:
                 out = mat.max(axis=1)
                 reduction_overflow = None
+        out = np.where(finite_members, out, np.nan)
         # SUM and AVG can return ``NaN`` from finite members when an intermediate partial sum
         # overflows and then cancels, so every non-finite result counts; MIN and MAX cannot.
         blown = (
@@ -311,6 +312,11 @@ def _eval_term_uncached(term: A.Term, binder: str, binding: dict, frame: Frame,
             return None, None
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             out = np.where(den == 0.0, np.nan, num / den)
+        out = np.where(
+            np.isfinite(num) & np.isfinite(den),
+            out,
+            np.nan,
+        )
         # Division by exact zero is deliberately ``NaN`` (undefined), and ``_blowup`` only fires on
         # an infinity, so the guarded case is never mistaken for an overflow.  A finite but tiny
         # denominator IS an overflow and is caught here.
@@ -367,7 +373,12 @@ def _eval_term_uncached(term: A.Term, binder: str, binding: dict, frame: Frame,
 
 def _time_vector(frame: Frame, time_index: str) -> np.ndarray:
     """Return checked nanoseconds so ordering and cadence share one interpretation."""
-    return _datetime_ns(frame.row_context[time_index])
+    key = ("time_vector", time_index)
+    if key not in frame.temporal_cache:
+        frame.temporal_cache[key] = _datetime_ns(
+            frame.row_context[time_index]
+        )
+    return frame.temporal_cache[key]
 
 
 _MISSING_GROUP = "__missing__"
@@ -552,6 +563,9 @@ def _ordered_groups(frame: Frame, nm: NameModel):
     group_keys = tuple(getattr(adapter, "group_keys", ()))
     if group_keys and not all(key in frame.row_context for key in group_keys):
         return None
+    cache_key = ("ordered_groups", time_index, group_keys)
+    if cache_key in frame.temporal_cache:
+        return frame.temporal_cache[cache_key]
     groups: dict[object, list[int]] = {}
     for row in range(frame.n_rows):
         if not group_keys:
@@ -571,6 +585,7 @@ def _ordered_groups(frame: Frame, nm: NameModel):
         index = np.asarray(rows, dtype=int)
         order = np.argsort(times[index], kind="stable")
         ordered.append(index[order])
+    frame.temporal_cache[cache_key] = ordered
     return ordered
 
 
@@ -580,12 +595,21 @@ def _consecutive_window_ends(
     rows: np.ndarray,
     window: int,
 ) -> np.ndarray:
+    adapter = getattr(nm, "adapter", None)
+    time_index = getattr(adapter, "time_index", "")
+    cache_key = (
+        "consecutive",
+        time_index,
+        rows.tobytes(),
+        int(window),
+    )
+    if cache_key in frame.temporal_cache:
+        return frame.temporal_cache[cache_key]
     valid = np.zeros(rows.size, dtype=bool)
     if window <= 1:
         valid[:] = True
+        frame.temporal_cache[cache_key] = valid
         return valid
-    adapter = getattr(nm, "adapter", None)
-    time_index = getattr(adapter, "time_index", "")
     times = _datetime_ns(
         np.asarray(frame.row_context[time_index])[rows]
     )
@@ -602,6 +626,7 @@ def _consecutive_window_ends(
     ]
     positive = [delta for delta in diffs if delta is not None and delta > 0]
     if not positive:
+        frame.temporal_cache[cache_key] = valid
         return valid
     cadence = min(positive)
     consecutive = np.asarray(
@@ -612,6 +637,7 @@ def _consecutive_window_ends(
         valid[end] = bool(np.all(
             consecutive[end - window + 1:end]
         ))
+    frame.temporal_cache[cache_key] = valid
     return valid
 
 
@@ -892,6 +918,9 @@ def rel_residual(g: Grounded) -> np.ndarray:
 def _condition_mask(condition: A.Condition | None, frame: Frame):
     if condition is None:
         return np.ones(frame.n_rows, dtype=bool)
+    cache_key = typed_condition_key(condition)
+    if cache_key in frame.condition_cache:
+        return frame.condition_cache[cache_key]
     if condition.op == "all":
         mask = np.ones(frame.n_rows, dtype=bool)
         for child in condition.values:
@@ -901,6 +930,7 @@ def _condition_mask(condition: A.Condition | None, frame: Frame):
             if child_mask is None:
                 return None
             mask &= child_mask
+        frame.condition_cache[cache_key] = mask
         return mask
     if condition.column not in frame.row_context:
         return None
@@ -919,6 +949,7 @@ def _condition_mask(condition: A.Condition | None, frame: Frame):
                 dtype=bool,
                 count=int(np.count_nonzero(present)),
             )
+        frame.condition_cache[cache_key] = mask
         return mask
     if condition.op == "!=":
         target = condition.values[0]
@@ -932,6 +963,7 @@ def _condition_mask(condition: A.Condition | None, frame: Frame):
                 dtype=bool,
                 count=int(np.count_nonzero(present)),
             )
+        frame.condition_cache[cache_key] = mask
         return mask
     allowed = {
         typed_group_key(value)
@@ -944,6 +976,7 @@ def _condition_mask(condition: A.Condition | None, frame: Frame):
             dtype=bool,
             count=int(np.count_nonzero(present)),
         )
+        frame.condition_cache[cache_key] = mask
         return mask
     if condition.op == "not in":
         mask[present] = np.fromiter(
@@ -954,6 +987,7 @@ def _condition_mask(condition: A.Condition | None, frame: Frame):
             dtype=bool,
             count=int(np.count_nonzero(present)),
         )
+        frame.condition_cache[cache_key] = mask
         return mask
     return None
 

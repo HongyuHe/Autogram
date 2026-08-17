@@ -243,7 +243,7 @@ def test_overflow_taint_survives_being_mapped_back_to_a_finite_value():
         term, "record", binding, dataset.observed, dataset.name_model,
     )
 
-    assert np.all(np.isfinite(values))
+    assert np.isnan(values).all()
     assert overflow is not None and bool(np.all(overflow))
 
     g = ground(
@@ -922,12 +922,7 @@ def test_display_keys_are_injective_for_labels_that_render_alike():
 
 
 def test_reduction_that_cancels_to_nan_is_an_overflow_not_missing_data():
-    """Round-34 review: a reduction can return NaN from finite members.
-
-    Pairwise summation overflows a partial sum and then cancels, so the result is ``NaN`` rather
-    than an infinity -- and a guard that only looks for infinities lets those rows be dropped as
-    ordinary missing data, shrinking the population behind a full-confidence support figure.
-    """
+    """Historical aggregate reduction still reports finite-member cancellation overflow."""
     import autogram.dsl.binders as B
     import autogram.dsl.evaluate as E
 
@@ -951,7 +946,7 @@ def test_reduction_that_cancels_to_nan_is_an_overflow_not_missing_data():
     original = B.resolve_family
     B.resolve_family = lambda role, binder, binding, nm: tuple(columns)
     try:
-        _value, overflow = E.eval_term_overflow(
+        value, overflow = E.eval_term_overflow(
             A.Agg("SUM", "fam"), "record", {}, dataset.observed, dataset.name_model,
         )
     finally:
@@ -1187,6 +1182,44 @@ def test_forward_fill_treats_an_infinite_reading_as_missing():
     filled = _partition_values(partition, child, "counter", True)
 
     assert np.allclose(filled, [10.0, 10.0, 20.0])
+
+
+def test_min_aggregate_cannot_resurrect_infinite_source_rows():
+    import autogram.dsl.binders as B
+
+    n = 200
+    source = np.full(n, np.inf)
+    source[:20] = 2.0
+    dataset = _dataset(
+        pd.DataFrame({
+            "finite": np.ones(n),
+            "source": source,
+            "target": np.ones(n),
+        }),
+        "nonfinite_min",
+    )
+    original = B.resolve_family
+    B.resolve_family = lambda *_args: ("finite", "source")
+    try:
+        result = DataOnlyEvaluator(
+            dataset,
+            DiscoveryConfig(
+                hold_rate_threshold=0.9,
+                band_mode="global",
+            ),
+        ).evaluate(A.Rule(
+            "record",
+            A.Compare(
+                A.Ref("target"),
+                "==",
+                A.Agg("MIN", "family"),
+            ),
+        ))
+    finally:
+        B.resolve_family = original
+
+    assert result.n_points == 20
+    assert result.support == pytest.approx(0.1)
 
 
 def test_saturating_add_is_correct_for_pre_epoch_timestamps():

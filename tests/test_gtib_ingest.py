@@ -731,6 +731,17 @@ def test_materialization_preserves_original_minute_indices_after_slice():
     assert frame["shard_000_1_input_increment"].tolist() == [120.0, 120.0]
 
 
+def test_derived_only_rejects_duplicate_typed_identity():
+    derived, _raw = _tables()
+    duplicate = pd.concat(
+        [derived.iloc[[0]], derived.iloc[[0]]],
+        ignore_index=True,
+    )
+
+    with pytest.raises(ValueError, match="duplicate consumer/minute"):
+        prepare_gtib(duplicate)
+
+
 def test_materialized_windows_keep_a_non_aligned_derived_origin():
     """Materialized minute windows must be the same intervals the streaming join evaluates."""
     derived, raw = _tables()

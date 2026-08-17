@@ -85,6 +85,8 @@ class Frame:
         "related_cache",
         "related_index_cache",
         "term_cache",
+        "condition_cache",
+        "temporal_cache",
     )
 
     def __init__(self, matrix: np.ndarray, names, row_context=None, relations=None):
@@ -96,6 +98,8 @@ class Frame:
         self.related_cache = {}
         self.related_index_cache = {}
         self.term_cache = TermCache()
+        self.condition_cache = {}
+        self.temporal_cache = {}
 
     @property
     def n_rows(self) -> int:
