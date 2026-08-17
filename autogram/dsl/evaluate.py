@@ -151,11 +151,31 @@ def _blowup(result, *inputs):
 
 
 def _pairwise_row_sum(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
-    """Use NumPy's deterministic row reduction and report finite-member overflow."""
+    """Use the historical NumPy reduction and report finite-member overflow."""
     matrix = np.asarray(matrix, dtype=float)
     with np.errstate(over="ignore", invalid="ignore"):
         output = matrix.sum(axis=1)
     finite_members = np.all(np.isfinite(matrix), axis=1)
+    overflow = ~np.isfinite(output) & finite_members
+    return output, (overflow if overflow.any() else None)
+
+
+def _canonical_row_sum(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
+    """Use padding-independent accurate summation for related-grain parity."""
+    matrix = np.asarray(matrix, dtype=float)
+    finite_members = np.all(np.isfinite(matrix), axis=1)
+    output = np.full(matrix.shape[0], np.nan, dtype=float)
+    overflow = np.zeros(matrix.shape[0], dtype=bool)
+    for row in range(matrix.shape[0]):
+        if not finite_members[row]:
+            with np.errstate(over="ignore", invalid="ignore"):
+                output[row] = np.sum(matrix[row])
+            continue
+        try:
+            output[row] = math.fsum(matrix[row].tolist())
+        except OverflowError:
+            output[row] = np.inf
+            overflow[row] = True
     overflow = ~np.isfinite(output) & finite_members
     return output, (overflow if overflow.any() else None)
 
@@ -251,7 +271,12 @@ def _eval_term_uncached(term: A.Term, binder: str, binding: dict, frame: Frame,
         finite_members = np.all(np.isfinite(mat), axis=1)
         with np.errstate(over="ignore", invalid="ignore"):
             if term.kind == "SUM":
-                out, reduction_overflow = _pairwise_row_sum(mat)
+                reducer = (
+                    _canonical_row_sum
+                    if term.family_role.startswith("shard_")
+                    else _pairwise_row_sum
+                )
+                out, reduction_overflow = reducer(mat)
             elif term.kind == "AVG":
                 out = mat.mean(axis=1)
                 reduction_overflow = None
@@ -1312,7 +1337,7 @@ def _related_aggregate(template, frame: Frame):
                 local_index,
             ] = contribution
         if partitions:
-            totals, reduction_overflow = _pairwise_row_sum(
+            totals, reduction_overflow = _canonical_row_sum(
                 contribution_matrix
             )
             if reduction_overflow is not None:
@@ -1437,19 +1462,20 @@ def _span_any(template, frame: Frame, child):
 
     parent_times, parent_groups = _parent_time_index(template, frame)
     child_groups = _span_child_index(template, frame, child)
-    output = np.zeros(frame.n_rows, dtype=float)
+    output = np.full(frame.n_rows, np.nan, dtype=float)
     interval_ns = int(
         pd.Timedelta(seconds=int(template.window_seconds)).value
     )
     for parent_key, parent_rows in parent_groups.items():
-        group = child_groups.get(parent_key)
-        if group is None or not len(group["starts"]):
-            continue
         rows = np.asarray([
             row for row in parent_rows
             if parent_times[row] != _NAT_NS
         ], dtype=int)
         if not rows.size:
+            continue
+        output[rows] = 0.0
+        group = child_groups.get(parent_key)
+        if group is None or not len(group["starts"]):
             continue
         starts = parent_times[rows]
         end_windows, windows_saturated = _saturating_add_ns(starts, interval_ns)

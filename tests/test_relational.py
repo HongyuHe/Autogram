@@ -592,6 +592,44 @@ def test_span_filters_and_cache_keys_preserve_typed_identity():
     assert one_values.tolist() == [0.0, 1.0]
 
 
+def test_span_join_leaves_missing_parent_time_ungradeable():
+    frame = Frame(
+        np.empty((2, 0), dtype=float),
+        [],
+        row_context={
+            "timestamp": np.array(
+                [np.datetime64("NaT"), np.datetime64("2026-01-01")],
+                dtype="datetime64[ns]",
+            ),
+        },
+    )
+    child = pd.DataFrame({
+        "span_start": pd.Series(dtype="datetime64[ns]"),
+        "span_end": pd.Series(dtype="datetime64[ns]"),
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="event",
+        relation="events",
+        column="",
+        mode="span_any",
+        parent_keys=(),
+        child_keys=(),
+        partition_keys=(),
+        parent_time="timestamp",
+        child_time="",
+        window_seconds=60,
+        span_start="span_start",
+        span_end="span_end",
+    )
+
+    values = _span_any(template, frame, child)
+
+    assert values is not None
+    assert np.isnan(values[0])
+    assert values[1] == 0.0
+
+
 def test_span_join_preserves_datetime_child_key_identity():
     parent_time = pd.Timestamp("1970-01-01")
     frame = Frame(

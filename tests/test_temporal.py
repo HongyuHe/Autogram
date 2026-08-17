@@ -841,6 +841,7 @@ def test_calibration_pins_profile_capabilities_to_current_tier():
         max_lag=3,
         advanced=True,
         max_degree=2,
+        proportional=True,
     )
     base = _base_spec(max_degree=1)
     pinned = replace(
@@ -864,6 +865,7 @@ def test_calibration_pins_profile_capabilities_to_current_tier():
     assert not grammar.conditional_enabled
     assert not grammar.advanced_enabled
     assert grammar.max_degree == 1
+    assert "~\u221d" not in grammar.ops
 
 
 def test_rolling_ratio_and_monotonicity_are_accepted():

@@ -14,6 +14,7 @@ from autogram.dsl import ast as A
 from autogram.dsl.evaluate import eval_term
 from autogram.loader.gtib import (
     AUTOGRAM_PROFILE_ATTR,
+    _infer_rate_window_seconds,
     _materialize_raw,
     infer_tabular_profile,
     prepare_gtib,
@@ -669,6 +670,21 @@ def test_gtib_materialization_infers_two_minute_rate_cadence():
     assert pd.isna(values.iloc[0])
     assert values.iloc[1:].tolist() == [10.0, 10.0]
     assert related["raw_input_rate"]["window_seconds"] == 120
+
+
+def test_rate_cadence_inference_groups_independent_consumer_origins():
+    frame = pd.DataFrame({
+        "timestamp": pd.to_datetime([
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:01:00",
+            "2026-01-01 00:00:30",
+            "2026-01-01 00:01:30",
+        ]),
+        "consumer_id": ["a", "a", "b", "b"],
+        "minute_index": [0, 1, 0, 1],
+    })
+
+    assert _infer_rate_window_seconds(frame) == 60
 
 
 def test_materialization_preserves_original_minute_indices_after_slice():

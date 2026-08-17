@@ -393,7 +393,7 @@ class Rule:
         """Structural identity ignoring the tag (used for dedup / archive keys)."""
         return repr((
             self.binder,
-            self.atom.unparse(),
+            self.atom,
             self.condition,
         ))
 

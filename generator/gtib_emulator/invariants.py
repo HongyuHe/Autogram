@@ -24,7 +24,6 @@ import numpy as np
 import pandas as pd
 
 from .config import EmulatorConfig
-from .deriver import derive_consumer, trajectory_alert
 
 
 @dataclass
@@ -102,35 +101,118 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
     label_bad = 0
     for rec in records:
         frame = rec["frame"]
-        expected = derive_consumer(
-            cfg,
-            rec["consumer"],
-            rec["obs"],
-            rec["phys"],
-        )
-        for column in (
-            "input_rate_bytes_per_min",
-            "output_rate_bytes_per_min",
-            "completeness_ratio",
-            "completeness_ratio_1h",
-            "backlog_bytes",
-            "cum_lost_bytes",
-        ):
+        obs = rec["obs"]
+        phys = rec["phys"]
+        spm = cfg.raw_steps_per_minute
+        win = cfg.minutes_per_smoothing_window
+        minute_values = []
+        for counter in (obs.input_counted, obs.output_counted):
+            filled = pd.DataFrame(counter.T).ffill().to_numpy().T
+            boundary = filled.reshape(
+                filled.shape[0], -1, spm,
+            )[:, :, -1]
+            delta = np.diff(
+                boundary,
+                axis=1,
+                prepend=boundary[:, :1],
+            )
+            reset = obs.reset_flag.reshape(
+                obs.reset_flag.shape[0], -1, spm,
+            ).any(axis=2)
+            valid = np.isfinite(delta) & (delta >= 0.0) & ~reset
+            valid[:, 0] = False
+            minute_values.append((delta, valid))
+        common_valid = minute_values[0][1] & minute_values[1][1]
+        rates = []
+        for delta, _valid in minute_values:
+            usable = np.where(common_valid, delta, np.nan)
+            summed = np.nansum(usable, axis=0)
+            rates.append(np.where(
+                common_valid.any(axis=0),
+                summed,
+                np.nan,
+            ))
+        input_rate, output_rate = rates
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.where(
+                input_rate > 0.0,
+                output_rate / input_rate,
+                np.nan,
+            )
+        ratio_1h = (
+            pd.Series(output_rate)
+            .rolling(win, min_periods=win)
+            .sum()
+            / pd.Series(input_rate)
+            .rolling(win, min_periods=win)
+            .sum()
+        ).to_numpy()
+        backlog = phys.backlog.reshape(
+            phys.backlog.shape[0], -1, spm,
+        )[:, :, -1].sum(axis=0)
+        loss = phys.cum_true_loss.reshape(
+            phys.cum_true_loss.shape[0], -1, spm,
+        )[:, :, -1].sum(axis=0)
+        expected_columns = {
+            "input_rate_bytes_per_min": input_rate,
+            "output_rate_bytes_per_min": output_rate,
+            "completeness_ratio": ratio,
+            "completeness_ratio_1h": ratio_1h,
+            "backlog_bytes": backlog,
+            "cum_lost_bytes": loss,
+        }
+        for column, expected_values in expected_columns.items():
             if not np.allclose(
                 frame[column].to_numpy(dtype=float),
-                expected[column].to_numpy(dtype=float),
+                expected_values,
                 rtol=1e-12,
                 atol=1e-9,
                 equal_nan=True,
             ):
                 derived_bad += 1
+        below = np.where(
+            np.isfinite(ratio_1h),
+            ratio_1h < cfg.alerting.alert_threshold,
+            False,
+        )
+        expected_static = np.zeros(len(frame), dtype=bool)
+        run = 0
+        for index, active in enumerate(below):
+            run = run + 1 if active else 0
+            expected_static[index] = (
+                run >= cfg.alerting.alert_duration_minutes
+            )
         static_bad += int(np.count_nonzero(
             frame["static_alert"].to_numpy(dtype=bool)
-            != expected["static_alert"].to_numpy(dtype=bool)
+            != expected_static
         ))
+        deficit = input_rate - output_rate
+        low = np.where(
+            np.isfinite(ratio_1h),
+            ratio_1h < cfg.alerting.good_data_threshold,
+            False,
+        )
+        deficit_sum = pd.Series(deficit).rolling(
+            45,
+            min_periods=45,
+        ).sum().to_numpy()
+        slope = pd.Series(ratio_1h).diff(45).to_numpy()
+        expected_trajectory = (
+            low
+            & np.where(
+                np.isfinite(deficit_sum),
+                deficit_sum > 0.0,
+                False,
+            )
+            & np.where(
+                np.isfinite(slope),
+                slope <= 0.0,
+                True,
+            )
+        )
         trajectory_bad += int(np.count_nonzero(
             frame["traj_alert"].to_numpy(dtype=bool)
-            != trajectory_alert(cfg, frame)
+            != expected_trajectory
         ))
         true_loss = frame["is_true_loss"].to_numpy(dtype=bool)
         benign = frame["is_benign_burst"].to_numpy(dtype=bool)
@@ -144,6 +226,10 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
         ))
         label_bad += int(np.count_nonzero(
             frame["oracle_alert"].to_numpy(dtype=bool) != true_loss
+        ))
+        label_bad += int(np.count_nonzero(
+            frame["consumer_id"].to_numpy(dtype=object)
+            != rec["consumer"].consumer_id
         ))
     results.extend((
         _hard(

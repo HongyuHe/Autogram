@@ -168,6 +168,24 @@ def test_structured_rule_signatures_do_not_collide_on_condition_text():
     assert first.condition.unparse() == second.condition.unparse()
     assert first.signature() != second.signature()
 
+    category_a = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "a",
+            (("b->1, c", 2),),
+            3,
+        ),
+    )
+    category_b = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "a->b",
+            (("1, c", 2),),
+            3,
+        ),
+    )
+    assert category_a.signature() != category_b.signature()
+
 
 def test_overlapping_add_aggregate_does_not_emit_set_valued_sum_alias():
     frame = pd.DataFrame({

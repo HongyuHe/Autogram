@@ -262,11 +262,18 @@ def _infer_rate_window_seconds(derived: pd.DataFrame) -> int:
     """Infer the timestamp step represented by one increment of ``minute_index``."""
     from ..dsl.evaluate import _datetime_ns
 
+    from ..dsl.evaluate import typed_group_key
+
     times = _datetime_ns(derived["timestamp"].to_numpy())
     minutes = derived["minute_index"].to_numpy(dtype=np.int64)
+    consumers = derived["consumer_id"].to_numpy(dtype=object)
+    groups = {}
+    for index, consumer in enumerate(consumers):
+        groups.setdefault(typed_group_key(consumer), []).append(index)
     steps = set()
-    for left in range(len(derived) - 1):
-        for right in range(left + 1, len(derived)):
+    for indices in groups.values():
+        ordered = sorted(indices, key=lambda index: minutes[index])
+        for left, right in zip(ordered, ordered[1:]):
             delta_index = int(minutes[right]) - int(minutes[left])
             if delta_index == 0:
                 continue
@@ -278,7 +285,6 @@ def _infer_rate_window_seconds(derived: pd.DataFrame) -> int:
             step = delta_time // delta_index
             if step > 0:
                 steps.add(step)
-            break
     if not steps:
         return 60
     if len(steps) != 1:

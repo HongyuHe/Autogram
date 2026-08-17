@@ -330,6 +330,11 @@ def _augment_profiled_dataframe_spec(df, spec):
         if getattr(spec, "aggregations_widened", False)
         else profile_agg_kinds or tuple(onto.agg_kinds)
     )
+    pinned = bool(
+        spec.temporal_bounds_widened
+        or spec.advanced_bounds_widened
+        or spec.degree_widened
+    )
     ontology = replace(
         onto,
         binders=binders,
@@ -345,7 +350,10 @@ def _augment_profiled_dataframe_spec(df, spec):
             + (
                 ("~∝",)
                 if (
-                    profile.get("proportional", False)
+                    (
+                        profile.get("proportional", False)
+                        and not pinned
+                    )
                     or getattr(
                         spec,
                         "proportional_widened",
@@ -396,11 +404,6 @@ def _augment_profiled_dataframe_spec(df, spec):
             filter_column=str(raw.get("filter_column", "")),
             filter_values=tuple(raw.get("filter_values", ())),
         ))
-    pinned = bool(
-        spec.temporal_bounds_widened
-        or spec.advanced_bounds_widened
-        or spec.degree_widened
-    )
     advanced_enabled = (
         bool(spec.advanced_enabled)
         if pinned
