@@ -540,7 +540,7 @@ def test_compiler_rejects_reserved_numeric_role_tokens(role):
     "column",
     ["a == 1, b", "b == 2, c", "a::b", "a\n"],
 )
-def test_compiler_requires_plain_condition_column_identifiers(column):
+def test_compiler_accepts_external_condition_column_labels(column):
     base = _node_template_spec()
     invalid = GrammarSpec(
         **{
@@ -549,8 +549,8 @@ def test_compiler_requires_plain_condition_column_identifiers(column):
         }
     )
 
-    with pytest.raises(CompileError, match="plain identifier"):
-        compile_spec(invalid)
+    adapter = compile_spec(invalid)
+    assert column in adapter.condition_columns
 
 
 def test_compiler_rejects_nonpositive_degree_bound():

@@ -1175,10 +1175,6 @@ def _related_aggregate(template, frame: Frame):
 
     parent_times, parent_groups = _parent_time_index(template, frame)
     child_partitions = _child_partition_index(template, frame, child)
-    total_partitions = sum(
-        len(partitions)
-        for partitions in child_partitions.values()
-    )
     output = np.full(frame.n_rows, np.nan, dtype=float)
     overflow = np.zeros(frame.n_rows, dtype=bool)
     window_ns = int(pd.Timedelta(seconds=int(template.window_seconds)).value)
@@ -1201,13 +1197,13 @@ def _related_aggregate(template, frame: Frame):
         starts = parent_times[ordered_parent]
         ends, ends_saturated = _saturating_add_ns(starts, window_ns)
         contribution_matrix = np.zeros(
-            (len(ordered_parent), total_partitions),
+            (len(ordered_parent), len(partitions)),
             dtype=float,
         )
         complete = np.ones(len(ordered_parent), dtype=bool)
         any_valid = np.zeros(len(ordered_parent), dtype=bool)
         blown = np.zeros(len(ordered_parent), dtype=bool)
-        for partition in partitions:
+        for local_index, partition in enumerate(partitions):
             times = partition["times"]
             interval_starts = np.searchsorted(times, starts, side="left")
             # A saturated window is clamped to the representable ceiling, so its upper bound has
@@ -1244,7 +1240,7 @@ def _related_aggregate(template, frame: Frame):
                 any_valid |= partition_valid
                 contribution_matrix[
                     :,
-                    int(partition["sum_index"]),
+                    local_index,
                 ] = contribution
                 continue
             prior_boundaries = (
@@ -1313,9 +1309,9 @@ def _related_aggregate(template, frame: Frame):
             any_valid |= partition_valid
             contribution_matrix[
                 :,
-                int(partition["sum_index"]),
+                local_index,
             ] = contribution
-        if total_partitions:
+        if partitions:
             totals, reduction_overflow = _pairwise_row_sum(
                 contribution_matrix
             )

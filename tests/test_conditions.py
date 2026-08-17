@@ -138,6 +138,37 @@ def test_condition_domains_and_masks_preserve_typed_identity():
     assert not np.any(in_mask & masks[1])
 
 
+def test_structured_rule_signatures_do_not_collide_on_condition_text():
+    atom = A.Compare(A.Ref("x"), "==", A.Ref("y"))
+    first = A.Rule(
+        "record",
+        atom,
+        condition=A.Condition(
+            "",
+            "all",
+            (
+                A.Condition("a", "==", (1,)),
+                A.Condition("b == 2, c", "==", (3,)),
+            ),
+        ),
+    )
+    second = A.Rule(
+        "record",
+        atom,
+        condition=A.Condition(
+            "",
+            "all",
+            (
+                A.Condition("a == 1, b", "==", (2,)),
+                A.Condition("c", "==", (3,)),
+            ),
+        ),
+    )
+
+    assert first.condition.unparse() == second.condition.unparse()
+    assert first.signature() != second.signature()
+
+
 def test_overlapping_add_aggregate_does_not_emit_set_valued_sum_alias():
     frame = pd.DataFrame({
         "a": np.arange(1.0, 21.0),

@@ -391,8 +391,11 @@ class Rule:
 
     def signature(self) -> str:
         """Structural identity ignoring the tag (used for dedup / archive keys)."""
-        condition = f" where {self.condition.unparse()}" if self.condition is not None else ""
-        return f"{self.binder}::{self.atom.unparse()}{condition}"
+        return repr((
+            self.binder,
+            self.atom.unparse(),
+            self.condition,
+        ))
 
 
 @dataclass(frozen=True)

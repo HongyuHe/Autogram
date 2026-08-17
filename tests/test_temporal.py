@@ -1088,6 +1088,13 @@ def test_lag_bound_recovered_from_exact_atomic_sign_law():
     # The opposite direction is not implied by an exact ``x >= 0`` and must not be recovered.
     other = KnownInvariant("lag_nonpositive", "<=", {"lag": ["x", 2]}, 0)
     assert recover_known(result, [other])["recall"] == 0.0
+    strict = KnownInvariant(
+        "lag_positive",
+        ">",
+        {"lag": ["x", 2]},
+        0,
+    )
+    assert recover_known(result, [strict])["recall"] == 0.0
 
 
 def test_lag_bound_recovered_structurally_from_retained_lag_rule():

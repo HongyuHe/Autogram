@@ -42,6 +42,7 @@ def _base_spec() -> GrammarSpec:
         family_selectors=(),
         binder_enumerate={"network": "singleton"},
         cell_codec=CellCodec(kind="scalar"),
+        advanced_enabled=True,
     )
 
 

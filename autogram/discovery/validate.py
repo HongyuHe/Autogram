@@ -2111,9 +2111,18 @@ def prepare_proxy_suite(regime, seed: int = 0,
         }
     ):
         _enable_shape_capabilities(nG, shape, nds)
+    presence_grammar = replace(
+        nG,
+        ops=("<|>",),
+        conditional_enabled=False,
+        condition_columns={},
+        max_conditioned_rules=0,
+    )
     presence_rules_by_signature = {
         rule.signature(): rule
-        for rule in EnumerationProposer(nG)._candidate_rules()
+        for rule in EnumerationProposer(
+            presence_grammar
+        ).propose()
         if isinstance(rule.atom, A.Compare)
         and rule.atom.op == "<|>"
     }

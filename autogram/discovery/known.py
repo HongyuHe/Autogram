@@ -599,7 +599,12 @@ def _exact_lag_bound_columns(result: DiscoveryResult, lag_op: str) -> set:
     ds = result.dataset
     nm = ds.name_model
     lower = lag_op in (">=", ">")
-    direction_ops = {">=", ">"} if lower else {"<=", "<"}
+    direction_ops = (
+        {">"} if lag_op == ">"
+        else {"<"} if lag_op == "<"
+        else {">=", ">"} if lower
+        else {"<=", "<"}
+    )
     cols: set = set()
     for ev in result.portfolio:
         if ev.rule.condition is not None:

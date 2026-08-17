@@ -396,6 +396,16 @@ def _augment_profiled_dataframe_spec(df, spec):
             filter_column=str(raw.get("filter_column", "")),
             filter_values=tuple(raw.get("filter_values", ())),
         ))
+    pinned = bool(
+        spec.temporal_bounds_widened
+        or spec.advanced_bounds_widened
+        or spec.degree_widened
+    )
+    advanced_enabled = (
+        bool(spec.advanced_enabled)
+        if pinned
+        else bool(profile.get("advanced", False))
+    )
     return replace(
         spec,
         patterns=tuple(patterns),
@@ -407,8 +417,22 @@ def _augment_profiled_dataframe_spec(df, spec):
         time_index=time_index,
         group_keys=group_keys,
         condition_columns=condition_columns,
-        conditional_enabled=bool(condition_columns),
-        temporal_enabled=bool(time_index),
+        conditional_enabled=bool(
+            condition_columns
+            and (
+                spec.conditional_enabled
+                if pinned
+                else True
+            )
+        ),
+        temporal_enabled=bool(
+            time_index
+            and (
+                spec.temporal_enabled
+                if pinned
+                else True
+            )
+        ),
         max_lag=(
             max(
                 int(getattr(spec, "max_lag", 0)),
@@ -440,21 +464,22 @@ def _augment_profiled_dataframe_spec(df, spec):
                 )
             }))
         ),
-        related_templates=tuple(related_templates),
-        boolean_roles=boolean_roles,
+        related_templates=(
+            tuple(related_templates)
+            if advanced_enabled
+            else ()
+        ),
+        boolean_roles=(
+            boolean_roles
+            if advanced_enabled
+            else {}
+        ),
         role_exclusions=tuple(
             exclusion
             for exclusion in getattr(spec, "role_exclusions", ())
             if set(exclusion) <= set(roles)
         ),
-        advanced_enabled=(
-            bool(
-                getattr(spec, "advanced_enabled", False)
-                or profile.get("advanced", False)
-            )
-            if getattr(spec, "advanced_bounds_widened", False)
-            else bool(profile.get("advanced", False))
-        ),
+        advanced_enabled=advanced_enabled,
         run_lengths=(
             tuple(sorted({
                 *(
@@ -484,13 +509,14 @@ def _augment_profiled_dataframe_spec(df, spec):
             )
         ),
         metadata_columns=metadata_columns,
-        band_enabled=bool(profile.get("band_enabled", False)),
+        band_enabled=(
+            bool(spec.band_enabled)
+            if pinned
+            else bool(profile.get("band_enabled", False))
+        ),
         max_degree=(
-            max(
-                int(getattr(spec, "max_degree", 1)),
-                max(1, int(profile.get("max_degree", 0))),
-            )
-            if getattr(spec, "degree_widened", False)
+            max(1, int(spec.max_degree))
+            if pinned
             else max(1, int(profile.get("max_degree", 0)))
         ),
     )

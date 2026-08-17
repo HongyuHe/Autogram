@@ -1355,18 +1355,9 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     # dataset whose induced codec names a different primary key. The proposal is reused as tier 0,
     # so this costs no extra induction.
     initial_spec = induce_spec(list(df.columns), inducer)
-    tier_specs = [initial_spec]
-    merged_spec = initial_spec
-    for _tier in tiers[1:]:
-        merged_spec = _merge_specs(
-            merged_spec,
-            induce_spec(list(df.columns), inducer),
-            columns=list(df.columns),
-        )
-        tier_specs.append(merged_spec)
     split_dataset, _split_grammar = build_dataframe_grammar(
         df,
-        tier_specs[-1],
+        initial_spec,
         search_cfg=scfg,
         name=f"{name}_split",
     )
@@ -1445,7 +1436,15 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             break
         # Tier 0 reuses the proposal already made for the split's cell codec; later tiers
         # (re-)propose the grammar from the columns.
-        spec = tier_specs[ti]
+        spec = (
+            initial_spec
+            if ti == 0
+            else _merge_specs(
+                accumulated,
+                induce_spec(list(df.columns), inducer),
+                columns=list(df.columns),
+            )
+        )
         if ti > 0:
             reinductions += 1
         spec = _widen_spec(spec, all_aggs=caps.get("all_aggs", False),
@@ -1458,6 +1457,15 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
                            advanced=caps.get("advanced", False),
                            run_lengths=caps.get("run_lengths", ()),
                            max_conjunction_terms=caps.get("max_conjunction_terms", 3))
+        spec = replace(
+            spec,
+            temporal_bounds_widened=True,
+            advanced_bounds_widened=True,
+            degree_widened=True,
+            conditional_enabled=bool(
+                spec.conditional_enabled and ti >= 3
+            ),
+        )
         accumulated = spec
         runtime_spec = normalize_dataframe_spec(df, spec, scfg)
         ds, G = build_dataframe_grammar(
