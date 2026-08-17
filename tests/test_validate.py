@@ -574,6 +574,77 @@ def test_odd_sparse_null_columns_balance_pooled_signs():
     assert not np.any(null == 0.0)
 
 
+def test_odd_sparse_null_columns_balance_each_quantified_role():
+    nodes = tuple(f"n{index}" for index in range(100))
+    columns = tuple(
+        name
+        for node in nodes
+        for name in (f"x_{node}", f"y_{node}")
+    )
+    frame = pd.DataFrame({
+        name: [1.0]
+        for name in columns
+    })
+    spec = GrammarSpec(
+        name="odd-role-null",
+        patterns=(
+            ColumnPattern(
+                "x",
+                "regex",
+                "measurement",
+                "x",
+                regex=r"^x_(?P<source>n\d+)$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+            ColumnPattern(
+                "y",
+                "regex",
+                "measurement",
+                "y",
+                regex=r"^y_(?P<source>n\d+)$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("node",),
+            ref_roles={"node": ("x", "y")},
+            fam_roles={"node": ()},
+        ),
+        ref_templates=(
+            RefTemplate("node", "x", "x_{X}"),
+            RefTemplate("node", "y", "y_{X}"),
+        ),
+        family_selectors=(),
+        binder_enumerate={"node": "per_node"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    dataset = build_dataset(
+        frame.columns,
+        frame.to_numpy(dtype=float),
+        compile_spec(spec),
+        name="odd_role_null",
+        timestamps=np.arange(1),
+    )
+    null = V._runtime_null_dataset(
+        dataset,
+        seed=0,
+        definition_targets=False,
+    ).observed
+
+    for prefix in ("x_", "y_"):
+        values = np.array([
+            null.col(name).item()
+            for name in columns
+            if name.startswith(prefix)
+        ])
+        assert np.count_nonzero(values > 0.0) == 50
+        assert np.count_nonzero(values < 0.0) == 50
+
+
 def test_score_recovery_exposes_numeric_one_sided_families(monkeypatch):
     # nonneg/nonpos are surfaced through the same uniform numeric recovery interface joint tuning
     # uses (getattr(rec, shape) >= 0.8), i.e. coverage of the planted one-sided columns.

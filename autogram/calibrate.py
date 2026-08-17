@@ -631,10 +631,21 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                         (),
                     )
                 }
+                if variants:
+                    return variants
                 options = [
                     quantified_variants(item)
                     for item in value
                 ]
+                combinations = math.prod(
+                    len(option)
+                    for option in options
+                )
+                if combinations > 10_000:
+                    raise ValueError(
+                        "quantified split abstraction exceeds 10000 "
+                        "role alternatives; tighten the induced schema"
+                    )
                 variants.update(
                     frozenset(items)
                     for items in itertools.product(*options)
@@ -692,8 +703,28 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                     quantified_variants(item)
                     for item in value
                 ]
+                combinations = math.prod(
+                    len(option)
+                    for option in options
+                )
+                if combinations > 10_000:
+                    raise ValueError(
+                        "quantified split abstraction exceeds 10000 "
+                        "role alternatives; tighten the induced schema"
+                    )
+                commutative = bool(
+                    value
+                    and all(
+                        isinstance(item, tuple)
+                        and item
+                        and item[0] == "bound"
+                        for item in value
+                    )
+                )
                 return {
-                    tuple(items)
+                    tuple(sorted(items, key=str))
+                    if commutative
+                    else tuple(items)
                     for items in itertools.product(*options)
                 }
             return abstract_column_variants(value)
@@ -703,9 +734,9 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
             variants = set()
             if candidates is not None:
                 for candidate in candidates:
+                    candidate = sum_balance_recovery_alias(candidate)
                     variants.update(
-                        sum_balance_recovery_alias(item)
-                        for item in quantified_variants(candidate)
+                        quantified_variants(candidate)
                     )
             abstracted.append(variants)
         for left in range(len(known)):

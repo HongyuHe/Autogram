@@ -1608,6 +1608,25 @@ def _runtime_null_dataset(
     matrix = np.empty_like(dataset.observed.matrix, dtype=float)
     generated_columns = {}
     adapter = dataset.name_model.adapter
+    odd_sign_by_column = {}
+    for binder in adapter.binders:
+        bindings = enumerate_bindings(binder, dataset.name_model)
+        for role in adapter.refs_for(binder):
+            columns = []
+            for binding in bindings:
+                column = resolve_ref(
+                    role,
+                    binder,
+                    binding,
+                    dataset.name_model,
+                )
+                if column is not None and column not in columns:
+                    columns.append(column)
+            for position, column in enumerate(columns):
+                odd_sign_by_column.setdefault(
+                    column,
+                    1 if position % 2 == 0 else -1,
+                )
     boolean_columns = set()
     for binder in adapter.binders:
         for binding in enumerate_bindings(
@@ -1640,7 +1659,10 @@ def _runtime_null_dataset(
             rng,
             binary=binary,
             magnitude_ceiling=magnitude_ceiling,
-            odd_sign=1 if index % 2 == 0 else -1,
+            odd_sign=odd_sign_by_column.get(
+                name,
+                1 if index % 2 == 0 else -1,
+            ),
         )
         if presence_masks and not binary:
             generated = _presence_masked(generated, rng)
