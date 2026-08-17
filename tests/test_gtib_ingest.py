@@ -672,6 +672,40 @@ def test_gtib_materialization_infers_two_minute_rate_cadence():
     assert related["raw_input_rate"]["window_seconds"] == 120
 
 
+def test_event_related_join_uses_inferred_rate_cadence():
+    derived = pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=2,
+            freq="2min",
+        ),
+        "consumer_id": ["consumer"] * 2,
+        "minute_index": [0, 1],
+        "input_rate_bytes_per_min": [np.nan, 10.0],
+    })
+    events = pd.DataFrame({
+        "consumer_id": ["consumer"],
+        "type": ["true_loss"],
+        "span_start": [pd.Timestamp("2026-01-01 00:01:30")],
+        "span_end": [pd.Timestamp("2026-01-01 00:01:50")],
+    })
+    prepared = prepare_gtib(derived, events=events)
+    dataset, _grammar = build_dataframe_grammar(
+        prepared,
+        _base_spec(),
+        name="event_two_minute_cadence",
+    )
+    values = eval_term(
+        A.RelatedAgg("event_true_loss"),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert values.tolist() == [1.0, 0.0]
+
+
 def test_rate_cadence_inference_groups_independent_consumer_origins():
     frame = pd.DataFrame({
         "timestamp": pd.to_datetime([

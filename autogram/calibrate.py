@@ -1457,16 +1457,24 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
                            advanced=caps.get("advanced", False),
                            run_lengths=caps.get("run_lengths", ()),
                            max_conjunction_terms=caps.get("max_conjunction_terms", 3))
+        accumulated = spec
         spec = replace(
             spec,
             temporal_bounds_widened=True,
             advanced_bounds_widened=True,
             degree_widened=True,
             conditional_enabled=bool(
-                spec.conditional_enabled and ti >= 3
+                ti >= 3
+                and (
+                    spec.conditional_enabled
+                    or bool(profile.get("condition_columns"))
+                )
+            ),
+            band_enabled=bool(
+                spec.band_enabled
+                or profile.get("band_enabled", False)
             ),
         )
-        accumulated = spec
         runtime_spec = normalize_dataframe_spec(df, spec, scfg)
         ds, G = build_dataframe_grammar(
             df,

@@ -214,9 +214,44 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
             frame["traj_alert"].to_numpy(dtype=bool)
             != expected_trajectory
         ))
-        true_loss = frame["is_true_loss"].to_numpy(dtype=bool)
-        benign = frame["is_benign_burst"].to_numpy(dtype=bool)
-        artifact = frame["is_artifact"].to_numpy(dtype=bool)
+        timestamps = pd.to_datetime(frame["timestamp"])
+        true_loss = np.zeros(len(frame), dtype=bool)
+        benign = np.zeros(len(frame), dtype=bool)
+        artifact = np.zeros(len(frame), dtype=bool)
+        consumer_events = events[
+            events["consumer_id"] == rec["consumer"].consumer_id
+        ] if not events.empty else events
+        for _, event in consumer_events.iterrows():
+            interval_end = timestamps + pd.to_timedelta(
+                cfg.time.rate_window_seconds,
+                unit="s",
+            )
+            active = (
+                (timestamps < pd.Timestamp(event["span_end"]))
+                & (
+                    interval_end
+                    > pd.Timestamp(event["span_start"])
+                )
+            ).to_numpy(dtype=bool)
+            event_type = str(event["type"])
+            if event_type.startswith("true_loss"):
+                true_loss |= active
+            elif event_type == "benign_burst":
+                benign |= active
+            elif event_type == "artifact":
+                artifact |= active
+        label_bad += int(np.count_nonzero(
+            frame["is_true_loss"].to_numpy(dtype=bool)
+            != true_loss
+        ))
+        label_bad += int(np.count_nonzero(
+            frame["is_benign_burst"].to_numpy(dtype=bool)
+            != benign
+        ))
+        label_bad += int(np.count_nonzero(
+            frame["is_artifact"].to_numpy(dtype=bool)
+            != artifact
+        ))
         expected_label = np.full(len(frame), "normal", dtype=object)
         expected_label[artifact] = "artifact"
         expected_label[benign] = "benign_burst"

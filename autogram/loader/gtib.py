@@ -399,7 +399,7 @@ def prepare_gtib(
             "partition_keys": (),
             "parent_time": "timestamp",
             "child_time": "span_start",
-            "window_seconds": 60,
+            "window_seconds": rate_window_seconds,
             "span_start": "span_start",
             "span_end": "span_end",
             "filter_column": "type",

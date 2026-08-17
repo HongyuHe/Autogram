@@ -64,6 +64,21 @@ def test_hard_checks_detect_corrupted_static_alert(result):
     assert not static.passed
 
 
+def test_hard_checks_detect_missing_event_catalogue(result):
+    checks = check_all(
+        result.config,
+        result.records,
+        result.events.iloc[:0].copy(),
+    )
+    label = next(
+        check
+        for check in checks
+        if check.name == "label_priority_definition"
+    )
+
+    assert not label.passed
+
+
 def test_byte_conservation_is_exact(result):
     for rec in result.records:
         phys = rec["phys"]

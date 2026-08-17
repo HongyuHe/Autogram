@@ -1385,6 +1385,28 @@ def test_merge_specs_does_not_reclassify_existing_numeric_role():
     )
 
 
+def test_runtime_tier_pins_do_not_erase_accumulated_capabilities():
+    base = replace(
+        _mini_spec(),
+        conditional_enabled=True,
+        condition_columns={"status": ("ok", "bad")},
+    )
+    pinned_runtime = replace(base, conditional_enabled=False)
+    later = replace(
+        _mini_spec(),
+        conditional_enabled=False,
+        condition_columns={},
+    )
+
+    accumulated = _merge_specs(base, later)
+
+    assert not pinned_runtime.conditional_enabled
+    assert accumulated.conditional_enabled
+    assert accumulated.condition_columns == {
+        "status": ("ok", "bad"),
+    }
+
+
 def test_known_split_keeps_singleton_sum_balance_aliases_together():
     known = [
         KnownInvariant(
