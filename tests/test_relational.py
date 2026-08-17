@@ -964,19 +964,14 @@ def test_span_runtime_null_saturates_extrapolated_end():
     )
     second = replace(template, role="event_second")
 
-    generated = _runtime_relation_null(
-        relation,
-        [template, second],
-        {"timestamp": times},
-        np.random.default_rng(0),
-        definition_targets=False,
-    )
-
-    maximum = generated.loc[
-        generated["span_start"] == pd.Timestamp.max
-    ]
-    assert len(maximum) == 1
-    assert maximum["span_end"].iloc[0] == pd.Timestamp.max
+    with pytest.raises(RuntimeError, match="positive duration"):
+        _runtime_relation_null(
+            relation,
+            [template, second],
+            {"timestamp": times},
+            np.random.default_rng(0),
+            definition_targets=False,
+        )
 
 
 def test_materialized_and_streaming_use_identical_sum_order():

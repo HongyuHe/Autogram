@@ -758,13 +758,13 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
             return abstract_column_variants(value)
 
         abstracted = []
-        for signature in signatures:
+        for index, signature in enumerate(signatures):
             variants = set()
-            candidates = (
-                None
-                if signature is None
-                else _known_matching_signatures(signature)
-            )
+            candidates = []
+            if signature is not None:
+                candidates.extend(_known_matching_signatures(signature))
+            if expansions[index] is not None:
+                candidates.extend(expansions[index])
             if candidates is not None:
                 for candidate in candidates:
                     candidate = sum_balance_recovery_alias(candidate)
@@ -1139,6 +1139,17 @@ def _merge_specs(base, new):
         if (template.binder, template.role) not in seen_related
     )
     filtered_boolean = {}
+    base_templates = {
+        (template.binder, template.template)
+        for template in base.ref_templates
+        if template.role not in set(
+            base.boolean_roles.get(template.binder, ())
+        )
+    }
+    new_templates = {
+        (template.binder, template.role): template.template
+        for template in new.ref_templates
+    }
     for binder, roles in new.boolean_roles.items():
         base_numeric = set(
             base.ontology.ref_roles.get(binder, ())
@@ -1146,6 +1157,10 @@ def _merge_specs(base, new):
         filtered_boolean[binder] = tuple(
             role for role in roles
             if role not in base_numeric
+            and (
+                binder,
+                new_templates.get((binder, role)),
+            ) not in base_templates
         )
     boolean_roles = _union_roles(
         base.boolean_roles,

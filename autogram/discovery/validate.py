@@ -1354,10 +1354,15 @@ def _runtime_relation_null(
                             int(times[ordered[-1]])
                             - int(times[ordered[-2]])
                         )
-                        shifted, _saturated = _saturating_add_ns(
+                        shifted, saturated = _saturating_add_ns(
                             np.asarray([times[row]], dtype=np.int64),
                             step,
                         )
+                        if bool(saturated[0]):
+                            raise RuntimeError(
+                                "runtime span null cannot represent a positive "
+                                "duration at the timestamp ceiling"
+                            )
                         span_end_ns = int(shifted[0])
                     else:
                         step = max(
@@ -1617,7 +1622,10 @@ def _runtime_null_dataset(
     matrix = np.empty_like(dataset.observed.matrix, dtype=float)
     generated_columns = {}
     adapter = dataset.name_model.adapter
-    odd_sign_by_column = {}
+    odd_sign_by_column = {
+        name: 1 if index % 2 == 0 else -1
+        for index, name in enumerate(dataset.observed.names)
+    }
     role_columns = []
     for binder in adapter.binders:
         bindings = enumerate_bindings(binder, dataset.name_model)
@@ -1634,12 +1642,43 @@ def _runtime_null_dataset(
                     columns.append(column)
             if columns:
                 role_columns.append(columns)
-    for columns in sorted(role_columns, key=len):
-        for position, column in enumerate(columns):
-            odd_sign_by_column.setdefault(
-                column,
-                1 if position % 2 == 0 else -1,
+    for _iteration in range(max(1, 10 * len(odd_sign_by_column))):
+        changed = False
+        for columns in role_columns:
+            imbalance = sum(
+                odd_sign_by_column[column]
+                for column in columns
             )
+            if abs(imbalance) <= 1:
+                continue
+            target = 1 if imbalance > 0 else -1
+            candidate = next(
+                (
+                    column for column in columns
+                    if odd_sign_by_column[column] == target
+                ),
+                None,
+            )
+            if candidate is not None:
+                odd_sign_by_column[candidate] *= -1
+                changed = True
+        if not changed:
+            break
+    unbalanced = [
+        columns
+        for columns in role_columns
+        if (
+            len(columns) > 1
+            and abs(sum(
+                odd_sign_by_column[column]
+                for column in columns
+            )) > 1
+        )
+    ]
+    if unbalanced:
+        raise RuntimeError(
+            "runtime null cannot balance overlapping quantified roles"
+        )
     boolean_columns = set()
     for binder in adapter.binders:
         for binding in enumerate_bindings(

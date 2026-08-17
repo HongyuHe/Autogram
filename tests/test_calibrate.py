@@ -1303,6 +1303,16 @@ def test_known_split_matches_alternative_roles_and_family_witnesses():
             ),
             KnownInvariant("other", "==", "x_n0", "y_n1"),
         ],
+        [
+            KnownInvariant("n0", "==", "x_n0", "y_n0"),
+            KnownInvariant(
+                "n1",
+                "==",
+                "x_n1",
+                {"sum": ["y_n1"]},
+            ),
+            KnownInvariant("other", ">=", "total_n0", 0),
+        ],
     )
 
     for catalogue_index, known in enumerate(catalogues):
@@ -1322,15 +1332,41 @@ def test_known_split_matches_alternative_roles_and_family_witnesses():
 
 
 def test_merge_specs_does_not_reclassify_existing_numeric_role():
-    base = _mini_spec()
+    base = replace(
+        _mini_spec(),
+        ref_templates=(
+            RefTemplate("node", "a", "metric_{X}"),
+        ),
+    )
     later = replace(
         base,
-        boolean_roles={"node": ("a",)},
+        ontology=RoleOntology(
+            binders=("node",),
+            ref_roles={
+                "node": ("a", "b", "boolean_alias"),
+            },
+            fam_roles={"node": ("fam",)},
+        ),
+        ref_templates=(
+            *base.ref_templates,
+            RefTemplate(
+                "node",
+                "boolean_alias",
+                "metric_{X}",
+            ),
+        ),
+        boolean_roles={
+            "node": ("a", "boolean_alias"),
+        },
     )
 
     merged = _merge_specs(base, later)
 
     assert "a" not in merged.boolean_roles.get("node", ())
+    assert "boolean_alias" not in merged.boolean_roles.get(
+        "node",
+        (),
+    )
 
 
 def test_known_split_keeps_singleton_sum_balance_aliases_together():
