@@ -24,8 +24,8 @@ from autogram.discovery.validate import score_recovery
 from autogram.dsl import ast as A
 from autogram.loader.loader import build_dataset
 from autogram.loader.names import NameModel
-from autogram.schema.compiler import compile_spec
-from autogram.schema.spec import FamilySelector, RefTemplate
+from autogram.schema.compiler import CompileError, compile_spec
+from autogram.schema.spec import FamilySelector, RefTemplate, RelatedTemplate
 
 
 def _broken_peer_payload(peer_group: str = "") -> dict:
@@ -579,6 +579,37 @@ def test_subagent_prunes_boolean_roles_not_declared_as_refs():
 
     assert spec.boolean_roles.get("network", ()) == ()
     _validate_schema_completeness(spec, data.columns)
+
+
+def test_compiler_rejects_related_templates_without_advanced_capability():
+    base = _spec_from_json(
+        _broken_peer_payload(peer_group="destination")
+    )
+    disabled = replace(
+        base,
+        related_templates=(
+            RelatedTemplate(
+                binder="network",
+                role="joined",
+                relation="raw",
+                column="value",
+                mode="sum_last",
+                parent_keys=(),
+                child_keys=(),
+                partition_keys=(),
+                parent_time="timestamp",
+                child_time="timestamp",
+                window_seconds=60,
+            ),
+        ),
+        advanced_enabled=False,
+    )
+
+    with pytest.raises(
+        CompileError,
+        match="related templates require advanced_enabled=True",
+    ):
+        compile_spec(disabled)
 
 
 def test_subagent_prunes_declared_binder_with_no_live_bindings():

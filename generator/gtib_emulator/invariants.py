@@ -48,33 +48,126 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
 
     results: list[InvariantResult] = []
 
-    # -- Hard: physical byte conservation  I == O + Q + L  --------------------
-    max_resid = 0.0
-    max_scale = 1.0
+    # -- Hard: every physical state value is finite --------------------------
+    physical_fields = (
+        "cum_input",
+        "cum_output_physical",
+        "cum_true_loss",
+        "backlog",
+    )
+    nonfinite_by_field = {field: 0 for field in physical_fields}
     for rec in records:
         phys = rec["phys"]
-        max_resid = max(max_resid, float(phys.conservation_residual().max()))
-        max_scale = max(max_scale, float(phys.cum_input.max()))
-    rel = max_resid / max_scale
+        for field in physical_fields:
+            values = np.asarray(getattr(phys, field))
+            nonfinite_by_field[field] += int(np.count_nonzero(
+                ~np.isfinite(values)
+            ))
+    physical_nonfinite = sum(nonfinite_by_field.values())
+    nonfinite_detail = ", ".join(
+        f"{field}={count}"
+        for field, count in nonfinite_by_field.items()
+        if count
+    ) or "none"
+    results.append(_hard(
+        "physical_state_is_finite",
+        physical_nonfinite == 0,
+        f"{physical_nonfinite} non-finite physical state values "
+        f"({nonfinite_detail}).",
+    ))
+
+    # -- Hard: every physical byte state is non-negative --------------------
+    minimum_by_field = {}
+    for field in physical_fields:
+        minima = []
+        for rec in records:
+            values = np.asarray(getattr(rec["phys"], field))
+            if values.size and np.all(np.isfinite(values)):
+                minima.append(float(np.min(values)))
+        minimum_by_field[field] = (
+            min(minima)
+            if minima
+            else float("nan")
+        )
+    physical_non_negative = (
+        physical_nonfinite == 0
+        and all(
+            minimum >= -1e-9
+            for minimum in minimum_by_field.values()
+        )
+    )
+    results.append(_hard(
+        "physical_state_is_non_negative",
+        physical_non_negative,
+        "minimum physical values: " + ", ".join(
+            f"{field}={minimum:.3g}"
+            for field, minimum in minimum_by_field.items()
+        ),
+    ))
+
+    # -- Hard: physical byte conservation  I == O + Q + L  --------------------
+    max_resid = 0.0
+    max_relative = 0.0
+    conservation_values_finite = physical_nonfinite == 0
+    for rec in records:
+        phys = rec["phys"]
+        residual = np.asarray(phys.conservation_residual())
+        cumulative_input = np.asarray(phys.cum_input)
+        if (
+            not residual.size
+            or residual.shape != cumulative_input.shape
+            or not np.all(np.isfinite(residual))
+            or not np.all(np.isfinite(cumulative_input))
+        ):
+            conservation_values_finite = False
+            continue
+        max_resid = max(max_resid, float(np.max(residual)))
+        relative = residual / np.maximum(
+            np.abs(cumulative_input),
+            1.0,
+        )
+        max_relative = max(
+            max_relative,
+            float(np.max(relative)),
+        )
+    if not conservation_values_finite:
+        max_relative = float("inf")
     results.append(_hard(
         "physical_byte_conservation",
-        rel < 1e-6,
-        f"max |I-(O+Q+L)| = {max_resid:.3g} bytes (relative {rel:.2e}); "
+        conservation_values_finite and max_relative < 1e-6,
+        f"max |I-(O+Q+L)| = {max_resid:.3g} bytes "
+        f"(pointwise relative to input {max_relative:.2e}); "
         "input == output + backlog + true_loss must hold exactly."))
 
     # -- Hard: backlog non-negative ------------------------------------------
-    min_backlog = min(float(rec["phys"].backlog.min()) for rec in records)
+    backlogs = [
+        np.asarray(rec["phys"].backlog)
+        for rec in records
+    ]
+    backlog_values_finite = all(np.all(np.isfinite(v)) for v in backlogs)
+    min_backlog = (
+        min(float(np.min(v)) for v in backlogs)
+        if backlog_values_finite
+        else float("nan")
+    )
     results.append(_hard(
-        "backlog_non_negative", min_backlog >= -1e-9,
+        "backlog_non_negative",
+        backlog_values_finite and min_backlog >= -1e-9,
         f"min backlog = {min_backlog:.3g} bytes; the queue can never hold negative bytes."))
 
     # -- Hard: cumulative true loss non-decreasing ---------------------------
     worst = 0.0
+    true_loss_values_finite = True
     for rec in records:
-        d = np.diff(rec["phys"].cum_true_loss, axis=1)
+        cumulative_loss = np.asarray(rec["phys"].cum_true_loss)
+        if not np.all(np.isfinite(cumulative_loss)):
+            true_loss_values_finite = False
+            continue
+        d = np.diff(cumulative_loss, axis=1)
         worst = min(worst, float(d.min()) if d.size else 0.0)
     results.append(_hard(
-        "true_loss_monotone_non_decreasing", worst >= -1e-6,
+        "true_loss_monotone_non_decreasing",
+        true_loss_values_finite and worst >= -1e-6,
         f"min step in cumulative true loss = {worst:.3g}; loss can only accumulate."))
 
     # -- Hard: observed counters monotone within reset-free runs -------------

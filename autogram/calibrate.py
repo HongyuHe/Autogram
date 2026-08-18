@@ -27,8 +27,8 @@ import numpy as np
 import pandas as pd
 
 from .config import DiscoveryConfig, SearchConfig
-from .dsl.evaluate import typed_unique
 from .discovery.export import write_rules_dl
+from .discovery.evaluate import DataOnlyEvaluator
 from .discovery.induce import induce_spec, make_inducer
 from .discovery.induce import _spec_to_json
 from .discovery.known import KnownInvariant, abstract_shapes, load_known, recover_known
@@ -379,7 +379,8 @@ def _validate_split_inputs(known: List[KnownInvariant], frac: float) -> None:
 
 def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                  frame=None, zero_tol: float = 1e-4,
-                 recovery_dataset=None, recovery_rules=None):
+                 recovery_dataset=None, recovery_rules=None,
+                 recovery_witnesses=None):
     """Partition known invariants into a calibration set and a structurally disjoint validation set.
 
     The split is by *recovery equivalence*, not by list position and not by exact signature. Two
@@ -393,7 +394,9 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
     Equivalence is therefore decided by `relation_signature_matches` -- the very predicate
     `recover_known` uses -- and entries are grouped into connected components under it, because
     tolerance-based matching is not transitive and a chain of near-identical thresholds must still
-    travel together.
+    travel together. Runtime witness catalogues add the stronger closure: every set of known
+    invariants matched by one grounded candidate rule is unioned, separately for each tier's
+    dataset/grammar so later re-induction or capability widening cannot create a cross-split alias.
     """
     _validate_split_inputs(known, frac)
     signatures = [_known_signature(invariant) for invariant in known]
@@ -776,15 +779,45 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                 ):
                     union(left, right)
 
+    witnesses = []
     if recovery_dataset is not None and recovery_rules is not None:
+        witnesses.append((recovery_dataset, recovery_rules))
+
+    for witness_dataset, witness_rules in itertools.chain(
+        witnesses,
+        (
+            recovery_witnesses
+            if recovery_witnesses is not None
+            else ()
+        ),
+    ):
         # A quantified rule is one recovery witness even though each binding emits a different
         # concrete-column signature. Every known relation that one candidate rule can recover must
         # stay on the same side of the split, or calibration on one binding predetermines held-out
-        # recall on another.
-        for rule in recovery_rules:
+        # recall on another. Each grammar is matched against its own runtime dataset because later
+        # patterns can change bindings/groundings even when the accumulated vocabulary is monotone.
+        witness_frame = witness_dataset.observed
+        witness_expansions = [
+            None
+            if signature is None
+            else [
+                _known_canonicalize(
+                    candidate,
+                    witness_frame,
+                    zero_tol,
+                    exact=_known_is_exact(signature),
+                )
+                for candidate in _known_matching_signatures(
+                    signature,
+                )
+            ]
+            for signature in signatures
+        ]
+        witness_evaluator = None
+        for rule in witness_rules:
             relations = set(rule_relations(
                 rule,
-                recovery_dataset,
+                witness_dataset,
             ))
             from .dsl import ast as A
             from .dsl.binders import (
@@ -793,6 +826,24 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
             )
 
             atom = rule.atom
+            if (
+                not relations
+                and isinstance(
+                    atom,
+                    (A.BooleanDefinition, A.BandDefinition),
+                )
+            ):
+                if witness_evaluator is None:
+                    witness_evaluator = DataOnlyEvaluator(
+                        witness_dataset,
+                        DiscoveryConfig(seed=seed),
+                    )
+                fitted = witness_evaluator.evaluate(rule)
+                relations = set(rule_relations(
+                    rule,
+                    witness_dataset,
+                    fitted.parameters,
+                ))
             if (
                 rule.condition is None
                 and isinstance(atom, A.Compare)
@@ -820,13 +871,13 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                     }.get(op, op)
                     for binding in enumerate_bindings(
                         rule.binder,
-                        recovery_dataset.name_model,
+                        witness_dataset.name_model,
                     ):
                         column = resolve_ref(
                             measured.role,
                             rule.binder,
                             binding,
-                            recovery_dataset.name_model,
+                            witness_dataset.name_model,
                         )
                         if column is not None:
                             relations.add((
@@ -841,7 +892,7 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                     sum_balance_recovery_alias(
                         _known_canonicalize(
                             relation,
-                            frame,
+                            witness_frame,
                             zero_tol,
                             exact=exact,
                         )
@@ -851,7 +902,9 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                 for exact in (False, True)
             }
             matched = []
-            for index, candidates in enumerate(expansions):
+            for index, candidates in enumerate(
+                witness_expansions,
+            ):
                 if candidates is None:
                     continue
                 exact = _known_is_exact(signatures[index])
@@ -967,19 +1020,27 @@ def _knob_schedule(base: DiscoveryConfig, null_floor: float = 0.5) -> List[Disco
                                             # rungs are real relaxations and not no-ops even when the
                                             # base is already a fixed global band
     low = max(null_floor, min(base.hold_rate_threshold, 0.60))
-    ladder = [
-        base,                                                            # base band (global by default), tuned knobs
-        replace(base, hold_rate_threshold=low),                          # lower threshold
-        replace(base, band_mode="global", tolerance=wide),               # fixed global-band fallback
-        replace(base, band_mode="global", tolerance=wide, hold_rate_threshold=low),
+    if low != base.hold_rate_threshold:
+        return [
+            base,
+            replace(base, hold_rate_threshold=low),
+            replace(base, band_mode="global", tolerance=wide),
+            replace(
+                base,
+                band_mode="global",
+                tolerance=wide,
+                hold_rate_threshold=low,
+            ),
+        ]
+    # At the null floor there is no honest threshold relaxation. Use two intermediate tolerance
+    # rungs instead, keeping the per-tier iteration cost fixed and every attempt meaningful.
+    delta = wide - base.tolerance
+    return [
+        base,
+        replace(base, tolerance=base.tolerance + delta / 3.0),
+        replace(base, tolerance=base.tolerance + 2.0 * delta / 3.0),
+        replace(base, band_mode="global", tolerance=wide),
     ]
-    out: List[DiscoveryConfig] = []
-    for c in ladder:
-        key = (c.band_mode, round(c.tolerance, 4), round(c.hold_rate_threshold, 4))
-        if not out or key != (out[-1].band_mode, round(out[-1].tolerance, 4),
-                              round(out[-1].hold_rate_threshold, 4)):
-            out.append(c)
-    return out
 
 
 def _capability_tiers() -> List[dict]:
@@ -1013,6 +1074,22 @@ def _capability_tiers() -> List[dict]:
             "max_conjunction_terms": 3,
         },
     ]
+
+
+_KNOB_RUNGS_PER_TIER = 4
+
+
+def _reachable_capability_tiers(
+    max_capability_tiers: int,
+    max_iterations: int,
+) -> List[dict]:
+    tiers = _capability_tiers()[:max(1, int(max_capability_tiers))]
+    if int(max_iterations) > 0:
+        reachable = 1 + (
+            int(max_iterations) - 1
+        ) // _KNOB_RUNGS_PER_TIER
+        tiers = tiers[:max(1, reachable)]
+    return tiers
 
 
 def _widen_spec(spec, *, all_aggs: bool = False, max_degree: Optional[int] = None,
@@ -1080,8 +1157,11 @@ def _merge_specs(base, new, columns=None):
       glyphs win.
     * ``binder_enumerate`` -- base strategy wins per binder; new binders are added.  ``max_degree``
       is the max of the two.
-    * ``role_exclusions`` and all dataset-level constants (codec, kinds, link marker, name) are
-      taken from ``base`` unchanged.
+    * ``role_exclusions`` and existing dataset interpretation (codec, kinds, link marker, time
+      and grouping columns, condition domains, name) are taken from ``base`` unchanged. When the
+      actual columns are available, newly proposed metadata is admitted only for columns the base
+      patterns did not interpret; a later proposal therefore cannot silently remove an existing
+      measurement while a newly recognized string label remains out of the numeric matrix.
 
     The result therefore admits **every** rule ``base`` did (a genuine superset) plus the novel
     vocabulary ``new`` contributes -- regardless of what the fresh proposal omitted.
@@ -1120,10 +1200,6 @@ def _merge_specs(base, new, columns=None):
         key: tuple(values)
         for key, values in base.condition_columns.items()
     }
-    for key, values in new.condition_columns.items():
-        conditions[key] = typed_unique(
-            (*conditions.get(key, ()), *tuple(values))
-        )
     seen_related = {
         (template.binder, template.role)
         for template in base.related_templates
@@ -1173,10 +1249,8 @@ def _merge_specs(base, new, columns=None):
             **base.binder_enumerate,
         },
         max_degree=max(base.max_degree, new.max_degree),
-        time_index=base.time_index or new.time_index,
-        group_keys=tuple(dict.fromkeys(
-            (*base.group_keys, *new.group_keys)
-        )),
+        time_index=base.time_index,
+        group_keys=tuple(base.group_keys),
         condition_columns=conditions,
         temporal_enabled=bool(
             base.temporal_enabled or new.temporal_enabled
@@ -1203,9 +1277,7 @@ def _merge_specs(base, new, columns=None):
             base.max_conjunction_terms,
             new.max_conjunction_terms,
         ),
-        metadata_columns=tuple(dict.fromkeys(
-            (*base.metadata_columns, *new.metadata_columns)
-        )),
+        metadata_columns=tuple(base.metadata_columns),
         band_enabled=bool(base.band_enabled or new.band_enabled),
         aggregations_widened=bool(
             base.aggregations_widened
@@ -1227,61 +1299,232 @@ def _merge_specs(base, new, columns=None):
             or new.proportional_widened
         ),
     )
-    if (
-        columns is None
-        or not base.patterns
-        or not merged.patterns
-    ):
+    if columns is None:
         return merged
 
-    from .dsl.binders import enumerate_bindings, resolve_ref
+    from .dsl.binders import (
+        enumerate_bindings,
+        resolve_family,
+        resolve_ref,
+    )
     from .loader.names import NameModel
 
-    base_adapter = compile_spec(base)
-    merged_adapter = compile_spec(merged)
-    base_model = NameModel.from_columns_with_adapter(
-        list(columns),
-        base_adapter,
+    actual_columns = list(columns)
+    actual_column_set = set(actual_columns)
+    base_adapter = None
+    base_model = None
+    if base.patterns:
+        base_adapter = compile_spec(base)
+        base_model = NameModel.from_columns_with_adapter(
+            actual_columns,
+            base_adapter,
+        )
+    base_interpreted_columns = {
+        base.time_index,
+        *base.group_keys,
+        *base.condition_columns,
+        *base.metadata_columns,
+    } - {""}
+    base_interpreted_columns |= (
+        set(base_model.by_name)
+        if base_model is not None
+        else set()
     )
+    metadata_columns = tuple(dict.fromkeys((
+        *base.metadata_columns,
+        *(
+            column
+            for column in new.metadata_columns
+            if column in actual_column_set
+            and column not in base_interpreted_columns
+        ),
+    )))
+    condition_columns = {
+        **conditions,
+        **{
+            column: tuple(values)
+            for column, values in new.condition_columns.items()
+            if column in actual_column_set
+            and column not in base_interpreted_columns
+        },
+    }
+    merged = replace(
+        merged,
+        condition_columns=condition_columns,
+        metadata_columns=metadata_columns,
+    )
+    if not merged.patterns:
+        return merged
+
+    merged_adapter = compile_spec(merged)
     merged_model = NameModel.from_columns_with_adapter(
-        list(columns),
+        actual_columns,
         merged_adapter,
     )
-    numeric_columns = set()
-    for binder in base_adapter.binders:
-        boolean = set(base.boolean_roles.get(binder, ()))
-        for role in base_adapter.refs_for(binder):
-            if role in boolean:
-                continue
-            for binding in enumerate_bindings(binder, base_model):
+    final_boolean_roles = merged.boolean_roles
+    if base_adapter is not None and base_model is not None:
+        numeric_columns = set()
+        for binder in base_adapter.binders:
+            boolean = set(base.boolean_roles.get(binder, ()))
+            for role in base_adapter.refs_for(binder):
+                if role in boolean:
+                    continue
+                for binding in enumerate_bindings(binder, base_model):
+                    column = resolve_ref(
+                        role,
+                        binder,
+                        binding,
+                        base_model,
+                    )
+                    if column is not None:
+                        numeric_columns.add(column)
+        filtered = {}
+        for binder, roles in merged.boolean_roles.items():
+            kept = []
+            for role in roles:
+                grounded = {
+                    resolve_ref(
+                        role,
+                        binder,
+                        binding,
+                        merged_model,
+                    )
+                    for binding in enumerate_bindings(
+                        binder,
+                        merged_model,
+                    )
+                } - {None}
+                if not grounded & numeric_columns:
+                    kept.append(role)
+            filtered[binder] = tuple(kept)
+        final_boolean_roles = filtered
+    merged = replace(
+        merged,
+        boolean_roles=final_boolean_roles,
+    )
+    protected_context = {
+        merged.time_index,
+        *merged.group_keys,
+        *condition_columns,
+        *metadata_columns,
+    } - {""}
+    grounding_conflicts = []
+    for binder in merged_adapter.binders:
+        boolean_roles = set(
+            final_boolean_roles.get(binder, ())
+        )
+        bindings = enumerate_bindings(binder, merged_model)
+        for role in merged_adapter.refs_for(binder):
+            for binding in bindings:
                 column = resolve_ref(
                     role,
                     binder,
                     binding,
-                    base_model,
+                    merged_model,
                 )
-                if column is not None:
-                    numeric_columns.add(column)
-    filtered = {}
-    for binder, roles in merged.boolean_roles.items():
-        kept = []
-        for role in roles:
-            grounded = {
-                resolve_ref(
+                if (
+                    column in protected_context
+                    and not (
+                        column in condition_columns
+                        and role in boolean_roles
+                    )
+                ):
+                    grounding_conflicts.append(
+                        f"ref {binder}/{role} -> {column!r}"
+                    )
+        for role in merged_adapter.fams_for(binder):
+            for binding in bindings:
+                overlap = set(resolve_family(
                     role,
                     binder,
                     binding,
                     merged_model,
-                )
-                for binding in enumerate_bindings(
-                    binder,
-                    merged_model,
-                )
-            } - {None}
-            if not grounded & numeric_columns:
-                kept.append(role)
-        filtered[binder] = tuple(kept)
-    return replace(merged, boolean_roles=filtered)
+                )) & protected_context
+                for column in sorted(overlap):
+                    grounding_conflicts.append(
+                        f"family {binder}/{role} -> {column!r}"
+                    )
+    if grounding_conflicts:
+        raise ValueError(
+            "re-induced context columns also ground numeric grammar roles: "
+            + "; ".join(grounding_conflicts[:8])
+        )
+    return merged
+
+
+def _prepare_runtime_tier_specs(
+    df,
+    initial_spec,
+    inducer,
+    tiers,
+    search_cfg,
+    profile,
+):
+    """Prepare every grammar the configured calibration loop could execute.
+
+    The held-out split must be fixed before tuning starts, so it cannot wait until a later recall
+    stall to learn that a re-induced/widened grammar contains a candidate which recovers entries on
+    both sides. Preparing the tier proposals first is safe: induction sees only dataset columns,
+    never known invariants, and the accumulated merge is monotone while dataset interpretation
+    remains pinned to tier 0.
+    """
+    columns = list(df.columns)
+    accumulated = None
+    runtime_specs = []
+    for tier_index, caps in enumerate(tiers):
+        proposed = (
+            initial_spec
+            if tier_index == 0
+            else induce_spec(columns, inducer)
+        )
+        spec = (
+            proposed
+            if accumulated is None
+            else _merge_specs(
+                accumulated,
+                proposed,
+                columns=columns,
+            )
+        )
+        spec = _widen_spec(
+            spec,
+            all_aggs=caps.get("all_aggs", False),
+            max_degree=caps.get("max_degree"),
+            drop_exclusions=caps.get("drop_exclusions", False),
+            proportional=caps.get("proportional", False),
+            temporal=caps.get("temporal", False),
+            max_lag=caps.get("max_lag", 0),
+            windows=caps.get("windows", ()),
+            advanced=caps.get("advanced", False),
+            run_lengths=caps.get("run_lengths", ()),
+            max_conjunction_terms=caps.get(
+                "max_conjunction_terms",
+                3,
+            ),
+        )
+        accumulated = spec
+        runtime_specs.append(normalize_dataframe_spec(
+            df,
+            replace(
+                spec,
+                temporal_bounds_widened=True,
+                advanced_bounds_widened=True,
+                degree_widened=True,
+                conditional_enabled=bool(
+                    tier_index >= 3
+                    and (
+                        spec.conditional_enabled
+                        or bool(profile.get("condition_columns"))
+                    )
+                ),
+                band_enabled=bool(
+                    spec.band_enabled
+                    or profile.get("band_enabled", False)
+                ),
+            ),
+            search_cfg,
+        ))
+    return runtime_specs
 
 
 def _spec_summary(spec, tier: int, caps: dict) -> dict:
@@ -1322,7 +1565,10 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     profile = dict(
         getattr(df, "attrs", {}).get("autogram_profile", {})
     )
-    tiers = _capability_tiers()[:max(1, cfg.max_capability_tiers)]
+    tiers = _reachable_capability_tiers(
+        cfg.max_capability_tiers,
+        cfg.max_iterations,
+    )
     advanced_possible = bool(profile.get("advanced", False)) or any(
         bool(caps.get("advanced", False))
         for caps in tiers
@@ -1349,24 +1595,73 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     # request or producing its side effects.
     _validate_split_inputs(known, cfg.validation_frac)
     inducer = _make_calibration_inducer(cfg)
-    # Induce the grammar BEFORE the split, purely to learn how the runtime will decode a cell. The
-    # split has to canonicalise known signatures against the same data the runtime frame sees, and
-    # the cell codec is what decides that; assuming the spec default would silently misread a
-    # dataset whose induced codec names a different primary key. The proposal is reused as tier 0,
-    # so this costs no extra induction.
+    # Prepare every grammar tier BEFORE the split. Besides learning the runtime cell codec, this
+    # exposes the complete structural candidate space that calibration may reach after a recall
+    # stall. Induction sees columns only (never known invariants), so doing it before the split does
+    # not leak validation content; it merely prevents a later candidate from recovering catalogue
+    # entries which were already placed on opposite sides.
     initial_spec = induce_spec(list(df.columns), inducer)
-    split_dataset, _split_grammar = build_dataframe_grammar(
+    runtime_tier_specs = _prepare_runtime_tier_specs(
         df,
         initial_spec,
+        inducer,
+        tiers,
+        scfg,
+        profile,
+    )
+    split_dataset, split_grammar = build_dataframe_grammar(
+        df,
+        runtime_tier_specs[-1],
         search_cfg=scfg,
         name=f"{name}_split",
     )
+    if getattr(split_grammar, "advanced_enabled", False) and not (
+        1 <= int(scfg.max_rules) <= 500_000
+    ):
+        raise ValueError(
+            "effective advanced calibration requires max_rules "
+            "between 1 and 500000"
+        )
+    recovery_witnesses = ()
+    if (
+        hasattr(split_dataset, "name_model")
+        and hasattr(split_grammar, "binders")
+    ):
+        def _iter_runtime_witnesses():
+            # Enumerate each tier against its own runtime NameModel. The accumulated grammar
+            # vocabulary is monotone, but a later pattern can still enlarge token/binding sets, so
+            # grounding only the final grammar is not a proof that every earlier witness was seen.
+            # This is structural enumeration only: no candidate is evaluated or selected using the
+            # known catalogue.
+            final_index = len(runtime_tier_specs) - 1
+            for tier_index, runtime_spec in enumerate(
+                runtime_tier_specs,
+            ):
+                if tier_index == final_index:
+                    dataset, grammar = (
+                        split_dataset,
+                        split_grammar,
+                    )
+                else:
+                    dataset, grammar = build_dataframe_grammar(
+                        df,
+                        runtime_spec,
+                        search_cfg=scfg,
+                        name=f"{name}_split_tier_{tier_index}",
+                    )
+                yield (
+                    dataset,
+                    EnumerationProposer(grammar).propose(),
+                )
+
+        recovery_witnesses = _iter_runtime_witnesses()
     calib, valid = _split_known(
         known,
         cfg.validation_frac,
         cfg.seed,
         frame=split_dataset.observed,
         recovery_dataset=split_dataset,
+        recovery_witnesses=recovery_witnesses,
     )
 
     # 1) proxy suite -- a caller-supplied regime is authoritative; otherwise it is derived from the
@@ -1425,64 +1720,26 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     best = None            # (recall, dcfg, res, tier, caps, null_eq, null_temporal)
     reinductions = 0
     global_iter = 0
-    accumulated = None     # running union of induced specs -> re-induction can only grow it (item 2)
     # Memoize the null gate by (band_mode, tolerance, threshold): the same relaxation-ladder rungs
     # recur in every grammar tier, and the null grammar is prepared once, so each unique config only
     # needs scoring once across all tiers.
     null_cache: dict = {}
 
-    for ti, caps in enumerate(tiers):
+    for ti, (caps, runtime_spec) in enumerate(zip(
+        tiers,
+        runtime_tier_specs,
+    )):
         if iteration_budget is not None and global_iter >= iteration_budget:
             break
-        # Tier 0 reuses the proposal already made for the split's cell codec; later tiers
-        # (re-)propose the grammar from the columns.
-        spec = (
-            initial_spec
-            if ti == 0
-            else _merge_specs(
-                accumulated,
-                induce_spec(list(df.columns), inducer),
-                columns=list(df.columns),
-            )
-        )
         if ti > 0:
             reinductions += 1
-        spec = _widen_spec(spec, all_aggs=caps.get("all_aggs", False),
-                           max_degree=caps.get("max_degree"),
-                           drop_exclusions=caps.get("drop_exclusions", False),
-                           proportional=caps.get("proportional", False),
-                           temporal=caps.get("temporal", False),
-                           max_lag=caps.get("max_lag", 0),
-                           windows=caps.get("windows", ()),
-                           advanced=caps.get("advanced", False),
-                           run_lengths=caps.get("run_lengths", ()),
-                           max_conjunction_terms=caps.get("max_conjunction_terms", 3))
-        accumulated = spec
-        spec = replace(
-            spec,
-            temporal_bounds_widened=True,
-            advanced_bounds_widened=True,
-            degree_widened=True,
-            conditional_enabled=bool(
-                ti >= 3
-                and (
-                    spec.conditional_enabled
-                    or bool(profile.get("condition_columns"))
-                )
-            ),
-            band_enabled=bool(
-                spec.band_enabled
-                or profile.get("band_enabled", False)
-            ),
-        )
-        runtime_spec = normalize_dataframe_spec(df, spec, scfg)
         ds, G = build_dataframe_grammar(
             df,
             runtime_spec,
             search_cfg=scfg,
             name=name,
         )
-        if G.advanced_enabled and not (
+        if getattr(G, "advanced_enabled", False) and not (
             1 <= int(scfg.max_rules) <= 500_000
         ):
             raise ValueError(

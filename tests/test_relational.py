@@ -954,7 +954,7 @@ def test_span_runtime_null_varies_typed_filter_roles_on_short_groups(
             span_start="span_start",
             span_end="span_end",
             filter_column="type",
-            filter_values=(value,),
+            filter_values=("shared", value),
         )
 
     templates = [
@@ -992,11 +992,332 @@ def test_span_runtime_null_varies_typed_filter_roles_on_short_groups(
         typed_group_key(3.0),
     }
     assert all(mask is not None for mask in masks)
-    assert all(0 < int(mask.sum()) < mask.size for mask in masks)
+    assert all(int(mask.sum()) == mask.size // 2 for mask in masks)
     assert len({
         tuple(mask.tolist())
         for mask in masks
     }) == len(masks)
+
+
+def test_span_runtime_null_rejects_wide_window_public_mask_collapse():
+    rows = 200
+    times = pd.date_range(
+        "2026-02-01",
+        periods=rows,
+        freq="1min",
+    ).to_numpy()
+    relation = pd.DataFrame({
+        "consumer_id": pd.Series(dtype=object),
+        "type": pd.Series(dtype=object),
+        "span_start": pd.Series(dtype="datetime64[ns]"),
+        "span_end": pd.Series(dtype="datetime64[ns]"),
+    })
+
+    def template(index, value):
+        return RelatedTemplate(
+            binder="record",
+            role=f"event_{index}",
+            relation="events",
+            column="",
+            mode="span_any",
+            parent_keys=("consumer_id",),
+            child_keys=("consumer_id",),
+            partition_keys=(),
+            parent_time="timestamp",
+            child_time="",
+            window_seconds=36_000,
+            span_start="span_start",
+            span_end="span_end",
+            filter_column="type",
+            filter_values=(value,),
+        )
+
+    context = {
+        "timestamp": times,
+        "consumer_id": np.array(
+            ["consumer"] * rows,
+            dtype=object,
+        ),
+    }
+    first = template(0, "role-a")
+    generated = _runtime_relation_null(
+        relation,
+        [first],
+        context,
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+    public_mask = _span_any(
+        first,
+        Frame(
+            np.empty((rows, 0), dtype=float),
+            [],
+            row_context=context,
+        ),
+        generated,
+    )
+
+    assert public_mask is not None
+    assert int(public_mask.sum()) == rows // 2
+
+    with pytest.raises(
+        RuntimeError,
+        match="distinct balanced public role masks",
+    ):
+        _runtime_relation_null(
+            relation,
+            [
+                first,
+                template(1, "role-b"),
+            ],
+            context,
+            np.random.default_rng(0),
+            definition_targets=False,
+        )
+
+
+def test_span_runtime_null_balances_only_finite_parent_timestamps():
+    times = np.array([
+        np.datetime64("NaT"),
+        np.datetime64("2026-02-01T00:00:00"),
+        np.datetime64("2026-02-01T00:01:00"),
+    ])
+    relation = pd.DataFrame({
+        "consumer_id": pd.Series(dtype=object),
+        "type": pd.Series(dtype=object),
+        "span_start": pd.Series(dtype="datetime64[ns]"),
+        "span_end": pd.Series(dtype="datetime64[ns]"),
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="event",
+        relation="events",
+        column="",
+        mode="span_any",
+        parent_keys=("consumer_id",),
+        child_keys=("consumer_id",),
+        partition_keys=(),
+        parent_time="timestamp",
+        child_time="",
+        window_seconds=60,
+        span_start="span_start",
+        span_end="span_end",
+        filter_column="type",
+        filter_values=("event",),
+    )
+    context = {
+        "timestamp": times,
+        "consumer_id": np.array(
+            ["consumer"] * times.size,
+            dtype=object,
+        ),
+    }
+
+    generated = _runtime_relation_null(
+        relation,
+        [template],
+        context,
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+    mask = _span_any(
+        template,
+        Frame(
+            np.empty((times.size, 0), dtype=float),
+            [],
+            row_context=context,
+        ),
+        generated,
+    )
+
+    assert np.isnan(mask[0])
+    assert sorted(mask[1:].tolist()) == [0.0, 1.0]
+
+
+def test_span_runtime_null_pools_groups_shrunk_to_finite_singletons():
+    times = np.array([
+        np.datetime64("NaT"),
+        np.datetime64("2026-02-01T00:00:00"),
+        np.datetime64("NaT"),
+        np.datetime64("2026-02-01T00:00:00"),
+    ])
+    relation = pd.DataFrame({
+        "consumer_id": pd.Series(dtype=object),
+        "type": pd.Series(dtype=object),
+        "span_start": pd.Series(dtype="datetime64[ns]"),
+        "span_end": pd.Series(dtype="datetime64[ns]"),
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="event",
+        relation="events",
+        column="",
+        mode="span_any",
+        parent_keys=("consumer_id",),
+        child_keys=("consumer_id",),
+        partition_keys=(),
+        parent_time="timestamp",
+        child_time="",
+        window_seconds=60,
+        span_start="span_start",
+        span_end="span_end",
+        filter_column="type",
+        filter_values=("event",),
+    )
+    context = {
+        "timestamp": times,
+        "consumer_id": np.array(
+            ["a", "a", "b", "b"],
+            dtype=object,
+        ),
+    }
+
+    generated = _runtime_relation_null(
+        relation,
+        [template],
+        context,
+        np.random.default_rng(11),
+        definition_targets=False,
+    )
+    mask = _span_any(
+        template,
+        Frame(
+            np.empty((times.size, 0), dtype=float),
+            [],
+            row_context=context,
+        ),
+        generated,
+    )
+
+    assert np.isnan(mask[[0, 2]]).all()
+    assert sorted(mask[[1, 3]].tolist()) == [0.0, 1.0]
+
+
+def test_span_runtime_null_differs_on_joint_finite_support():
+    rows = 11
+    base_times = pd.date_range(
+        "2026-02-01",
+        periods=rows,
+        freq="1min",
+    ).to_numpy()
+    time_a = base_times.copy()
+    time_b = base_times.copy()
+    time_a[[6]] = np.datetime64("NaT")
+    time_b[[3, 6, 8]] = np.datetime64("NaT")
+    relation = pd.DataFrame({
+        "consumer_id": pd.Series(dtype=object),
+        "type": pd.Series(dtype=object),
+        "span_start": pd.Series(dtype="datetime64[ns]"),
+        "span_end": pd.Series(dtype="datetime64[ns]"),
+    })
+
+    def template(role, parent_time, filter_value):
+        return RelatedTemplate(
+            binder="record",
+            role=role,
+            relation="events",
+            column="",
+            mode="span_any",
+            parent_keys=("consumer_id",),
+            child_keys=("consumer_id",),
+            partition_keys=(),
+            parent_time=parent_time,
+            child_time="",
+            window_seconds=60,
+            span_start="span_start",
+            span_end="span_end",
+            filter_column="type",
+            filter_values=(filter_value,),
+        )
+
+    templates = (
+        template("event_a", "time_a", "a"),
+        template("event_b", "time_b", "b"),
+    )
+    context = {
+        "time_a": time_a,
+        "time_b": time_b,
+        "consumer_id": np.array(
+            ["consumer"] * rows,
+            dtype=object,
+        ),
+    }
+    generated = _runtime_relation_null(
+        relation,
+        templates,
+        context,
+        np.random.default_rng(0),
+        definition_targets=False,
+    )
+    parent = Frame(
+        np.empty((rows, 0), dtype=float),
+        [],
+        row_context=context,
+    )
+    masks = [
+        _span_any(item, parent, generated)
+        for item in templates
+    ]
+    joint = np.isfinite(masks[0]) & np.isfinite(masks[1])
+
+    assert np.any(joint)
+    assert np.any(masks[0][joint] != masks[1][joint])
+
+
+def test_span_runtime_null_rejects_nested_filter_domains():
+    times = pd.date_range(
+        "2026-02-01",
+        periods=20,
+        freq="1min",
+    ).to_numpy()
+    relation = pd.DataFrame({
+        "consumer_id": pd.Series(dtype=object),
+        "type": pd.Series(dtype=object),
+        "span_start": pd.Series(dtype="datetime64[ns]"),
+        "span_end": pd.Series(dtype="datetime64[ns]"),
+    })
+    template = RelatedTemplate(
+        binder="record",
+        role="event_wide",
+        relation="events",
+        column="",
+        mode="span_any",
+        parent_keys=("consumer_id",),
+        child_keys=("consumer_id",),
+        partition_keys=(),
+        parent_time="timestamp",
+        child_time="",
+        window_seconds=60,
+        span_start="span_start",
+        span_end="span_end",
+        filter_column="type",
+        filter_values=("a", "b"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="runtime span null cannot isolate overlapping span filters",
+    ):
+        _runtime_relation_null(
+            relation,
+            [
+                template,
+                replace(
+                    template,
+                    role="event_narrow",
+                    filter_values=("a",),
+                ),
+            ],
+            {
+                "timestamp": times,
+                "consumer_id": np.array(
+                    ["consumer"] * len(times),
+                    dtype=object,
+                ),
+            },
+            np.random.default_rng(0),
+            definition_targets=False,
+        )
 
 
 def test_span_runtime_null_saturates_extrapolated_end():

@@ -10,7 +10,12 @@ import numpy as np
 import pandas as pd
 
 from ..config import DiscoveryConfig, SearchConfig
-from ..dsl.evaluate import typed_unique
+from ..dsl.binders import (
+    enumerate_bindings,
+    resolve_family,
+    resolve_ref,
+)
+from ..dsl.evaluate import typed_group_key, typed_unique
 from ..dsl.grammar import Grammar, grammar_from_adapter
 from ..loader.loader import Dataset, build_dataset, load_dataframe
 from ..schema.compiler import compile_spec
@@ -54,15 +59,94 @@ def _dataset_from_columns(columns: Sequence[str], matrix: np.ndarray, adapter, n
     return build_dataset(columns, matrix, adapter, name, timestamps)
 
 
-def _make_proposer(G: Grammar, scfg: SearchConfig):
+def _runtime_column_roles(ds: Dataset, G: Grammar) -> tuple[tuple[object, ...], ...]:
+    pairs = []
+    seen = set()
+    for binder in G.binders:
+        bindings = enumerate_bindings(binder, ds.name_model)
+        for role in G.refs_for(binder):
+            for binding in bindings:
+                column = resolve_ref(
+                    role,
+                    binder,
+                    binding,
+                    ds.name_model,
+                )
+                if column is None:
+                    continue
+                key = (
+                    binder,
+                    typed_group_key(column),
+                    role,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                pairs.append((binder, column, role))
+    return tuple(pairs)
+
+
+def _attach_runtime_column_roles(ds: Dataset, G: Grammar) -> Grammar:
+    return replace(
+        G,
+        column_roles=_runtime_column_roles(ds, G),
+    )
+
+
+def _validate_runtime_role_groundings(ds: Dataset, G: Grammar) -> None:
+    """Fail before enumeration when numeric grammar roles resolve only to context."""
+    observed = set(ds.observed.names)
+    invalid = []
+    for binder in G.binders:
+        bindings = enumerate_bindings(binder, ds.name_model)
+        for role in G.refs_for(binder):
+            for binding in bindings:
+                column = resolve_ref(
+                    role,
+                    binder,
+                    binding,
+                    ds.name_model,
+                )
+                if column is not None and column not in observed:
+                    invalid.append(
+                        f"ref {binder}/{role} -> {column!r}"
+                    )
+        for role in G.fams_for(binder):
+            for binding in bindings:
+                for column in resolve_family(
+                    role,
+                    binder,
+                    binding,
+                    ds.name_model,
+                ):
+                    if column not in observed:
+                        invalid.append(
+                            f"family {binder}/{role} -> {column!r}"
+                        )
+    if invalid:
+        raise ValueError(
+            "numeric grammar role groundings are absent from the "
+            "observed frame: "
+            + "; ".join(dict.fromkeys(invalid[:8]))
+        )
+
+
+def _make_proposer(ds: Dataset, G: Grammar, scfg: SearchConfig):
     if scfg.proposer != "enumeration":
         raise ValueError("v2 supports only proposer='enumeration'")
-    return EnumerationProposer(G)
+    return EnumerationProposer(
+        G,
+        column_roles=(
+            G.column_roles
+            or _runtime_column_roles(ds, G)
+        ),
+    )
 
 
 def _run_dataset(ds: Dataset, G: Grammar, *, proposer, dcfg: DiscoveryConfig, scfg: SearchConfig) -> DiscoveryResult:
+    _validate_runtime_role_groundings(ds, G)
     evaluator = DataOnlyEvaluator(ds, dcfg)
-    proposer_obj = proposer or _make_proposer(G, scfg)
+    proposer_obj = proposer or _make_proposer(ds, G, scfg)
     logically_screened = isinstance(proposer_obj, EnumerationProposer)
     archive = ParetoArchive(legacy_compat=G.legacy_compat)
     candidates = proposer_obj.propose(0, (), None)
@@ -121,6 +205,8 @@ def prepare_columns(columns: Sequence[str], matrix: np.ndarray, *,
         max_linear_leaves=scfg.max_linear_leaves,
         max_conditioned_rules=scfg.max_conditioned_rules,
     )
+    G = _attach_runtime_column_roles(ds, G)
+    _validate_runtime_role_groundings(ds, G)
     return ds, G, spec
 
 
@@ -186,6 +272,8 @@ def build_dataframe_grammar(df, spec, *, search_cfg: Optional[SearchConfig] = No
         max_linear_leaves=scfg.max_linear_leaves,
         max_conditioned_rules=scfg.max_conditioned_rules,
     )
+    G = _attach_runtime_column_roles(ds, G)
+    _validate_runtime_role_groundings(ds, G)
     return ds, G
 
 

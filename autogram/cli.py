@@ -15,7 +15,6 @@ from .config import DiscoveryConfig, SearchConfig
 from .discovery import synth
 from .discovery.induce import available_inducer_backends, make_inducer
 from .discovery.subagent import HARNESSES, configured_harness
-from .discovery.loop import discover, discover_dataframe
 from .discovery.validate import run_all
 
 
@@ -262,33 +261,34 @@ def cmd_discover(args: argparse.Namespace) -> int:
         inducer = make_inducer(args.schema_backend)
     normalized_spec = None
     input_frame = None
+    runtime_spec = None
+    from .discovery.loop import prepare_columns, prepare_dataframe, run_prepared
     if args.input:
         input_frame = _configure_dataframe_profile(
             _load_dataframe(args.input, getattr(args, "raw_input", "")),
             args,
         )
         name = args.name or os.path.splitext(os.path.basename(args.input))[0]
-        from .discovery.loop import prepare_dataframe, run_prepared
         from .discovery.induce import _spec_to_json
         ds, G, runtime_spec = prepare_dataframe(
             input_frame, inducer=inducer, search_cfg=scfg, name=name
         )
-        if G.advanced_enabled and (
-            scfg.max_rules <= 0
-            or scfg.max_rules > 500_000
-        ):
-            raise ValueError(
-                "effective advanced discovery requires --max-rules "
-                "between 1 and 500000"
-            )
-        res = run_prepared(ds, G, discovery_cfg=dcfg, search_cfg=scfg)
-        normalized_spec = _spec_to_json(runtime_spec)
     else:
         data = synth.make_synthetic(n_entities=args.entities, n_snapshots=args.snapshots,
                                     noise=args.noise, seed=args.seed)
         name = args.name or "synthetic"
-        res = discover(data.columns, data.matrix, inducer=inducer, discovery_cfg=dcfg,
-                       search_cfg=scfg, name=name, timestamps=data.timestamps)
+        ds, G, runtime_spec = prepare_columns(
+            data.columns,
+            data.matrix,
+            inducer=inducer,
+            search_cfg=scfg,
+            name=name,
+            timestamps=data.timestamps,
+        )
+    _enforce_effective_capability_rule_budget(G, scfg)
+    if args.input:
+        normalized_spec = _spec_to_json(runtime_spec)
+    res = run_prepared(ds, G, discovery_cfg=dcfg, search_cfg=scfg)
     print(res.report())
     if args.json:
         from .calibrate import _engine_source_fingerprint, _fingerprint
@@ -539,24 +539,54 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _enforce_capability_rule_budget(args: argparse.Namespace) -> None:
-    advanced_possible = bool(getattr(args, "advanced", False))
-    if getattr(args, "cmd", "") == "calibrate":
-        from .calibrate import _capability_tiers
-
-        advanced_possible |= int(
-            getattr(args, "max_capability_tiers", 0) or 0
-        ) >= len(_capability_tiers())
-    if not advanced_possible:
-        return
-    limit = int(getattr(args, "max_rules", 0) or 0)
+def _require_advanced_rule_budget(limit: int, *, context: str) -> None:
     if limit <= 0:
         raise ValueError(
-            "advanced discovery requires a finite --max-rules budget "
+            f"{context} requires a finite --max-rules budget "
             "(set it directly or through --config)"
         )
     if limit > 500_000:
-        raise ValueError("advanced --max-rules must be <= 500000")
+        raise ValueError(
+            f"{context} requires --max-rules <= 500000"
+        )
+
+
+def _enforce_effective_capability_rule_budget(grammar, search_cfg) -> None:
+    if not bool(getattr(grammar, "advanced_enabled", False)):
+        return
+    _require_advanced_rule_budget(
+        int(getattr(search_cfg, "max_rules", 0) or 0),
+        context="effective advanced discovery",
+    )
+
+
+def _enforce_capability_rule_budget(args: argparse.Namespace) -> None:
+    advanced_possible = bool(getattr(args, "advanced", False))
+    if getattr(args, "cmd", "") == "calibrate":
+        from .calibrate import _reachable_capability_tiers
+
+        tiers = _reachable_capability_tiers(
+            int(
+                getattr(args, "max_capability_tiers", 0)
+                or 0
+            ),
+            int(getattr(args, "max_iterations", 0) or 0),
+        )
+        advanced_possible |= any(
+            bool(caps.get("advanced", False))
+            for caps in tiers
+        )
+    if not advanced_possible:
+        return
+    context = (
+        "advanced calibration"
+        if getattr(args, "cmd", "") == "calibrate"
+        else "advanced discovery"
+    )
+    _require_advanced_rule_budget(
+        int(getattr(args, "max_rules", 0) or 0),
+        context=context,
+    )
 
 
 def main(argv: Optional[list] = None) -> int:

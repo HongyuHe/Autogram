@@ -297,6 +297,171 @@ def test_consecutive_window_cache_uses_stable_row_content():
     assert np.array_equal(repeated, contiguous)
 
 
+def test_temporal_cadence_is_shared_across_groups():
+    frame = _profile(pd.DataFrame({
+        "timestamp": pd.to_datetime([
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:01:00",
+            "2026-01-01 00:02:00",
+            "2026-01-01 00:03:00",
+            "2026-01-01 00:04:00",
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:02:00",
+            "2026-01-01 00:04:00",
+        ]),
+        "series_id": ["dense"] * 5 + ["sparse"] * 3,
+        "x": [0.0, 1.0, 2.0, 3.0, 4.0, 10.0, 12.0, 14.0],
+    }), windows=(2,), max_lag=1)
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="shared_temporal_cadence",
+    )
+
+    lagged = eval_term(
+        A.Lag(A.Ref("x"), 1),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+    rolled = eval_term(
+        A.Rolling(A.Ref("x"), 2, "SUM"),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert np.allclose(lagged[1:5], [0.0, 1.0, 2.0, 3.0])
+    assert np.allclose(rolled[1:5], [1.0, 3.0, 5.0, 7.0])
+    assert np.isnan(lagged[5:]).all()
+    assert np.isnan(rolled[5:]).all()
+
+
+def test_declared_temporal_cadence_overrides_a_sparse_observed_minimum():
+    frame = _profile(pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=3,
+            freq="2min",
+        ),
+        "series_id": ["sparse"] * 3,
+        "x": [0.0, 2.0, 4.0],
+    }), windows=(2,), max_lag=1)
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="declared_temporal_cadence",
+    )
+    dataset.name_model.adapter.temporal_cadence_seconds = 60
+
+    lagged = eval_term(
+        A.Lag(A.Ref("x"), 1),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert np.isnan(lagged).all()
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "expected"),
+    (
+        ("temporal_cadence_seconds", 1.5, 1_500_000_000),
+        ("cadence_seconds", 0.5, 500_000_000),
+    ),
+)
+def test_declared_temporal_cadence_preserves_fractional_seconds(
+    attribute,
+    value,
+    expected,
+):
+    from autogram.dsl.evaluate import _declared_temporal_cadence_ns
+
+    frame = _profile(pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=2,
+            freq="1s",
+        ),
+        "series_id": "a",
+        "x": [1.0, 2.0],
+    }), windows=(2,), max_lag=1)
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="fractional_declared_cadence",
+    )
+    setattr(dataset.name_model.adapter, attribute, value)
+
+    assert _declared_temporal_cadence_ns(
+        dataset.name_model,
+    ) == expected
+
+
+def test_declared_temporal_cadence_rejects_fractional_nanoseconds():
+    from autogram.dsl.evaluate import _declared_temporal_cadence_ns
+
+    frame = _profile(pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=2,
+            freq="1s",
+        ),
+        "series_id": "a",
+        "x": [1.0, 2.0],
+    }), windows=(2,), max_lag=1)
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="invalid_declared_cadence",
+    )
+    dataset.name_model.adapter.temporal_cadence_ns = 0.5
+
+    with pytest.raises(
+        ValueError,
+        match="exact positive datetime64\\[ns\\] cadence",
+    ):
+        _declared_temporal_cadence_ns(dataset.name_model)
+
+
+def test_temporal_cadence_inference_preserves_typed_group_phases():
+    groups = np.empty(6, dtype=object)
+    groups[:3] = True
+    groups[3:] = 1
+    frame = _profile(pd.DataFrame({
+        "timestamp": pd.to_datetime([
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:02:00",
+            "2026-01-01 00:04:00",
+            "2026-01-01 00:01:00",
+            "2026-01-01 00:03:00",
+            "2026-01-01 00:05:00",
+        ]),
+        "series_id": pd.Series(groups, dtype=object),
+        "x": [0.0, 2.0, 4.0, 1.0, 3.0, 5.0],
+    }), windows=(2,), max_lag=1)
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="typed_temporal_cadence",
+    )
+
+    lagged = eval_term(
+        A.Lag(A.Ref("x"), 1),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert np.isnan(lagged[[0, 3]]).all()
+    assert np.allclose(lagged[[1, 2, 4, 5]], [0.0, 2.0, 1.0, 3.0])
+
+
 def test_temporal_cadence_rejects_wide_unit_timestamp_wrap():
     timestamps = np.array(
         [

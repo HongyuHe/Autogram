@@ -13,7 +13,7 @@ import pytest
 from autogram.config import DiscoveryConfig
 from autogram.calibrate import (
     CalibrationConfig, _capability_tiers, _derive_regime, _knob_schedule, _merge_specs,
-    _split_known,
+    _reachable_capability_tiers, _split_known,
     _make_calibration_inducer, _spec_summary, _widen_spec, calibrate,
 )
 from autogram.discovery.known import KnownInvariant, load_known
@@ -36,6 +36,48 @@ def _mini_spec(agg=("SUM",), max_degree=1, role_exclusions=()):
     return GrammarSpec(name="t", patterns=(), ontology=onto, ref_templates=(),
                        family_selectors=(), binder_enumerate={"node": "per_node"},
                        max_degree=max_degree, role_exclusions=role_exclusions)
+
+
+def _sum_witness_spec(*, include_family: bool) -> GrammarSpec:
+    columns = ("total", "a", "x", "y", "q")
+    return GrammarSpec(
+        name="sum-witness",
+        patterns=(
+            ColumnPattern(
+                "values",
+                "regex",
+                "measurement",
+                "value",
+                regex=r"^(?:total|a|z|x|y|q)$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": columns},
+            fam_roles={
+                "record": ("parts",) if include_family else (),
+            },
+            agg_kinds=("SUM",),
+        ),
+        ref_templates=tuple(
+            RefTemplate("record", column, column)
+            for column in columns
+        ),
+        family_selectors=(
+            (
+                FamilySelector(
+                    "record",
+                    "parts",
+                    "measurement",
+                    columns=("a", "z"),
+                ),
+            )
+            if include_family
+            else ()
+        ),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
 
 
 class _CalibrationInducer(SchemaInducer):
@@ -141,6 +183,33 @@ def test_knob_schedule_global_base_has_distinct_rungs():
     assert len(keys) == len(ladder)                        # no duplicate (mode, tol, thr) rungs
     assert all(c.band_mode == "global" for c in ladder)    # every rung stays in the default mode
     assert max(c.tolerance for c in ladder) > base.tolerance   # a genuinely looser rung exists
+
+
+def test_knob_schedule_has_fixed_cost_at_null_floor():
+    base = DiscoveryConfig(
+        seed=0,
+        tolerance=0.05,
+        hold_rate_threshold=0.5,
+        band_mode="global",
+    )
+    ladder = _knob_schedule(base, null_floor=0.5)
+    keys = {
+        (
+            item.band_mode,
+            round(item.tolerance, 8),
+            round(item.hold_rate_threshold, 8),
+        )
+        for item in ladder
+    }
+
+    assert len(ladder) == 4
+    assert len(keys) == 4
+    assert _reachable_capability_tiers(5, 4) == [
+        _capability_tiers()[0],
+    ]
+    assert _reachable_capability_tiers(5, 5) == (
+        _capability_tiers()[:2]
+    )
 
 
 def test_spec_summary_reports_capabilities():
@@ -271,7 +340,7 @@ def test_merge_specs_is_identity_preserving_superset_of_base():
     assert m.role_exclusions == (frozenset({"a", "b"}),)
 
 
-def test_merge_specs_unions_all_capability_fields():
+def test_merge_specs_widens_capabilities_but_keeps_dataset_interpretation():
     base = _mini_spec()
     related = RelatedTemplate(
         binder="node",
@@ -307,9 +376,9 @@ def test_merge_specs_unions_all_capability_fields():
 
     merged = _merge_specs(base, new)
 
-    assert merged.time_index == "timestamp"
-    assert merged.group_keys == ("tenant",)
-    assert merged.condition_columns == {"label": ("normal", "alert")}
+    assert merged.time_index == base.time_index
+    assert merged.group_keys == base.group_keys
+    assert merged.condition_columns == base.condition_columns
     assert merged.temporal_enabled
     assert merged.max_lag == 7
     assert merged.windows == (3, 7)
@@ -320,7 +389,7 @@ def test_merge_specs_unions_all_capability_fields():
     assert merged.advanced_enabled
     assert merged.run_lengths == (3, 5)
     assert merged.max_conjunction_terms == 4
-    assert merged.metadata_columns == ("tenant",)
+    assert merged.metadata_columns == base.metadata_columns
     assert merged.band_enabled
 
 
@@ -605,6 +674,156 @@ def test_calibrate_continues_capability_widening_when_recall_stalls(monkeypatch,
 
     assert report["grammar_reinductions"] == 2
     assert {entry["grammar_tier"] for entry in report["trajectory"]} == {0, 1, 2}
+
+
+def test_calibrate_split_closes_over_later_tier_runtime_witnesses(
+    monkeypatch,
+    tmp_path,
+):
+    import autogram.calibrate as calibration
+    from autogram.discovery.validate import PreparedProxy, ProxySuite
+
+    frame = pd.DataFrame({
+        "total": np.full(20, 1000.05),
+        "a": np.full(20, 1000.0),
+        "z": np.full(20, 0.05),
+        "x": np.arange(20.0),
+        "y": np.arange(20.0) + 1.0,
+        "q": np.arange(20.0) + 2.0,
+    })
+    known = _write_known(tmp_path, [
+        {
+            "name": "exact_padded",
+            "op": "==",
+            "lhs": "total",
+            "rhs": {"sum": ["a", "z"]},
+        },
+        {
+            "name": "approx_plain",
+            "op": "~=",
+            "lhs": "total",
+            "rhs": {"sum": ["a"]},
+        },
+        {"name": "other", "op": "==", "lhs": "x", "rhs": "y"},
+        {"name": "third", "op": ">=", "lhs": "q", "rhs": 0},
+    ])
+    proposals = iter((
+        _sum_witness_spec(include_family=False),
+        _sum_witness_spec(include_family=True),
+    ))
+    induced = []
+
+    def fake_induce(columns, inducer):
+        spec = next(proposals)
+        induced.append(spec)
+        return spec
+
+    def fake_prepare(regime, seed=0, inducer=None, **kwargs):
+        positives = [
+            PreparedProxy(entry.shape, object(), object(), {})
+            for entry in regime.active_entries()
+        ]
+        return ProxySuite(
+            positives=positives,
+            null=PreparedProxy("null", object(), object(), {}),
+        )
+
+    def fake_runtime(dataset, grammar, search_cfg, **kwargs):
+        return ProxySuite(
+            positives=[],
+            null=PreparedProxy("runtime_null", dataset, grammar, {}),
+            candidate_counts={
+                "all": 0,
+                "equalities": 0,
+                "temporal": 0,
+                "definitions": 0,
+            },
+        )
+
+    monkeypatch.setattr(calibration, "make_inducer", lambda *args, **kwargs: object())
+    monkeypatch.setattr(calibration, "induce_spec", fake_induce)
+    monkeypatch.setattr(calibration, "prepare_proxy_suite", fake_prepare)
+    monkeypatch.setattr(calibration, "prepare_runtime_null_controls", fake_runtime)
+    monkeypatch.setattr(calibration, "tune_joint", lambda *args, **kwargs: {
+        "tolerance": 0.05,
+        "hold_rate_threshold": 0.66,
+        "expansions": 0,
+        "selected_null_equalities": 0,
+        "proxy_shapes": [
+            proxy.shape for proxy in args[0].positives
+        ],
+        "per_proxy": [],
+    })
+    monkeypatch.setattr(
+        calibration,
+        "run_prepared",
+        lambda dataset, grammar, **kwargs: SimpleNamespace(
+            portfolio=[],
+            dataset=dataset,
+            grammar=grammar,
+            _dcfg=kwargs["discovery_cfg"],
+        ),
+    )
+    monkeypatch.setattr(calibration, "recover_known", lambda result, invariants: {
+        "recall": 0.5,
+        "recovered": 1,
+        "total": len(invariants),
+        "invariants": [],
+    })
+    monkeypatch.setattr(calibration, "null_equalities_at", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(calibration, "null_temporal_at", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(calibration, "null_definitions_at", lambda *args, **kwargs: 0)
+
+    original_split = calibration._split_known
+
+    def checked_split(*args, **kwargs):
+        without_witnesses = dict(kwargs)
+        without_witnesses.pop("recovery_witnesses", None)
+        without_witnesses["recovery_rules"] = None
+        bare_calibration, _bare_validation = original_split(
+            *args,
+            **without_witnesses,
+        )
+        bare_names = {
+            item.name for item in bare_calibration
+        }
+        assert (
+            ("exact_padded" in bare_names)
+            != ("approx_plain" in bare_names)
+        )
+
+        calibration_known, validation_known = original_split(
+            *args,
+            **kwargs,
+        )
+        calibration_names = {
+            item.name for item in calibration_known
+        }
+        validation_names = {
+            item.name for item in validation_known
+        }
+        assert {"exact_padded", "approx_plain"} <= calibration_names or {
+            "exact_padded",
+            "approx_plain",
+        } <= validation_names
+        return calibration_known, validation_known
+
+    monkeypatch.setattr(calibration, "_split_known", checked_split)
+
+    calibrate(
+        frame,
+        known,
+        CalibrationConfig(
+            max_capability_tiers=2,
+            max_complexity=6,
+            max_rules=10_000,
+            validation_frac=0.5,
+            save_rules=False,
+        ),
+        name="later_witness",
+    )
+
+    assert len(induced) == 2
 
 
 def test_calibrate_applies_max_iterations_globally_across_tiers(
@@ -1194,6 +1413,70 @@ def test_known_split_groups_later_tier_and_parameterized_bindings():
         } <= validation_names, catalogue_index
 
 
+def test_known_split_closes_over_fitted_definition_witness():
+    from autogram.dsl import ast as A
+
+    signal = np.linspace(90.0, 112.0, 221)
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "signal": signal,
+            "other": signal * 2.0,
+            "alert": signal < 101.0,
+        }),
+        condition_columns=("alert",),
+        advanced=True,
+    )
+    dataset, grammar = build_dataframe_grammar(
+        frame,
+        _mini_spec(),
+        name="fitted_split_witness",
+    )
+    witness = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("alert"),
+            A.Conjunction((
+                A.Bound(A.Ref("signal"), "<", None),
+            )),
+        ),
+    )
+    known = [
+        KnownInvariant(
+            "lower",
+            ":=",
+            "alert",
+            {"and": [
+                {"bound": ["signal", "<", 100.0]},
+            ]},
+        ),
+        KnownInvariant(
+            "upper",
+            ":=",
+            "alert",
+            {"and": [
+                {"bound": ["signal", "<", 101.9]},
+            ]},
+        ),
+        KnownInvariant("other", "==", "signal", "other"),
+    ]
+
+    calibration, validation = _split_known(
+        known,
+        frac=0.5,
+        seed=0,
+        frame=dataset.observed,
+        recovery_dataset=dataset,
+        recovery_rules=[witness],
+    )
+    calibration_names = {item.name for item in calibration}
+    validation_names = {item.name for item in validation}
+
+    assert {"lower", "upper"} <= calibration_names or {
+        "lower",
+        "upper",
+    } <= validation_names
+
+
 def test_known_split_matches_alternative_roles_and_family_witnesses():
     frame = pd.DataFrame({
         "x_n0": np.ones(20),
@@ -1383,6 +1666,458 @@ def test_merge_specs_does_not_reclassify_existing_numeric_role():
         "node",
         (),
     )
+
+
+def test_merge_specs_keeps_base_measurements_out_of_later_metadata():
+    base = GrammarSpec(
+        name="measurement-base",
+        patterns=(
+            ColumnPattern(
+                "metric",
+                "regex",
+                "measurement",
+                "value",
+                regex=r"^metric_(?P<source>n\d+)$",
+                node_groups=("source",),
+                source_group="source",
+                token_groups=("source",),
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("node",),
+            ref_roles={"node": ("metric",)},
+            fam_roles={"node": ()},
+            agg_kinds=("SUM",),
+        ),
+        ref_templates=(
+            RefTemplate("node", "metric", "metric_{X}"),
+        ),
+        family_selectors=(),
+        binder_enumerate={"node": "per_node"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    later = replace(
+        base,
+        ontology=replace(
+            base.ontology,
+            agg_kinds=("AVG",),
+        ),
+        max_degree=2,
+        time_index="metric_n0",
+        group_keys=("metric_n1",),
+        condition_columns={"metric_n0": (1.0, 2.0)},
+        metadata_columns=("metric_n1",),
+        temporal_enabled=True,
+        conditional_enabled=True,
+    )
+
+    merged = _merge_specs(
+        base,
+        later,
+        columns=("metric_n0", "metric_n1"),
+    )
+    dataset, grammar = build_dataframe_grammar(
+        pd.DataFrame({
+            "metric_n0": np.arange(8.0),
+            "metric_n1": np.arange(8.0) + 1.0,
+        }),
+        merged,
+        name="base_interpretation",
+    )
+
+    assert merged.time_index == base.time_index
+    assert merged.group_keys == base.group_keys
+    assert merged.condition_columns == base.condition_columns
+    assert merged.metadata_columns == base.metadata_columns
+    assert set(dataset.observed.names) == {
+        "metric_n0",
+        "metric_n1",
+    }
+    assert set(grammar.agg_kinds) == {"SUM", "AVG"}
+    assert grammar.max_degree == 2
+    assert grammar.temporal_enabled
+    assert grammar.conditional_enabled
+
+
+def test_merge_specs_admits_new_metadata_without_removing_base_measurement():
+    base = GrammarSpec(
+        name="metric-base",
+        patterns=(
+            ColumnPattern(
+                "metric",
+                "regex",
+                "measurement",
+                "value",
+                regex=r"^metric$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("metric",)},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(
+            RefTemplate("record", "metric", "metric"),
+        ),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    later = replace(
+        base,
+        patterns=(
+            ColumnPattern(
+                "label",
+                "regex",
+                "metadata",
+                "label",
+                regex=r"^label$",
+            ),
+        ),
+        metadata_columns=("metric", "label"),
+    )
+
+    merged = _merge_specs(
+        base,
+        later,
+        columns=("metric", "label"),
+    )
+    dataset, _ = build_dataframe_grammar(
+        pd.DataFrame({
+            "metric": [1.0, 2.0, 3.0],
+            "label": ["red", "green", "blue"],
+        }),
+        merged,
+        name="new_metadata",
+    )
+
+    assert merged.metadata_columns == ("label",)
+    assert dataset.observed.names == ["metric"]
+    np.testing.assert_array_equal(
+        dataset.observed.matrix[:, 0],
+        np.array([1.0, 2.0, 3.0]),
+    )
+    assert dataset.observed.row_context["label"].tolist() == [
+        "red",
+        "green",
+        "blue",
+    ]
+
+
+def test_merge_specs_admits_new_condition_without_reclassifying_measurement():
+    base = GrammarSpec(
+        name="metric-base",
+        patterns=(
+            ColumnPattern(
+                "metric",
+                "regex",
+                "measurement",
+                "value",
+                regex=r"^metric$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("metric",)},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(
+            RefTemplate("record", "metric", "metric"),
+        ),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    later = replace(
+        base,
+        patterns=(
+            ColumnPattern(
+                "label",
+                "regex",
+                "metadata",
+                "label",
+                regex=r"^label$",
+            ),
+        ),
+        condition_columns={"label": ("red", "blue")},
+        conditional_enabled=True,
+    )
+
+    merged = _merge_specs(
+        base,
+        later,
+        columns=("metric", "label"),
+    )
+    dataset, grammar = build_dataframe_grammar(
+        pd.DataFrame({
+            "metric": [1.0, 2.0, 3.0],
+            "label": ["red", "blue", "red"],
+        }),
+        merged,
+        name="new_condition",
+    )
+
+    assert merged.condition_columns == {
+        "label": ("red", "blue"),
+    }
+    assert dataset.observed.names == ["metric"]
+    assert dataset.observed.row_context["label"].tolist() == [
+        "red",
+        "blue",
+        "red",
+    ]
+    assert grammar.conditional_enabled
+
+
+def test_merge_specs_preserves_unpatterned_base_condition_domain():
+    base = replace(
+        _mini_spec(),
+        condition_columns={"label": ("red", "blue")},
+        metadata_columns=("label",),
+        conditional_enabled=True,
+    )
+    later = replace(
+        _mini_spec(),
+        condition_columns={"label": ("red",)},
+        metadata_columns=(),
+        conditional_enabled=True,
+    )
+
+    merged = _merge_specs(
+        base,
+        later,
+        columns=("label", "metric"),
+    )
+
+    assert merged.condition_columns == {
+        "label": ("red", "blue"),
+    }
+    assert merged.metadata_columns == ("label",)
+
+
+def test_merge_specs_rejects_context_column_in_numeric_family():
+    base = GrammarSpec(
+        name="family-base",
+        patterns=(
+            ColumnPattern(
+                "part",
+                "regex",
+                "part",
+                "value",
+                regex=r"^part_a$",
+            ),
+            ColumnPattern(
+                "total",
+                "regex",
+                "total",
+                "value",
+                regex=r"^total$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("total",)},
+            fam_roles={"record": ("parts",)},
+        ),
+        ref_templates=(
+            RefTemplate("record", "total", "total"),
+        ),
+        family_selectors=(
+            FamilySelector(
+                "record",
+                "parts",
+                match_kind="part",
+            ),
+        ),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    later = replace(
+        base,
+        patterns=(
+            ColumnPattern(
+                "part_b",
+                "regex",
+                "part",
+                "value",
+                regex=r"^part_b$",
+            ),
+        ),
+        condition_columns={"part_b": ("red", "blue")},
+        conditional_enabled=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="context columns also ground numeric grammar roles.*parts",
+    ):
+        _merge_specs(
+            base,
+            later,
+            columns=("part_a", "part_b", "total"),
+        )
+
+
+def test_merge_specs_validates_context_grounding_for_patternless_base():
+    base = GrammarSpec(
+        name="empty-base",
+        patterns=(),
+        ontology=RoleOntology(
+            binders=(),
+            ref_roles={},
+            fam_roles={},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    later = GrammarSpec(
+        name="later",
+        patterns=(
+            ColumnPattern(
+                "x",
+                "regex",
+                "part",
+                "value",
+                regex=r"^x$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ()},
+            fam_roles={"record": ("parts",)},
+        ),
+        ref_templates=(),
+        family_selectors=(
+            FamilySelector(
+                "record",
+                "parts",
+                match_kind="part",
+            ),
+        ),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+        condition_columns={"x": ("red", "blue")},
+        conditional_enabled=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="context columns also ground numeric grammar roles.*parts",
+    ):
+        _merge_specs(base, later, columns=("x",))
+
+
+def test_merge_specs_rejects_new_numeric_role_for_base_context():
+    base = GrammarSpec(
+        name="context-base",
+        patterns=(
+            ColumnPattern(
+                "metric",
+                "regex",
+                "measurement",
+                "value",
+                regex=r"^metric$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("metric",)},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(
+            RefTemplate("record", "metric", "metric"),
+        ),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+        condition_columns={"label": ("red", "blue")},
+        metadata_columns=("label",),
+        conditional_enabled=True,
+    )
+    later = replace(
+        base,
+        patterns=(
+            ColumnPattern(
+                "label",
+                "regex",
+                "measurement",
+                "value",
+                regex=r"^label$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("label",)},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(
+            RefTemplate("record", "label", "label"),
+        ),
+        condition_columns={},
+        metadata_columns=(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="context columns also ground numeric grammar roles.*label",
+    ):
+        _merge_specs(
+            base,
+            later,
+            columns=("metric", "label"),
+        )
+
+
+def test_merge_specs_rechecks_context_after_boolean_role_demotion():
+    columns = ("value_n0", "value_n1")
+    base = GrammarSpec(
+        name="numeric-base",
+        patterns=(
+            ColumnPattern(
+                "value",
+                "regex",
+                "measurement",
+                "value",
+                regex=r"^value_(?P<node>n\d+)$",
+                node_groups=("node",),
+                token_groups=("node",),
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("node",),
+            ref_roles={"node": ("value",)},
+            fam_roles={"node": ()},
+        ),
+        ref_templates=(
+            RefTemplate("node", "value", "value_{X}"),
+        ),
+        family_selectors=(),
+        binder_enumerate={"node": "per_node"},
+        cell_codec=CellCodec(kind="scalar"),
+        condition_columns={"value_n1": (False, True)},
+        metadata_columns=(),
+        conditional_enabled=True,
+    )
+    later = replace(
+        base,
+        ontology=RoleOntology(
+            binders=("node",),
+            ref_roles={"node": ("alias",)},
+            fam_roles={"node": ()},
+        ),
+        ref_templates=(
+            RefTemplate("node", "alias", "value_{X}"),
+        ),
+        boolean_roles={"node": ("alias",)},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="context columns also ground numeric grammar roles.*alias",
+    ):
+        _merge_specs(base, later, columns=columns)
 
 
 def test_runtime_tier_pins_do_not_erase_accumulated_capabilities():

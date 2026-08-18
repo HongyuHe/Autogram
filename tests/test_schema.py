@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from autogram.discovery import synth
+from autogram.discovery.loop import build_dataframe_grammar
 from autogram.discovery.induce import (
     _spec_from_json,
     _spec_to_json,
@@ -70,6 +72,7 @@ def test_compiler_rejects_unhashable_span_filter_values():
                 filter_values=([],),
             ),
         ),
+        advanced_enabled=True,
         cell_codec=CellCodec(kind="scalar"),
     )
 
@@ -125,6 +128,7 @@ def test_compiler_rejects_unrepresentable_related_window():
                     window_seconds=10 ** 30,
                 ),
             ),
+            "advanced_enabled": True,
         }
     )
 
@@ -171,6 +175,7 @@ def test_numpy_span_filter_values_compile_and_serialize_as_python_scalars():
                 filter_values=(np.int64(1),),
             ),
         ),
+        advanced_enabled=True,
         cell_codec=CellCodec(kind="scalar"),
     )
 
@@ -667,3 +672,62 @@ def test_compiler_rejects_role_name_with_trailing_newline():
     )
     with pytest.raises(CompileError, match="plain identifier"):
         compile_spec(bad)
+
+
+def test_runtime_rejects_family_grounding_to_context_column():
+    frame = pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=3,
+            freq="1min",
+        ),
+        "value": [1.0, 2.0, 3.0],
+    })
+    spec = GrammarSpec(
+        name="context-family",
+        patterns=(
+            ColumnPattern(
+                "timestamp",
+                "regex",
+                "metadata",
+                "timestamp",
+                regex=r"^timestamp$",
+            ),
+            ColumnPattern(
+                "value",
+                "regex",
+                "measurement",
+                "value",
+                regex=r"^value$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("value",)},
+            fam_roles={"record": ("context",)},
+        ),
+        ref_templates=(
+            RefTemplate("record", "value", "value"),
+        ),
+        family_selectors=(
+            FamilySelector(
+                "record",
+                "context",
+                match_kind="metadata",
+            ),
+        ),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+        time_index="timestamp",
+        metadata_columns=("timestamp",),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="role groundings are absent.*timestamp",
+    ):
+        build_dataframe_grammar(
+            frame,
+            spec,
+            name="context_family",
+        )

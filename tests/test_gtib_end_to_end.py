@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -20,6 +21,7 @@ from autogram.discovery.validate import (
     prepare_runtime_null_controls,
 )
 from autogram.dsl import ast as A
+from autogram.dsl.evaluate import typed_group_key
 import pandas as pd
 
 from autogram.loader.gtib import prepare_gtib_files, prepare_gtib_raw
@@ -456,6 +458,7 @@ def test_runtime_null_controls_match_gtib_search_multiplicity():
                     "<=",
                     ">",
                     "<",
+                    "<|>",
                 }
             )
             or isinstance(rule.atom, A.BandDefinition)
@@ -493,19 +496,42 @@ def test_runtime_null_controls_match_gtib_search_multiplicity():
             controls.null.ds.observed.col(column).tolist()
         ) <= {0.0, 1.0}
     null_context = controls.temporal_null.ds.row_context
+    source_context = dataset.observed.row_context
     for column, values in grammar.condition_columns.items():
-        counts = pd.Series(null_context[column]).value_counts()
-        assert set(counts.index) == set(values)
-        assert int(counts.max() - counts.min()) <= 1
-    combinations = pd.DataFrame({
-        "archetype": null_context["archetype"],
-        "label": null_context["label"],
-    }).value_counts()
-    assert len(combinations) == (
-        len(grammar.condition_columns["archetype"])
-        * len(grammar.condition_columns["label"])
+        counts = Counter(
+            typed_group_key(value)
+            for value in null_context[column]
+        )
+        assert set(counts) == {
+            typed_group_key(value)
+            for value in values
+        }
+        source_counts = Counter(
+            typed_group_key(value)
+            for value in source_context[column]
+        )
+        assert counts == source_counts
+    combinations = Counter(
+        (
+            typed_group_key(archetype),
+            typed_group_key(label),
+        )
+        for archetype, label in zip(
+            null_context["archetype"],
+            null_context["label"],
+        )
     )
-    assert int(combinations.max() - combinations.min()) <= 1
+    source_combinations = Counter(
+        (
+            typed_group_key(archetype),
+            typed_group_key(label),
+        )
+        for archetype, label in zip(
+            source_context["archetype"],
+            source_context["label"],
+        )
+    )
+    assert combinations == source_combinations
 
 
 def test_gtib_known_file_shapes_match_the_recovered_rules():

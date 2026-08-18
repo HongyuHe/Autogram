@@ -24,6 +24,12 @@ _COUNTERS = {
     "presenter_output_counted": "output_increment",
 }
 _BOUNDARY_COLUMNS = ("backlog_bytes", "cum_lost_bytes")
+_GTIB_RAW_IDENTITY_COLUMNS = ("timestamp", "consumer_id", "shard_id")
+_GTIB_RAW_REQUIRED_COLUMNS = frozenset({
+    *_GTIB_RAW_IDENTITY_COLUMNS,
+    *_COUNTERS,
+    "reset_flag",
+})
 
 # Flag columns that are semantically Boolean but may arrive as bool, int, float, or string after a
 # CSV/parquet round-trip. They are coerced to a real nullable Boolean at ingestion so downstream
@@ -312,6 +318,64 @@ def _infer_rate_window_seconds(derived: pd.DataFrame) -> int:
     return nanoseconds // 1_000_000_000
 
 
+def _validated_gtib_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    """Copy and normalize a raw table after validating its shard-grain identity."""
+    missing = sorted(_GTIB_RAW_REQUIRED_COLUMNS - set(raw.columns))
+    if missing:
+        raise ValueError(f"GTIB raw table is missing required columns: {missing}")
+
+    from ..dsl.evaluate import (
+        _datetime_ns,
+        canonical_typed_value,
+        is_missing_scalar,
+        typed_group_key,
+    )
+
+    def identity_missing(value) -> bool:
+        value = canonical_typed_value(value)
+        if isinstance(value, tuple):
+            return any(identity_missing(component) for component in value)
+        return is_missing_scalar(value)
+
+    frame = raw.copy()
+    timestamp_ns = _datetime_ns(frame["timestamp"].to_numpy())
+    consumers = frame["consumer_id"].to_numpy(dtype=object)
+    shards = frame["shard_id"].to_numpy(dtype=object)
+    nat_ns = np.iinfo(np.int64).min
+    seen: dict[tuple, int] = {}
+    for position, (timestamp, consumer, shard) in enumerate(
+        zip(timestamp_ns, consumers, shards)
+    ):
+        missing_components = []
+        if int(timestamp) == nat_ns:
+            missing_components.append("timestamp")
+        if identity_missing(consumer):
+            missing_components.append("consumer_id")
+        if identity_missing(shard):
+            missing_components.append("shard_id")
+        if missing_components:
+            raise ValueError(
+                "GTIB raw identities require nonmissing timestamp, "
+                "consumer_id, and shard_id; "
+                f"row {position} is missing {missing_components}"
+            )
+        identity = (
+            int(timestamp),
+            typed_group_key(consumer),
+            typed_group_key(shard),
+        )
+        previous = seen.get(identity)
+        if previous is not None:
+            raise ValueError(
+                "GTIB raw table has duplicate raw identity "
+                "(timestamp, consumer_id, shard_id) at rows "
+                f"{previous} and {position}"
+            )
+        seen[identity] = position
+    frame["timestamp"] = timestamp_ns.view("datetime64[ns]")
+    return frame
+
+
 def prepare_gtib(
     derived: pd.DataFrame,
     raw: pd.DataFrame | None = None,
@@ -507,23 +571,7 @@ def prepare_gtib_files(
 def prepare_gtib_raw(raw: pd.DataFrame) -> pd.DataFrame:
     """Profile the raw shard-grain table for grouped temporal discovery."""
 
-    required = {
-        "timestamp",
-        "consumer_id",
-        "shard_id",
-        "collector_input_counted",
-        "presenter_output_counted",
-        "reset_flag",
-    }
-    missing = sorted(required - set(raw.columns))
-    if missing:
-        raise ValueError(f"GTIB raw table is missing required columns: {missing}")
-    from ..dsl.evaluate import _datetime_ns
-
-    frame = raw.copy()
-    frame["timestamp"] = _datetime_ns(
-        frame["timestamp"].to_numpy()
-    ).view("datetime64[ns]")
+    frame = _validated_gtib_raw(raw)
     frame = _coerce_flag_columns(frame)
     conditions = [
         column
@@ -618,22 +666,7 @@ def _materialize_raw(
             result[key] = candidate
         return result
 
-    required = {
-        "timestamp",
-        "consumer_id",
-        "shard_id",
-        "collector_input_counted",
-        "presenter_output_counted",
-        "reset_flag",
-    }
-    missing = sorted(required - set(raw.columns))
-    if missing:
-        raise ValueError(f"GTIB raw table is missing required columns: {missing}")
-
-    child = raw.copy()
-    child["timestamp"] = _datetime_ns(
-        child["timestamp"].to_numpy()
-    ).view("datetime64[ns]")
+    child = _validated_gtib_raw(raw)
     parent_lookup = {}
     parent_consumers = derived["consumer_id"].to_numpy(dtype=object)
     parent_minutes = derived["minute_index"].to_numpy(dtype=int)

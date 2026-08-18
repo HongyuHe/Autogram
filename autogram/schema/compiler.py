@@ -426,6 +426,10 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
                 template.filter_values
             ),
         )
+    if related_templates and not bool(spec.advanced_enabled):
+        raise CompileError(
+            "related templates require advanced_enabled=True"
+        )
 
     patterns = tuple(_compile_pattern(p) for p in spec.patterns)
 

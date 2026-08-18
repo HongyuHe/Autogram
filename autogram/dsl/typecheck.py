@@ -160,24 +160,39 @@ def _leaf_set(term: A.Term) -> set:
     return set()
 
 
-def _predicate_leaf_set(predicate: A.Predicate) -> set:
+def _role_set(term: A.Term) -> set[str]:
+    """Roles contained in a term, including those nested under temporal operators."""
+    if isinstance(term, A.Ref):
+        return {term.role}
+    if isinstance(term, A.Agg):
+        return {term.family_role}
+    if isinstance(term, A.RelatedAgg):
+        return {term.role}
+    if isinstance(term, (A.Scale, A.Lag, A.Diff, A.Rolling)):
+        return _role_set(term.term)
+    if isinstance(term, A.Add):
+        return set().union(*(_role_set(child) for child in term.terms))
+    if isinstance(term, A.Mul):
+        return _role_set(term.left) | _role_set(term.right)
+    if isinstance(term, A.Div):
+        return _role_set(term.num) | _role_set(term.den)
+    return set()
+
+
+def _predicate_role_set(predicate: A.Predicate) -> set[str]:
     if isinstance(predicate, A.Bound):
-        return _leaf_set(predicate.term)
+        return _role_set(predicate.term)
     if isinstance(predicate, A.Sustained):
-        return _predicate_leaf_set(predicate.predicate)
+        return _predicate_role_set(predicate.predicate)
     if isinstance(predicate, A.Conjunction):
         return set().union(*(
-            _predicate_leaf_set(item)
+            _predicate_role_set(item)
             for item in predicate.predicates
         ))
     return set()
 
 
-def _excluded_roles(leaves, G) -> bool:
-    roles = {
-        leaf[1] if leaf[0] == "r" else leaf[-1]
-        for leaf in leaves
-    }
+def _excluded_roles(roles: set[str], G) -> bool:
     return any(
         len(pair) == 2 and set(pair) <= roles
         for pair in getattr(G, "role_exclusions", ())
@@ -287,8 +302,8 @@ def is_admissible(rule: A.Rule, G) -> tuple:
         if _learned_bound_count(atom.predicate) > 2:
             return False, "Boolean definition has too many learned thresholds"
         if _excluded_roles(
-            _leaf_set(atom.target)
-            | _predicate_leaf_set(atom.predicate),
+            _role_set(atom.target)
+            | _predicate_role_set(atom.predicate),
             G,
         ):
             return False, "excluded role co-occurrence"
@@ -326,6 +341,8 @@ def is_admissible(rule: A.Rule, G) -> tuple:
             return False, "band requires a measured term"
         if _has_boolean_ref(atom.term, rule.binder, G):
             return False, "band requires a numeric term"
+        if _excluded_roles(_role_set(atom.term), G):
+            return False, "excluded role co-occurrence"
         if rule.complexity() > G.complexity_cap(rule.binder):
             return False, "exceeds max complexity"
         return True, ""
@@ -370,7 +387,7 @@ def is_admissible(rule: A.Rule, G) -> tuple:
         if isinstance(side, A.Mul) and not (_has_measured(side.left) and _has_measured(side.right)):
             return False, "product operands must both be measured"
     if _excluded_roles(
-        _leaf_set(atom.left) | _leaf_set(atom.right),
+        _role_set(atom.left) | _role_set(atom.right),
         G,
     ):
         return False, "excluded role co-occurrence"

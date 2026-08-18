@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import itertools
-import re
-from typing import Dict, List, Sequence
+from collections.abc import Mapping
+from typing import Dict, Iterable, List, Sequence
 
 from ..dsl import ast as A
 from ..dsl.evaluate import (
@@ -150,7 +150,7 @@ def _term_ref_roles(term: A.Term) -> set[str]:
     return set()
 
 
-def _condition_columns(condition: A.Condition) -> set[str]:
+def _condition_columns(condition: A.Condition) -> set[object]:
     if condition.op == "all":
         return set().union(*(
             _condition_columns(child)
@@ -160,7 +160,44 @@ def _condition_columns(condition: A.Condition) -> set[str]:
     return {condition.column}
 
 
-def _self_conditioned(rule: A.Rule) -> bool:
+def _typed_column_roles(
+    column_roles: Mapping[object, str] | Iterable[tuple] | None,
+) -> dict[tuple[str | None, tuple], frozenset[str]] | None:
+    if column_roles is None:
+        return None
+    items = (
+        column_roles.items()
+        if isinstance(column_roles, Mapping)
+        else column_roles
+    )
+    out: dict[tuple, set[str]] = {}
+    for item in items:
+        if len(item) == 2:
+            column, role = item
+            binder = None
+        elif len(item) == 3:
+            binder, column, role = item
+            binder = str(binder)
+        else:
+            raise ValueError(
+                "column role mappings require (column, role) or "
+                "(binder, column, role) entries"
+            )
+        key = (binder, typed_group_key(column))
+        out.setdefault(key, set()).add(str(role))
+    return {
+        key: frozenset(roles)
+        for key, roles in out.items()
+    }
+
+
+def _self_conditioned(
+    rule: A.Rule,
+    column_roles: Mapping[
+        tuple[str | None, tuple],
+        frozenset[str],
+    ] | None,
+) -> bool:
     if rule.condition is None:
         return False
     if isinstance(rule.atom, A.Compare):
@@ -172,18 +209,22 @@ def _self_conditioned(rule: A.Rule) -> bool:
         roles = _term_ref_roles(rule.atom.term)
     else:
         return False
-    normalize = lambda value: re.sub(
-        r"[^A-Za-z0-9_]",
-        "_",
-        value,
-    )
-    return bool(
-        {normalize(role) for role in roles}
-        & {
-            normalize(column)
-            for column in _condition_columns(rule.condition)
-        }
-    )
+    condition_roles = set()
+    for column in _condition_columns(rule.condition):
+        mapped = set()
+        if column_roles is not None:
+            column_key = typed_group_key(column)
+            mapped.update(
+                column_roles.get((rule.binder, column_key), ())
+            )
+            mapped.update(
+                column_roles.get((None, column_key), ())
+            )
+        if mapped:
+            condition_roles.update(mapped)
+        elif column_roles is None and isinstance(column, str):
+            condition_roles.add(column)
+    return bool(roles & condition_roles)
 
 
 class EnumerationProposer:
@@ -191,10 +232,29 @@ class EnumerationProposer:
 
     ``n`` is accepted for compatibility with the discovery loop but does not limit enumeration;
     use ``Grammar.max_complexity`` to bound the hypothesis space.
+
+    ``column_roles`` is the authoritative profiled column-to-role mapping. Runtime entries are
+    binder-scoped triples; mappings and two-item entries remain binder-agnostic for manual grammars.
+    Iterables preserve typed column identities that compare equal in Python.
     """
 
-    def __init__(self, G: Grammar):
+    def __init__(
+        self,
+        G: Grammar,
+        *,
+        column_roles: (
+            Mapping[object, str]
+            | Iterable[tuple]
+            | None
+        ) = None,
+    ):
         self.G = G
+        if column_roles is None:
+            grammar_column_roles = getattr(G, "column_roles", None)
+            column_roles = grammar_column_roles or None
+        self._column_roles = _typed_column_roles(
+            column_roles
+        )
         self._cache: List[A.Rule] | None = None
 
     def propose(self, n: int = 0, seeds: Sequence[A.Rule] = (), rng=None) -> List[A.Rule]:
@@ -653,7 +713,7 @@ class EnumerationProposer:
                     conditioned_emitted += 1
             for candidate in variants:
                 rule = normalize_rule(candidate)
-                if _self_conditioned(rule):
+                if _self_conditioned(rule, self._column_roles):
                     continue
                 if rule.complexity() > self.G.complexity_cap(rule.binder):
                     continue

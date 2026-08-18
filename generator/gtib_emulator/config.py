@@ -22,7 +22,9 @@ Provenance tags used in the comments below:
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from numbers import Integral, Real
 from typing import Any, Mapping
 
 import yaml
@@ -347,24 +349,99 @@ def load_config(path: str | None = None, overrides: Mapping[str, Any] | None = N
 def _validate(cfg: EmulatorConfig) -> None:
     """Cheap sanity checks that catch obviously broken configs early."""
 
-    if cfg.time.duration_hours <= 0:
-        raise ValueError("time.duration_hours must be > 0")
+    duration = cfg.time.duration_hours
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, Real)
+        or not math.isfinite(float(duration))
+        or duration <= 0
+    ):
+        raise ValueError("time.duration_hours must be a finite number > 0")
+
+    intervals = {
+        "time.raw_scrape_seconds": cfg.time.raw_scrape_seconds,
+        "time.rate_window_seconds": cfg.time.rate_window_seconds,
+        "time.smoothing_window_seconds": cfg.time.smoothing_window_seconds,
+    }
+    for name, value in intervals.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Integral)
+            or value <= 0
+        ):
+            raise ValueError(f"{name} must be a positive integer number of seconds")
+
+    raw_seconds = cfg.time.raw_scrape_seconds
+    rate_seconds = cfg.time.rate_window_seconds
+    smoothing_seconds = cfg.time.smoothing_window_seconds
+    if 60 % raw_seconds != 0:
+        raise ValueError(
+            "time.raw_scrape_seconds must evenly divide 60 seconds; "
+            "event durations are defined in whole minutes"
+        )
+    if rate_seconds != 60:
+        raise ValueError(
+            "time.rate_window_seconds must be exactly 60; derived rows and "
+            "alert durations use one-minute bins"
+        )
+    if rate_seconds % raw_seconds != 0:
+        raise ValueError(
+            "time.rate_window_seconds must be a multiple of "
+            "time.raw_scrape_seconds"
+        )
+    if smoothing_seconds % rate_seconds != 0:
+        raise ValueError(
+            "time.smoothing_window_seconds must be a multiple of "
+            "time.rate_window_seconds"
+        )
+
+    raw_steps_exact = float(duration) * 3600.0 / raw_seconds
+    if not math.isfinite(raw_steps_exact):
+        raise ValueError(
+            "time.duration_hours produces a non-finite raw timestamp grid"
+        )
+    raw_steps = round(raw_steps_exact)
+    if raw_steps < 1 or not math.isclose(
+        raw_steps_exact,
+        raw_steps,
+        rel_tol=1e-12,
+        abs_tol=1e-9,
+    ):
+        raise ValueError(
+            "time.duration_hours must define a non-empty whole number of "
+            "time.raw_scrape_seconds samples"
+        )
+    raw_steps_per_rate_bin = rate_seconds // raw_seconds
+    if raw_steps % raw_steps_per_rate_bin != 0:
+        raise ValueError(
+            f"time.duration_hours produces {raw_steps} raw samples, which "
+            f"does not fill complete {rate_seconds}-second rate bins "
+            f"({raw_steps_per_rate_bin} samples per bin)"
+        )
+
     try:
         start = pd.Timestamp(cfg.time.start_timestamp)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            "time.start_timestamp must be a valid finite timestamp"
+        ) from error
+    if pd.isna(start):
+        raise ValueError(
+            "time.start_timestamp must be a valid finite timestamp, not NaT"
+        )
+    try:
         end = start + pd.to_timedelta(
-            cfg.time.duration_hours,
+            duration,
             unit="h",
         )
+        if pd.isna(end):
+            raise ValueError("generated timestamp grid ends at NaT")
         start.as_unit("ns")
         end.as_unit("ns")
     except (OverflowError, TypeError, ValueError) as error:
         raise ValueError(
-            "generated timestamps must fit datetime64[ns]"
+            "generated timestamp grid must be finite and fit datetime64[ns]"
         ) from error
-    if cfg.time.rate_window_seconds % cfg.time.raw_scrape_seconds != 0:
-        raise ValueError("rate_window_seconds must be a multiple of raw_scrape_seconds")
-    if cfg.time.smoothing_window_seconds % cfg.time.rate_window_seconds != 0:
-        raise ValueError("smoothing_window_seconds must be a multiple of rate_window_seconds")
     if cfg.scale.shards_min < 1 or cfg.scale.shards_max < cfg.scale.shards_min:
         raise ValueError("require 1 <= shards_min <= shards_max")
     if not (0.0 < cfg.pipeline.healthy_ratio_mean <= 1.0):

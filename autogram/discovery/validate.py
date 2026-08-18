@@ -21,6 +21,7 @@ from ..dsl.binders import enumerate_bindings, resolve_family, resolve_ref
 from ..dsl.evaluate import (
     _datetime_ns,
     _saturating_add_ns,
+    _span_any,
     _typed_object_array,
     eval_term,
     robust_median,
@@ -1266,6 +1267,170 @@ def _presence_masked(values, rng) -> np.ndarray:
     return generated
 
 
+def _runtime_span_frame(relation, records, templates) -> pd.DataFrame:
+    frame = pd.DataFrame.from_records(
+        records,
+        columns=relation.columns,
+    )
+    identity_columns = tuple(dict.fromkeys(
+        column
+        for template in templates
+        for column in (
+            *template.child_keys,
+            template.filter_column,
+        )
+        if column
+    ))
+    for column in identity_columns:
+        values = np.empty(len(records), dtype=object)
+        for index, record in enumerate(records):
+            values[index] = record[column]
+        frame[column] = pd.Series(values, dtype=object)
+    return frame
+
+
+def _runtime_span_mask_key(mask, groups, singleton_rows):
+    if mask is None:
+        return None
+    values = np.asarray(mask, dtype=float)
+    if values.ndim != 1 or values.size != sum(
+        len(bucket["rows"]) for bucket in groups.values()
+    ):
+        return None
+
+    finite = np.isfinite(values)
+    if not np.all(
+        np.isnan(values[~finite])
+    ):
+        return None
+
+    def balanced(rows):
+        indices = np.asarray(rows, dtype=int)
+        selected = values[indices[finite[indices]]]
+        return (
+            np.all((selected == 0.0) | (selected == 1.0))
+            and int(np.count_nonzero(selected == 1.0))
+            == selected.size // 2
+        )
+
+    effective_singletons = []
+    for bucket in groups.values():
+        rows = np.asarray(bucket["rows"], dtype=int)
+        gradeable = rows[finite[rows]]
+        if gradeable.size > 1:
+            if not balanced(gradeable):
+                return None
+        elif gradeable.size == 1:
+            effective_singletons.append(int(gradeable[0]))
+    if effective_singletons and not balanced(effective_singletons):
+        return None
+    return (
+        finite.astype(np.uint8).tobytes(),
+        (values == 1.0).astype(np.uint8).tobytes(),
+    )
+
+
+def _span_masks_equal_on_joint_support(left, right) -> bool:
+    left_values = np.asarray(left, dtype=float)
+    right_values = np.asarray(right, dtype=float)
+    if left_values.shape != right_values.shape:
+        return False
+    joint = np.isfinite(left_values) & np.isfinite(right_values)
+    return bool(
+        np.any(joint)
+        and np.array_equal(
+            left_values[joint],
+            right_values[joint],
+        )
+    )
+
+
+def _runtime_span_records(
+    relation,
+    template,
+    times,
+    groups,
+    selected_rows,
+    filter_value,
+    emitted,
+):
+    records = []
+    signatures = set()
+    for key, bucket in groups.items():
+        ordered = [
+            row
+            for row in sorted(
+                bucket["rows"],
+                key=lambda row: times[row],
+            )
+            if times[row] != np.iinfo(np.int64).min
+        ]
+        for position, row in enumerate(ordered):
+            if not selected_rows[row]:
+                continue
+            signature = (
+                tuple(key),
+                template.filter_column,
+                typed_group_key(filter_value),
+                template.span_start,
+                template.span_end,
+                int(times[row]),
+            )
+            if signature in emitted or signature in signatures:
+                continue
+            signatures.add(signature)
+            record = {
+                column: pd.NA
+                for column in relation.columns
+            }
+            for child_key, value in zip(
+                template.child_keys,
+                bucket["raw_key"],
+            ):
+                record[child_key] = value
+            record[template.span_start] = pd.Timestamp(
+                int(times[row])
+            )
+            if position + 1 < len(ordered):
+                span_end_ns = int(times[ordered[position + 1]])
+            elif len(ordered) > 1:
+                step = (
+                    int(times[ordered[-1]])
+                    - int(times[ordered[-2]])
+                )
+                shifted, saturated = _saturating_add_ns(
+                    np.asarray([times[row]], dtype=np.int64),
+                    step,
+                )
+                if bool(saturated[0]):
+                    raise RuntimeError(
+                        "runtime span null cannot represent a positive "
+                        "duration at the timestamp ceiling"
+                    )
+                span_end_ns = int(shifted[0])
+            else:
+                step = max(
+                    1,
+                    int(template.window_seconds)
+                    * 1_000_000_000,
+                )
+                shifted, saturated = _saturating_add_ns(
+                    np.asarray([times[row]], dtype=np.int64),
+                    step,
+                )
+                if bool(saturated[0]):
+                    raise RuntimeError(
+                        "runtime span null cannot represent a positive "
+                        "duration at the timestamp ceiling"
+                    )
+                span_end_ns = int(shifted[0])
+            record[template.span_end] = pd.Timestamp(span_end_ns)
+            if template.filter_column:
+                record[template.filter_column] = filter_value
+            records.append(record)
+    return records, signatures
+
+
 def _runtime_relation_null(
     relation,
     templates,
@@ -1282,32 +1447,107 @@ def _runtime_relation_null(
         template for template in templates
         if template.mode == "span_any"
     ]
-    seen_span_filters = set()
-    for template in span_templates:
-        key = (
+    # Each scrubbed span role gets one declared label that no peer admits. Candidate selections are
+    # accepted only after their real span/window projection is balanced and distinct, then checked
+    # again together so private-label leakage cannot weaken the false-discovery control.
+    private_span_filter_values = []
+    span_filter_domains = [
+        (
             template.relation,
             template.filter_column,
             tuple(
-                typed_group_key(value)
+                (typed_group_key(value), value)
                 for value in template.filter_values
             ),
         )
-        if key in seen_span_filters:
+        for template in span_templates
+    ]
+    missing_key = typed_group_key(pd.NA)
+    no_private_filter = object()
+    for template_index, (relation_name, filter_column, domain) in enumerate(
+        span_filter_domains
+    ):
+        if not filter_column:
+            if any(
+                other_relation == relation_name
+                for other_index, (other_relation, _other_column, _other_domain)
+                in enumerate(span_filter_domains)
+                if other_index != template_index
+            ):
+                raise RuntimeError(
+                    "runtime span null cannot isolate an unfiltered template "
+                    "from other span templates"
+                )
+            private_span_filter_values.append(None)
+            continue
+        if not domain:
             raise RuntimeError(
-                "runtime span null cannot isolate templates sharing one filter"
+                "runtime span null cannot isolate an empty span filter"
             )
-        seen_span_filters.add(key)
+        other_keys = {
+            key
+            for other_index, (
+                other_relation,
+                other_column,
+                other_domain,
+            )
+            in enumerate(span_filter_domains)
+            if other_index != template_index
+            and other_relation == relation_name
+            and other_column == filter_column
+            for key, _value in other_domain
+        }
+        private_value = next(
+            (
+                value
+                for key, value in domain
+                if key not in other_keys
+            ),
+            no_private_filter,
+        )
+        if private_value is no_private_filter:
+            raise RuntimeError(
+                "runtime span null cannot isolate overlapping span filters"
+            )
+        if (
+            any(
+                other_relation == relation_name
+                and other_column != filter_column
+                for other_index, (
+                    other_relation,
+                    other_column,
+                    _other_domain,
+                )
+                in enumerate(span_filter_domains)
+                if other_index != template_index
+            )
+            and any(
+                key == missing_key
+                for key, _value in domain
+            )
+        ):
+            raise RuntimeError(
+                "runtime span null cannot isolate a missing filter value "
+                "across filter columns"
+            )
+        private_span_filter_values.append(private_value)
     if span_templates:
         records = []
         emitted = set()
-        used_masks = set()
+        used_selected_masks = set()
+        used_public_masks = set()
+        used_public_values = []
+        accepted_public_masks = []
         for template_index, template in enumerate(span_templates):
             required = {
                 template.parent_time,
                 *template.parent_keys,
             } - {""}
             if not required <= set(parent_context):
-                continue
+                raise RuntimeError(
+                    "runtime span null cannot evaluate a template without "
+                    "its parent context"
+                )
             times = _datetime_ns(
                 parent_context[template.parent_time]
             )
@@ -1337,135 +1577,156 @@ def _runtime_relation_null(
                 raise RuntimeError(
                     "runtime span null cannot vary one singleton parent"
                 )
-            for _attempt in range(100):
+            attempted_selected_masks = set()
+            random_attempts = 100
+            structured_attempts = min(100, times.size)
+            for attempt in range(
+                random_attempts + structured_attempts
+            ):
                 selected_rows = np.zeros(times.size, dtype=bool)
-                for bucket in groups.values():
-                    rows = np.asarray(bucket["rows"], dtype=int)
-                    if rows.size > 1:
+                if attempt < random_attempts:
+                    for bucket in groups.values():
+                        rows = np.asarray(bucket["rows"], dtype=int)
+                        if rows.size > 1:
+                            selected_rows[
+                                rng.choice(
+                                    rows,
+                                    size=rows.size // 2,
+                                    replace=False,
+                                )
+                            ] = True
+                    if singleton_rows:
+                        chosen = rng.choice(
+                            singleton_rows,
+                            size=len(singleton_rows) // 2,
+                            replace=False,
+                        )
+                        selected_rows[chosen] = True
+                else:
+                    offset = attempt - random_attempts
+                    for bucket in groups.values():
+                        rows = np.asarray(sorted(
+                            bucket["rows"],
+                            key=lambda row: (times[row], row),
+                        ), dtype=int)
+                        count = rows.size // 2
+                        if count:
+                            start = min(offset, rows.size - count)
+                            selected_rows[
+                                rows[start:start + count]
+                            ] = True
+                    if singleton_rows:
+                        rows = np.asarray(sorted(
+                            singleton_rows,
+                            key=lambda row: (times[row], row),
+                        ), dtype=int)
+                        count = rows.size // 2
+                        start = min(offset, rows.size - count)
                         selected_rows[
-                            rng.choice(
-                                rows,
-                                size=rows.size // 2,
-                                replace=False,
-                            )
+                            rows[start:start + count]
                         ] = True
-                if singleton_rows:
-                    chosen = rng.choice(
-                        singleton_rows,
-                        size=len(singleton_rows) // 2,
-                        replace=False,
+                selected_key = selected_rows.tobytes()
+                if (
+                    selected_key in used_selected_masks
+                    or selected_key in attempted_selected_masks
+                ):
+                    continue
+                attempted_selected_masks.add(selected_key)
+                filter_value = private_span_filter_values[template_index]
+                candidate_records, candidate_signatures = (
+                    _runtime_span_records(
+                        relation,
+                        template,
+                        times,
+                        groups,
+                        selected_rows,
+                        filter_value,
+                        emitted,
                     )
-                    selected_rows[chosen] = True
-                mask_key = selected_rows.tobytes()
-                if mask_key not in used_masks:
-                    used_masks.add(mask_key)
-                    break
+                )
+                if not candidate_records:
+                    continue
+                candidate_frame = _runtime_span_frame(
+                    relation,
+                    candidate_records,
+                    (template,),
+                )
+                parent_frame = Frame(
+                    np.empty((times.size, 0), dtype=float),
+                    [],
+                    row_context=parent_context,
+                )
+                public_mask = _span_any(
+                    template,
+                    parent_frame,
+                    candidate_frame,
+                )
+                public_key = _runtime_span_mask_key(
+                    public_mask,
+                    groups,
+                    singleton_rows,
+                )
+                if (
+                    public_key is None
+                    or public_key in used_public_masks
+                    or any(
+                        _span_masks_equal_on_joint_support(
+                            public_mask,
+                            previous,
+                        )
+                        for previous in used_public_values
+                    )
+                ):
+                    continue
+                used_selected_masks.add(selected_key)
+                used_public_masks.add(public_key)
+                used_public_values.append(
+                    np.asarray(public_mask, dtype=float).copy()
+                )
+                records.extend(candidate_records)
+                emitted.update(candidate_signatures)
+                accepted_public_masks.append((
+                    template,
+                    groups,
+                    singleton_rows,
+                    times.size,
+                    public_key,
+                ))
+                break
             else:
                 raise RuntimeError(
-                    "runtime span null could not generate distinct role masks"
+                    "runtime span null could not generate distinct balanced "
+                    "public role masks"
                 )
-            filter_value = (
-                template.filter_values[0]
-                if template.filter_values
-                else "__null__"
+        span_frame = _runtime_span_frame(
+            relation,
+            records,
+            span_templates,
+        )
+        for (
+            template,
+            groups,
+            singleton_rows,
+            n_rows,
+            expected_key,
+        ) in accepted_public_masks:
+            parent_frame = Frame(
+                np.empty((n_rows, 0), dtype=float),
+                [],
+                row_context=parent_context,
             )
-            for group_index, (key, bucket) in enumerate(groups.items()):
-                rows = bucket["rows"]
-                ordered = sorted(rows, key=lambda row: times[row])
-                for position, row in enumerate(ordered):
-                    if not selected_rows[row]:
-                        continue
-                    signature = (
-                        tuple(key),
-                        template.filter_column,
-                        typed_group_key(filter_value),
-                        template.span_start,
-                        template.span_end,
-                        int(times[row]),
-                    )
-                    if signature in emitted:
-                        continue
-                    emitted.add(signature)
-                    record = {
-                        column: pd.NA
-                        for column in relation.columns
-                    }
-                    for child_key, value in zip(
-                        template.child_keys,
-                        bucket["raw_key"],
-                    ):
-                        record[child_key] = value
-                    record[template.span_start] = pd.Timestamp(
-                        int(times[row])
-                    )
-                    if position + 1 < len(ordered):
-                        span_end_ns = int(times[ordered[position + 1]])
-                    elif len(ordered) > 1:
-                        step = (
-                            int(times[ordered[-1]])
-                            - int(times[ordered[-2]])
-                        )
-                        shifted, saturated = _saturating_add_ns(
-                            np.asarray([times[row]], dtype=np.int64),
-                            step,
-                        )
-                        if bool(saturated[0]):
-                            raise RuntimeError(
-                                "runtime span null cannot represent a positive "
-                                "duration at the timestamp ceiling"
-                            )
-                        if bool(saturated[0]):
-                            raise RuntimeError(
-                                "runtime span null cannot represent a positive "
-                                "duration at the timestamp ceiling"
-                            )
-                        span_end_ns = int(shifted[0])
-                    else:
-                        step = max(
-                            1,
-                            int(template.window_seconds)
-                            * 1_000_000_000,
-                        )
-                        shifted, saturated = _saturating_add_ns(
-                            np.asarray([times[row]], dtype=np.int64),
-                            step,
-                        )
-                        if bool(saturated[0]):
-                            raise RuntimeError(
-                                "runtime span null cannot represent a positive "
-                                "duration at the timestamp ceiling"
-                            )
-                        span_end_ns = int(shifted[0])
-                    record[template.span_end] = pd.Timestamp(
-                        span_end_ns
-                    )
-                    if template.filter_column:
-                        record[template.filter_column] = filter_value
-                    records.append(record)
-        if records:
-            span_frame = pd.DataFrame.from_records(
-                records,
-                columns=relation.columns,
+            public_key = _runtime_span_mask_key(
+                _span_any(template, parent_frame, span_frame),
+                groups,
+                singleton_rows,
             )
-            identity_columns = tuple(dict.fromkeys(
-                column
-                for template in span_templates
-                for column in (
-                    *template.child_keys,
-                    template.filter_column,
+            if public_key != expected_key:
+                raise RuntimeError(
+                    "runtime span null lost private-label isolation in its "
+                    "public role masks"
                 )
-                if column
-            ))
-            for column in identity_columns:
-                values = np.empty(len(records), dtype=object)
-                for index, record in enumerate(records):
-                    values[index] = record[column]
-                span_frame[column] = pd.Series(
-                    values,
-                    dtype=object,
-                )
-            if len(span_templates) == len(templates):
-                return span_frame
+        if len(span_templates) == len(templates):
+            return span_frame
     output = relation.copy(deep=True)
     for template in span_templates:
         if template.span_start in output:

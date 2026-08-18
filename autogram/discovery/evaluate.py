@@ -7,6 +7,7 @@ interval.  MDL is computed for tie-breaking, never as an acceptance gate.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 import numpy as np
 import pandas as pd
@@ -1061,22 +1062,33 @@ class DataOnlyEvaluator:
             )
         return None
 
-    def _graded_condition_rejection(self, rule: A.Rule, valid: np.ndarray):
+    def _graded_condition_rejection(
+        self,
+        rule: A.Rule,
+        valid: np.ndarray,
+        source_rows: np.ndarray,
+    ):
         """Re-apply the condition floor to the rows a definition can actually grade, else ``None``.
 
         ``_condition_support_rejection`` runs before grounding, so it can only count the rows the
         condition selects. A definition grades a narrower population than that: rolling windows,
         non-finite targets and unevaluable predicate operands all shrink the validity mask. Without
         this second check a condition that nominally selects enough rows can still be scored on a
-        handful of them, which is exactly the thin evidence the floor exists to reject.
+        handful of them, which is exactly the thin evidence the floor exists to reject. Quantified
+        bindings repeat each source row in the grounding population, so the floor is measured on
+        unique source-row indices while scoring remains binding-level.
         """
         if rule.condition is None:
             return None
         graded = np.asarray(valid, dtype=bool)
         if graded.size == 0:
             return None
-        selected = int(np.count_nonzero(graded))
-        support = float(selected) / float(graded.size)
+        rows = np.asarray(source_rows, dtype=int)
+        if rows.shape != graded.shape:
+            raise ValueError("definition validity and source rows are not aligned")
+        selected = int(np.unique(rows[graded]).size)
+        attempted = int(self.ds.observed.n_rows)
+        support = float(selected) / float(attempted) if attempted else 0.0
         if (
             selected < int(self.cfg.min_condition_points)
             or support < float(self.cfg.min_condition_fraction)
@@ -1084,7 +1096,7 @@ class DataOnlyEvaluator:
             return self._reject(
                 rule,
                 "condition support below minimum after grounding "
-                f"({selected} points, {support:.3f} of rows)",
+                f"({selected} source rows, {support:.3f} of rows)",
             )
         return None
 
@@ -1094,7 +1106,7 @@ class DataOnlyEvaluator:
         if len(learned) > 2:
             return self._reject(rule, "Boolean definition has too many learned thresholds")
         window_by_bound = dict(_learned_bound_contexts(atom.predicate))
-        target, valid, groups, effective, n_bindings = _definition_grounding(
+        target, valid, source_rows, groups, effective, n_bindings = _definition_grounding(
             rule,
             learned,
             window_by_bound,
@@ -1103,7 +1115,7 @@ class DataOnlyEvaluator:
         )
         if target.size == 0:
             return self._reject(rule, "Boolean definition grounded no valid points")
-        thin = self._graded_condition_rejection(rule, valid)
+        thin = self._graded_condition_rejection(rule, valid, source_rows)
         if thin is not None:
             return thin
         # Split the gradeable points once on the threshold-independent validity mask, then draw
@@ -1121,6 +1133,7 @@ class DataOnlyEvaluator:
                 fit_mask,
                 self.cfg,
                 descriptor=bound.unparse(),
+                op=bound.op,
             )
             for bound in learned
         ]
@@ -1147,7 +1160,24 @@ class DataOnlyEvaluator:
                 float(np.mean(target[fit_mask] == predicted[fit_mask]))
                 if np.any(fit_mask) else 0.0
             )
-            preference = (score, -sum(abs(value) for value in thresholds.values()))
+            # Equivalent fit-split classifiers should prefer the shortest numeric description,
+            # not the threshold nearest zero. The latter arbitrarily picks one edge of an
+            # unidentifiable interval and is brittle on held-out rows; a simple decimal inside the
+            # same interval is the lower-MDL, more stable representative.
+            literal_cost = sum(
+                len(repr(float(value)))
+                for value in thresholds.values()
+            )
+            fractional_cost = sum(
+                not float(value).is_integer()
+                for value in thresholds.values()
+            )
+            preference = (
+                score,
+                -literal_cost,
+                -fractional_cost,
+                -sum(abs(value) for value in thresholds.values()),
+            )
             if best is None or preference > best[0]:
                 best = (preference, thresholds, predicted)
         if best is None:
@@ -1202,7 +1232,11 @@ class DataOnlyEvaluator:
             active[present] = raw_active[present].astype(bool)
             valid &= present
             case_masks.append((active, value))
-        thin = self._graded_condition_rejection(rule, valid)
+        thin = self._graded_condition_rejection(
+            rule,
+            valid,
+            np.arange(frame.n_rows, dtype=int),
+        )
         if thin is not None:
             return thin
         missing_edges = []
@@ -1334,6 +1368,7 @@ class DataOnlyEvaluator:
     def _evaluate_band_definition(self, rule: A.Rule, tainted_rows=None) -> Evaluation:
         values = []
         groups = []
+        source_rows = []
         source_groups = _group_labels(
             self.ds.observed,
             self.ds.name_model,
@@ -1369,11 +1404,13 @@ class DataOnlyEvaluator:
             if binding_taint is not None:
                 mask &= ~np.asarray(binding_taint, dtype=bool)
             values.append(np.asarray(vector, dtype=float)[mask])
+            source_rows.append(np.flatnonzero(mask))
             if source_groups is not None:
                 groups.append(source_groups[mask])
         if not values:
             return self._reject(rule, "band grounded no valid points")
         population = np.concatenate(values)
+        population_rows = np.concatenate(source_rows)
         population_groups = (
             np.concatenate(groups)
             if groups
@@ -1393,15 +1430,23 @@ class DataOnlyEvaluator:
         )
         if rule.condition is not None:
             # Measure the floor on the rows the band can actually grade, not on the rows the
-            # condition merely selects: non-finite terms shrink the evidence further.
+            # condition merely selects: non-finite terms shrink the evidence further. A quantified
+            # binding can repeat those points, so only unique source rows count toward the floor.
+            condition_points = int(np.unique(population_rows).size)
+            condition_support = (
+                float(condition_points) / float(self.ds.observed.n_rows)
+                if self.ds.observed.n_rows
+                else 0.0
+            )
             if (
-                population.size < int(self.cfg.min_condition_points)
-                or graded_rows < float(self.cfg.min_condition_fraction)
+                condition_points < int(self.cfg.min_condition_points)
+                or condition_support < float(self.cfg.min_condition_fraction)
             ):
                 return self._reject(
                     rule,
                     "condition support below minimum "
-                    f"({population.size} points, {graded_rows:.3f} of rows)",
+                    f"({condition_points} source rows, "
+                    f"{condition_support:.3f} of rows)",
                 )
         valid = np.ones(population.size, dtype=bool)
         learned = rule.atom.center is None
@@ -1476,14 +1521,23 @@ class DataOnlyEvaluator:
             )
             # A tolerated overflow still shrinks the evidence, so a conditioned band has to clear
             # the support floor again on what is left of it.
+            condition_points = int(np.unique(
+                population_rows[~centre_overflow]
+            ).size)
+            condition_support = (
+                float(condition_points) / float(self.ds.observed.n_rows)
+                if self.ds.observed.n_rows
+                else 0.0
+            )
             if rule.condition is not None and (
-                graded_points < int(self.cfg.min_condition_points)
-                or graded_rows < float(self.cfg.min_condition_fraction)
+                condition_points < int(self.cfg.min_condition_points)
+                or condition_support < float(self.cfg.min_condition_fraction)
             ):
                 return self._reject(
                     rule,
                     "condition support below minimum after overflow "
-                    f"({graded_points} points, {graded_rows:.3f} of rows)",
+                    f"({condition_points} source rows, "
+                    f"{condition_support:.3f} of rows)",
                 )
         observed = population[evaluation_mask]
         scale = np.maximum(np.abs(observed), abs(center))
@@ -1751,14 +1805,15 @@ def _bound_effective_series(bound: A.Bound, window, binder, binding, dataset):
 def _definition_grounding(rule: A.Rule, learned, window_by_bound, dataset, tainted_rows=None):
     """Single aligned pass over the definition population.
 
-    Returns the concatenated Boolean target, the threshold-independent validity mask, the optional
-    group labels, and each learned bound's *effective* series (the term itself, or its rolling
-    window reduction under a sustained wrapper). Grounding everything in one binding loop keeps the
-    per-bound series row-aligned with the target/valid arrays that ``_boolean_population`` produces,
-    so the fit/evaluation split can be computed once and reused for candidate generation and
-    scoring without leaking evaluation-split labels into the fit.
+    Returns the concatenated Boolean target, the threshold-independent validity mask, its aligned
+    source-row indices, the optional group labels, and each learned bound's *effective* series (the
+    term itself, or its rolling window reduction under a sustained wrapper). Grounding everything
+    in one binding loop keeps the per-bound series row-aligned with the target/valid arrays that
+    ``_boolean_population`` produces, so the fit/evaluation split can be computed once and reused
+    for candidate generation and scoring without leaking evaluation-split labels into the fit.
     """
     frame = dataset.observed
+    frame_rows = np.arange(frame.n_rows, dtype=int)
     zero = {bound: 0.0 for bound in learned}
     condition = (
         _condition_mask(rule.condition, frame)
@@ -1768,6 +1823,7 @@ def _definition_grounding(rule: A.Rule, learned, window_by_bound, dataset, taint
     source_groups = _group_labels(frame, dataset.name_model)
     targets: list[np.ndarray] = []
     valids: list[np.ndarray] = []
+    source_rows: list[np.ndarray] = []
     groups: list[np.ndarray] = []
     effective: dict = {bound: [] for bound in learned}
     n_bindings = 0
@@ -1803,6 +1859,7 @@ def _definition_grounding(rule: A.Rule, learned, window_by_bound, dataset, taint
             valid = valid & ~np.asarray(binding_taint, dtype=bool)
         targets.append(np.asarray(target, dtype=float) != 0.0)
         valids.append(valid & np.isfinite(np.asarray(target, dtype=float)))
+        source_rows.append(frame_rows)
         if source_groups is not None:
             groups.append(source_groups.copy())
         for bound in learned:
@@ -1819,18 +1876,96 @@ def _definition_grounding(rule: A.Rule, learned, window_by_bound, dataset, taint
         n_bindings += 1
     if not targets:
         empty = np.empty(0, dtype=bool)
-        return empty, empty, None, {}, 0
+        return empty, empty, np.empty(0, dtype=int), None, {}, 0
     return (
         np.concatenate(targets),
         np.concatenate(valids),
+        np.concatenate(source_rows),
         np.concatenate(groups) if groups else None,
         {bound: np.concatenate(chunks) for bound, chunks in effective.items()},
         n_bindings,
     )
 
 
+def _threshold_literal_key(candidate: float, midpoint: float) -> tuple:
+    value = float(candidate)
+    return (
+        len(repr(value)),
+        0 if value.is_integer() else 1,
+        abs(value),
+        abs(value - float(midpoint)),
+    )
+
+
+def _simple_float_separator(low: float, high: float, midpoint: float) -> float:
+    """Return the shortest decimal float strictly separating two finite values."""
+    candidates = [float(midpoint)]
+    if low < 0.0 < high:
+        candidates.append(0.0)
+    # Integers have exceptionally short literals and need not be near the midpoint: (0, 1e20)
+    # should consider 1.0. The nearest integer from each side is sufficient because any farther
+    # integer has no shorter representation at the same magnitude class.
+    for integer in (math.floor(low) + 1, math.ceil(high) - 1):
+        candidate = float(integer)
+        if np.isfinite(candidate) and low < candidate < high:
+            candidates.append(candidate)
+    anchors = (
+        float(midpoint),
+        float(np.nextafter(low, high)),
+        float(np.nextafter(high, low)),
+    )
+    # The first significant-digit level that places an anchor inside the interval is the simplest
+    # local decimal grid that can separate it. Later levels only add digits, so stop there.
+    for significant_digits in range(1, 18):
+        level = []
+        for anchor in anchors:
+            candidate = float(format(
+                anchor,
+                f".{significant_digits}g",
+            ))
+            if np.isfinite(candidate) and low < candidate < high:
+                level.append(candidate)
+        if level:
+            candidates.extend(level)
+            break
+    return min(
+        candidates,
+        key=lambda candidate: _threshold_literal_key(
+            candidate,
+            midpoint,
+        ),
+    )
+
+
+def _simplest_threshold_representative(
+    low: float,
+    high: float,
+    midpoint: float,
+    op: str | None,
+) -> float:
+    if op is None:
+        return float(midpoint)
+    interior = _simple_float_separator(low, high, midpoint)
+    equivalent_endpoint = {
+        "<": high,
+        "<=": low,
+        ">": low,
+        ">=": high,
+    }.get(op)
+    candidates = [interior]
+    if equivalent_endpoint is not None:
+        candidates.append(float(equivalent_endpoint))
+    return min(
+        candidates,
+        key=lambda candidate: _threshold_literal_key(
+            candidate,
+            midpoint,
+        ),
+    )
+
+
 def _fit_threshold_candidates(effective: np.ndarray, fit_mask: np.ndarray, cfg=None,
-                              descriptor: str = "") -> list[float]:
+                              descriptor: str = "", op: str | None = None) -> list[float]:
     """Exhaustive, holdout-clean candidate thresholds for one learned bound.
 
     Candidates are drawn from the *fit* rows only (never the evaluation split) as the midpoints
@@ -1864,6 +1999,13 @@ def _fit_threshold_candidates(effective: np.ndarray, fit_mask: np.ndarray, cfg=N
         if overflow.any():
             base = np.where(overflow, lo_vals * 0.5 + hi_vals * 0.5, base)
         collapsed = (base <= lo_vals) | (base >= hi_vals)
+        for index in np.flatnonzero(~collapsed):
+            base[index] = _simplest_threshold_representative(
+                float(lo_vals[index]),
+                float(hi_vals[index]),
+                float(base[index]),
+                op,
+            )
         separators = np.concatenate((
             lo_vals[collapsed],
             hi_vals[collapsed],
@@ -1886,6 +2028,22 @@ def _fit_threshold_candidates(effective: np.ndarray, fit_mask: np.ndarray, cfg=N
         low = float(unique[0])
     if not np.isfinite(high):
         high = float(unique[-1])
+    if op in ("<", ">="):
+        low = min(
+            (float(low), float(unique[0])),
+            key=lambda candidate: _threshold_literal_key(
+                candidate,
+                float(unique[0]),
+            ),
+        )
+    if op in ("<=", ">"):
+        high = min(
+            (float(high), float(unique[-1])),
+            key=lambda candidate: _threshold_literal_key(
+                candidate,
+                float(unique[-1]),
+            ),
+        )
     edges = np.array([low, high], dtype=float)
     candidates = np.unique(np.concatenate([
         base,

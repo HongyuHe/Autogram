@@ -121,6 +121,62 @@ def test_hard_checks_reject_unflagged_infinite_counter(result):
     assert not finite.passed
 
 
+@pytest.mark.parametrize(
+    "field",
+    (
+        "cum_input",
+        "cum_output_physical",
+        "cum_true_loss",
+        "backlog",
+    ),
+)
+def test_hard_checks_reject_nan_physical_state(result, field):
+    records = copy.deepcopy(result.records)
+    getattr(records[0]["phys"], field)[0, 0] = np.nan
+
+    checks = check_all(result.config, records, result.events)
+    finite = next(
+        check
+        for check in checks
+        if check.name == "physical_state_is_finite"
+    )
+    conservation = next(
+        check
+        for check in checks
+        if check.name == "physical_byte_conservation"
+    )
+
+    assert not finite.passed
+    assert field in finite.detail
+    assert not conservation.passed
+
+
+def test_hard_checks_reject_opposing_corrupt_physical_states(result):
+    records = copy.deepcopy(result.records)
+    phys = records[0]["phys"]
+    phys.cum_output_physical = (
+        phys.cum_output_physical
+        + 1e18
+        + 1e9
+    )
+    phys.cum_true_loss = phys.cum_true_loss - 1e18
+
+    checks = check_all(result.config, records, result.events)
+    conservation = next(
+        check
+        for check in checks
+        if check.name == "physical_byte_conservation"
+    )
+    non_negative = next(
+        check
+        for check in checks
+        if check.name == "physical_state_is_non_negative"
+    )
+
+    assert not conservation.passed
+    assert not non_negative.passed
+
+
 def test_byte_conservation_is_exact(result):
     for rec in result.records:
         phys = rec["phys"]
@@ -155,6 +211,50 @@ def test_generator_rejects_out_of_range_timestamps():
                 "duration_hours": 1.0,
             },
         })
+
+
+def test_generator_rejects_nat_start_timestamp():
+    with pytest.raises(ValueError, match="finite timestamp, not NaT"):
+        load_config(overrides={
+            "time": {"start_timestamp": "NaT"},
+        })
+
+
+def test_generator_rejects_partial_rate_bin():
+    with pytest.raises(
+        ValueError,
+        match="361 raw samples.*complete 60-second rate bins",
+    ):
+        load_config(overrides={
+            "time": {"duration_hours": 3610 / 3600},
+        })
+
+
+@pytest.mark.parametrize(
+    ("time_overrides", "message"),
+    (
+        (
+            {
+                "raw_scrape_seconds": 90,
+                "rate_window_seconds": 180,
+            },
+            "raw_scrape_seconds.*divide 60",
+        ),
+        (
+            {
+                "raw_scrape_seconds": 30,
+                "rate_window_seconds": 120,
+            },
+            "rate_window_seconds must be exactly 60",
+        ),
+    ),
+)
+def test_generator_rejects_incompatible_minute_cadence(
+    time_overrides,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        load_config(overrides={"time": time_overrides})
 
 
 def test_derived_schema(result):

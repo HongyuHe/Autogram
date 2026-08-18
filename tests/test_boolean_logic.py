@@ -127,6 +127,45 @@ def test_boolean_definition_respects_role_exclusions():
     assert "excluded role" in reason
 
 
+def test_temporal_compound_boolean_definition_respects_role_exclusions():
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=", "=="),
+        ref_roles={"record": ("alert", "a", "b")},
+        fam_roles={"record": ()},
+        boolean_roles={"record": ("alert",)},
+        advanced_enabled=True,
+        temporal_enabled=True,
+        windows=(1,),
+        max_lag=1,
+        role_exclusions=(frozenset({"a", "b"}),),
+        max_complexity=12,
+    )
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("alert"),
+            A.Bound(
+                A.Rolling(
+                    A.Add((
+                        A.Ref("a"),
+                        A.Scale(-1.0, A.Ref("b")),
+                    )),
+                    1,
+                    "SUM",
+                ),
+                ">",
+                0.0,
+            ),
+        ),
+    )
+
+    ok, reason = is_admissible(rule, grammar)
+
+    assert not ok
+    assert "excluded role" in reason
+
+
 def test_disabled_conditions_do_not_expand_large_domains():
     grammar = Grammar(
         binders=("record",),
@@ -353,6 +392,68 @@ def test_conditioned_definition_support_is_measured_on_gradeable_rows():
         ),
     ).evaluate(rule)
     assert "condition support below minimum" not in permissive.reason
+
+
+def test_quantified_definition_condition_floor_counts_unique_source_rows(monkeypatch):
+    # Round-71: post-ground support is a source-row floor, not a binding-point floor. Twenty
+    # quantified bindings must not turn one gradeable condition row into twenty rows of evidence.
+    import autogram.discovery.evaluate as evaluate_module
+
+    n = 40
+    selected = np.zeros(n, dtype=bool)
+    selected[:20] = True
+    signal = np.ones(n, dtype=float)
+    alert = np.zeros(n, dtype=float)
+    signal[0] = 0.0
+    alert[0] = 1.0
+    signal[1:20] = np.nan
+    alert[1:20] = np.nan
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=n, freq="1min"),
+        "series_id": "a",
+        "regime": np.where(selected, "rare", "common"),
+        "signal": signal,
+        "alert": alert,
+    })
+    frame = profile_dataframe(
+        df,
+        time_index="timestamp",
+        group_keys=("series_id",),
+        condition_columns=("regime",),
+        temporal_windows=(2,),
+        max_lag=2,
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="quantified_thin_after_grounding",
+    )
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("alert"),
+            A.Bound(A.Ref("signal"), "<", 0.5),
+        ),
+        condition=A.Condition("regime", "==", ("rare",)),
+    )
+    monkeypatch.setattr(
+        evaluate_module,
+        "enumerate_bindings",
+        lambda binder, name_model: [{"slot": index} for index in range(20)],
+    )
+
+    evaluation = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            min_condition_points=20,
+            min_condition_fraction=0.0,
+            band_mode="global",
+        ),
+    ).evaluate(rule)
+
+    assert not evaluation.accepted
+    assert "condition support below minimum after grounding" in evaluation.reason
+    assert "(1 source rows," in evaluation.reason
 
 
 def test_conditioned_definition_signature_keeps_its_condition():
@@ -1333,6 +1434,194 @@ def test_fit_threshold_candidates_are_fit_only_exhaustive_with_edges():
     assert any(abs(c - 1.5) < 1e-9 for c in candidates)
     assert any(abs(c - 2.5) < 1e-9 for c in candidates)
     assert min(candidates) < 1.0 and max(candidates) > 3.0
+
+
+def test_learned_definition_prefers_simple_separator_across_fit_ties(monkeypatch):
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "timestamp": pd.date_range("2026-01-01", periods=6, freq="1min"),
+            "series_id": "a",
+            "signal": [0.9797, 0.9802, 0.9796, 0.9799, 0.97997, 0.9801],
+            "gate": [1.0, 1.0, 0.0, 0.0, 1.0, 1.0],
+            "alert": [True, False, False, False, True, False],
+        }),
+        time_index="timestamp",
+        group_keys=("series_id",),
+        condition_columns=("alert",),
+        advanced=True,
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="simple_threshold",
+    )
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("alert"),
+            A.Conjunction((
+                A.Bound(A.Ref("signal"), "<", None),
+                A.Bound(A.Ref("gate"), ">", 0.5),
+            )),
+        ),
+    )
+
+    def fixed_masks(valid, _cfg, *, split, groups=None):
+        assert split
+        fit = np.array([True, True, True, True, False, False])
+        evaluation = ~fit
+        return fit & valid, evaluation & valid
+
+    monkeypatch.setattr(
+        "autogram.discovery.evaluate._parameter_masks",
+        fixed_masks,
+    )
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(hold_rate_threshold=0.0),
+    ).evaluate(rule)
+
+    threshold = result.parameters["thresholds"][
+        A.Bound(A.Ref("signal"), "<", None).unparse()
+    ]
+    assert threshold == 0.98
+    assert result.hold_rate == 1.0
+
+
+def test_learned_definition_finds_shortest_separator_away_from_midpoint(
+    monkeypatch,
+):
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "signal": [0.99, 100.0, 2.0],
+            "alert": [True, False, False],
+        }),
+        condition_columns=("alert",),
+        advanced=True,
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="shortest_threshold",
+    )
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("alert"),
+            A.Bound(A.Ref("signal"), "<", None),
+        ),
+    )
+
+    def fixed_masks(valid, _cfg, *, split, groups=None):
+        assert split
+        fit = np.array([True, True, False])
+        evaluation = ~fit
+        return fit & valid, evaluation & valid
+
+    monkeypatch.setattr(
+        "autogram.discovery.evaluate._parameter_masks",
+        fixed_masks,
+    )
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(hold_rate_threshold=0.0),
+    ).evaluate(rule)
+
+    threshold = result.parameters["thresholds"][
+        A.Bound(A.Ref("signal"), "<", None).unparse()
+    ]
+    assert threshold == 1.0
+    assert result.hold_rate == 1.0
+
+
+def test_learned_closed_bound_prefers_equivalent_observed_endpoint(
+    monkeypatch,
+):
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "signal": [1.0, 1.000000001, 1.0000000001],
+            "alert": [True, False, False],
+        }),
+        condition_columns=("alert",),
+        advanced=True,
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="closed_threshold",
+    )
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("alert"),
+            A.Bound(A.Ref("signal"), "<=", None),
+        ),
+    )
+
+    def fixed_masks(valid, _cfg, *, split, groups=None):
+        assert split
+        fit = np.array([True, True, False])
+        evaluation = ~fit
+        return fit & valid, evaluation & valid
+
+    monkeypatch.setattr(
+        "autogram.discovery.evaluate._parameter_masks",
+        fixed_masks,
+    )
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(hold_rate_threshold=0.0),
+    ).evaluate(rule)
+
+    threshold = result.parameters["thresholds"][
+        A.Bound(A.Ref("signal"), "<=", None).unparse()
+    ]
+    assert threshold == 1.0
+    assert result.hold_rate == 1.0
+
+
+def test_learned_threshold_finds_simple_integer_beside_zero(monkeypatch):
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "signal": [0.0, 1e20, 0.5, 2.0],
+            "alert": [True, False, True, False],
+        }),
+        condition_columns=("alert",),
+        advanced=True,
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="zero_adjacent_threshold",
+    )
+    rule = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("alert"),
+            A.Bound(A.Ref("signal"), "<", None),
+        ),
+    )
+
+    def fixed_masks(valid, _cfg, *, split, groups=None):
+        assert split
+        fit = np.array([True, True, False, False])
+        evaluation = ~fit
+        return fit & valid, evaluation & valid
+
+    monkeypatch.setattr(
+        "autogram.discovery.evaluate._parameter_masks",
+        fixed_masks,
+    )
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(hold_rate_threshold=0.0),
+    ).evaluate(rule)
+
+    threshold = result.parameters["thresholds"][
+        A.Bound(A.Ref("signal"), "<", None).unparse()
+    ]
+    assert threshold == 1.0
+    assert result.hold_rate == 1.0
 
 
 def test_fit_threshold_candidates_are_overflow_safe_at_float_extremes():

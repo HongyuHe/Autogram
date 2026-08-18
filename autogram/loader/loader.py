@@ -171,40 +171,190 @@ class Dataset:
         }
 
 
+def _matrix_column_accessor(matrix, n_columns: int):
+    """Return ``(n_rows, column_at)`` without promoting identity columns.
+
+    NumPy arrays are homogeneous, so an already-float array may already have lost integer
+    precision before reaching the loader.  Preserve an array's existing dtype, preserve pandas
+    columns independently, and materialize other row-oriented inputs as objects so this function
+    does not itself promote mixed integer/float rows before copying their identities.
+    """
+    if isinstance(matrix, pd.DataFrame):
+        shape = matrix.shape
+
+        def column_at(index):
+            return matrix.iloc[:, index].to_numpy(copy=True)
+    else:
+        source = (
+            np.asarray(matrix)
+            if isinstance(matrix, np.ndarray)
+            else np.asarray(matrix, dtype=object)
+        )
+        shape = source.shape
+
+        def column_at(index):
+            return np.array(source[:, index], copy=True)
+
+    if len(shape) != 2:
+        raise ValueError(
+            f"dataset matrix must be two-dimensional, got shape {shape}"
+        )
+    if shape[1] != n_columns:
+        raise ValueError(
+            "dataset matrix column count does not match supplied columns "
+            f"({shape[1]} != {n_columns})"
+        )
+    return int(shape[0]), column_at
+
+
+def _is_missing_scalar(value) -> bool:
+    if value is None:
+        return True
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(missing, (bool, np.bool_)) and bool(missing)
+
+
+def _declared_boolean_columns(nm: NameModel) -> set:
+    """Resolve schema-declared Boolean conditions and ref roles to columns."""
+    adapter = nm.adapter
+    declared = {
+        column
+        for column, values in (
+            getattr(adapter, "condition_columns", {}) or {}
+        ).items()
+        if values
+        and all(isinstance(value, (bool, np.bool_)) for value in values)
+    }
+    for binder in getattr(adapter, "binders", ()):
+        roles = tuple(getattr(adapter, "boolean_roles", {}).get(binder, ()))
+        if not roles:
+            continue
+        for binding in adapter.enumerate_bindings(binder, nm):
+            for role in roles:
+                column = adapter.resolve_ref(role, binder, binding, nm)
+                if column is not None:
+                    declared.add(column)
+    return declared
+
+
+def _is_boolean_column(values, *, declared: bool = False) -> bool:
+    """Recognize native Booleans without conflating them with 0/1 or text.
+
+    A schema declaration retains an empty or all-missing Boolean column, but
+    never overrides contradictory non-Boolean scalar contents.
+    """
+    if pd.api.types.is_bool_dtype(values):
+        return True
+    found = False
+    for value in np.asarray(values, dtype=object).reshape(-1):
+        if _is_missing_scalar(value):
+            continue
+        if not isinstance(value, (bool, np.bool_)):
+            return False
+        found = True
+    return found or declared
+
+
+def _column_to_float(values) -> np.ndarray:
+    """Convert one measurement column, mapping nullable scalars to NaN."""
+    try:
+        return np.asarray(values, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        source = np.asarray(values, dtype=object)
+        converted = np.empty(source.shape, dtype=float)
+        for index in np.ndindex(source.shape):
+            value = source[index]
+            converted[index] = (
+                np.nan if _is_missing_scalar(value) else float(value)
+            )
+        return converted
+
+
 def build_dataset(columns, matrix: np.ndarray, adapter, name: str,
                   timestamps=None) -> Dataset:
-    """Build a :class:`Dataset` directly from a numeric ``(N, d)`` matrix and an adapter.
+    """Build a :class:`Dataset` directly from a matrix-like table and an adapter.
 
     The columns are parsed through the induced ``adapter``; only columns the adapter recognises
-    are kept (re-ordered to the engine's low-then-high convention).
+    are kept as float measurements (re-ordered to the engine's low-then-high convention).
+    Declared grouping identities are copied from the source columns without float promotion.
 
     When the adapter declares a time index (and optionally grouping columns), the row context is
     populated the same way the DataFrame path does -- otherwise temporal terms would ground to zero
     points because ``_ordered_groups`` cannot find the declared time column in ``row_context``.
     """
-    matrix = np.asarray(matrix, dtype=float)
-    nm = NameModel.from_columns_with_adapter(list(columns), adapter)
-    ordered = list(nm.low_cols) + list(nm.high_cols)
-    idx = [list(columns).index(c) for c in ordered]
-    if timestamps is None:
-        timestamps = np.arange(matrix.shape[0])
-    timestamps = np.asarray(timestamps)
+    source_columns = list(columns)
+    n_rows, column_at = _matrix_column_accessor(matrix, len(source_columns))
+    nm = NameModel.from_columns_with_adapter(source_columns, adapter)
+    positions = {}
+    for index, column in enumerate(source_columns):
+        positions.setdefault(column, index)
+    source_cache = {}
+
+    def source_column(column):
+        if column not in source_cache:
+            source_cache[column] = column_at(positions[column])
+        return source_cache[column]
+
     time_index = getattr(adapter, "time_index", "") or ""
     group_keys = tuple(getattr(adapter, "group_keys", ()) or ())
+    condition_columns = tuple(
+        getattr(adapter, "condition_columns", {}) or ()
+    )
+    metadata_columns = tuple(
+        getattr(adapter, "metadata_columns", ()) or ()
+    )
+    context_order = tuple(dict.fromkeys((
+        time_index,
+        *group_keys,
+        *condition_columns,
+        *metadata_columns,
+    )))
+    context_columns = set(context_order) - {""}
+    declared_boolean_columns = _declared_boolean_columns(nm)
+    ordered = [
+        column
+        for column in (list(nm.low_cols) + list(nm.high_cols))
+        if (
+            column not in context_columns
+            or _is_boolean_column(
+                source_column(column),
+                declared=column in declared_boolean_columns,
+            )
+        )
+    ]
+    observed_matrix = np.empty((n_rows, len(ordered)), dtype=float)
+    for target, column in enumerate(ordered):
+        try:
+            observed_matrix[:, target] = _column_to_float(
+                source_column(column)
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"measurement column {column!r} cannot be converted to float"
+            ) from error
+    if timestamps is None:
+        timestamps = (
+            source_column(time_index)
+            if time_index and time_index in positions
+            else np.arange(n_rows)
+        )
+    timestamps = np.asarray(timestamps)
     row_context: dict = {}
     if time_index:
         row_context[time_index] = timestamps
-    source_columns = list(columns)
-    for key in group_keys:
-        if key in source_columns:
-            row_context[key] = matrix[:, source_columns.index(key)]
+    for key in context_order:
+        if key and key != time_index and key in positions:
+            row_context[key] = source_column(key)
     observed = Frame(
-        matrix[:, idx] if idx else np.empty((matrix.shape[0], 0)),
+        observed_matrix,
         ordered,
         row_context=row_context,
     )
     return Dataset(name=name, name_model=nm, observed=observed,
-                   timestamps=timestamps, n_snapshots=matrix.shape[0],
+                   timestamps=timestamps, n_snapshots=n_rows,
                    time_index=time_index,
                    group_keys=group_keys,
                    row_context=row_context)
@@ -228,6 +378,7 @@ def load_dataframe(df, adapter, name: str, timestamps=None) -> Dataset:
     """Build a :class:`Dataset` from an in-memory DataFrame via a compiled adapter codec."""
     columns = list(df.columns)
     nm = NameModel.from_columns_with_adapter(columns, adapter)
+    declared_boolean_columns = _declared_boolean_columns(nm)
     metadata = {
         adapter.time_index,
         *adapter.group_keys,
@@ -237,7 +388,10 @@ def load_dataframe(df, adapter, name: str, timestamps=None) -> Dataset:
     ordered = [
         c for c in (list(nm.low_cols) + list(nm.high_cols))
         if c not in metadata
-        or pd.api.types.is_bool_dtype(df[c])
+        or _is_boolean_column(
+            df[c],
+            declared=c in declared_boolean_columns,
+        )
     ]
     row_context = {
         c: df[c].to_numpy(copy=True)

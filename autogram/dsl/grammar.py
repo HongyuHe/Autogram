@@ -41,6 +41,7 @@ class Grammar:
     windows: Tuple[int, ...] = ()
     conditional_enabled: bool = False
     condition_columns: Dict[str, Tuple[object, ...]] = field(default_factory=dict)
+    column_roles: Tuple[Tuple[object, ...], ...] = ()
     max_condition_values: int = 4
     related_roles: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     boolean_roles: Dict[str, Tuple[str, ...]] = field(default_factory=dict)

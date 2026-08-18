@@ -804,7 +804,7 @@ def test_condition_conjunction_search_is_column_name_invariant():
     assert expected in EnumerationProposer(grammar)._conditions()
 
 
-def test_proposer_rejects_self_conditioned_temporal_rules():
+def test_proposer_legacy_no_map_rejects_raw_name_self_condition():
     grammar = Grammar(
         binders=("record",),
         ops=("~=", "==", "<=", ">="),
@@ -828,6 +828,240 @@ def test_proposer_rejects_self_conditioned_temporal_rules():
         )
         for rule in rules
     )
+
+
+def test_proposer_authoritative_map_does_not_fallback_for_unmapped_condition():
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=", "==", "<=", ">="),
+        ref_roles={"record": ("status",)},
+        fam_roles={"record": ()},
+        temporal_enabled=True,
+        max_lag=1,
+        conditional_enabled=True,
+        condition_columns={"status": (False, True)},
+    )
+    proposed = {
+        rule.signature()
+        for rule in EnumerationProposer(
+            grammar,
+            column_roles=(("status!", "status"),),
+        ).propose()
+    }
+    conditioned_delta = normalize_rule(A.Rule(
+        "record",
+        A.Compare(A.Diff(A.Ref("status"), 1), ">=", A.Const(0.0)),
+        condition=A.Condition("status", "==", (True,)),
+    )).signature()
+
+    assert conditioned_delta in proposed
+
+
+def test_proposer_rejects_prefixed_profile_role_self_conditions():
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=", "==", "<=", ">="),
+        ref_roles={"record": ("v_123", "other")},
+        fam_roles={"record": ()},
+        temporal_enabled=True,
+        max_lag=1,
+        conditional_enabled=True,
+        condition_columns={"123": (False, True)},
+    )
+    grammar.column_roles = (("123", "v_123"),)
+    proposed = {
+        rule.signature()
+        for rule in EnumerationProposer(grammar).propose()
+    }
+
+    def conditioned_delta(role):
+        return normalize_rule(A.Rule(
+            "record",
+            A.Compare(A.Diff(A.Ref(role), 1), ">=", A.Const(0.0)),
+            condition=A.Condition("123", "==", (True,)),
+        )).signature()
+
+    assert conditioned_delta("v_123") not in proposed
+    assert conditioned_delta("other") in proposed
+
+
+@pytest.mark.parametrize(
+    "condition_column,self_role,other_role,column_roles",
+    [
+        (
+            "a b",
+            "a_b_2",
+            "a_b",
+            (("a-b", "a_b"), ("a b", "a_b_2")),
+        ),
+        (
+            1,
+            "v_1",
+            "v_1_2",
+            ((1, "v_1"), ("1", "v_1_2")),
+        ),
+    ],
+    ids=("collision-suffix", "typed-column-identity"),
+)
+def test_proposer_uses_exact_column_role_identity_for_self_conditions(
+    condition_column,
+    self_role,
+    other_role,
+    column_roles,
+):
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=", "==", "<=", ">="),
+        ref_roles={"record": (self_role, other_role)},
+        fam_roles={"record": ()},
+        temporal_enabled=True,
+        max_lag=1,
+        conditional_enabled=True,
+        condition_columns={condition_column: (False, True)},
+    )
+    proposed = {
+        rule.signature()
+        for rule in EnumerationProposer(
+            grammar,
+            column_roles=column_roles,
+        ).propose()
+    }
+
+    def conditioned_delta(role):
+        return normalize_rule(A.Rule(
+            "record",
+            A.Compare(A.Diff(A.Ref(role), 1), ">=", A.Const(0.0)),
+            condition=A.Condition(
+                condition_column,
+                "==",
+                (True,),
+            ),
+        )).signature()
+
+    assert conditioned_delta(self_role) not in proposed
+    assert conditioned_delta(other_role) in proposed
+
+
+def test_dataframe_runtime_wires_authoritative_self_condition_mapping():
+    frame = pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=8,
+            freq="1min",
+        ),
+        "a-b": np.array(
+            [False, True, False, True, False, True, False, True],
+            dtype=bool,
+        ),
+        "other": np.arange(8.0),
+    })
+    spec = GrammarSpec(
+        name="runtime-self-condition",
+        patterns=(
+            ColumnPattern(
+                "timestamp",
+                "regex",
+                "metadata",
+                "timestamp",
+                regex=r"^timestamp$",
+            ),
+            ColumnPattern(
+                "self",
+                "regex",
+                "tabular",
+                "a_b",
+                regex=r"^a-b$",
+            ),
+            ColumnPattern(
+                "other",
+                "regex",
+                "tabular",
+                "other",
+                regex=r"^other$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("a_b", "other")},
+            fam_roles={"record": ()},
+            ops=(">=",),
+        ),
+        ref_templates=(
+            RefTemplate("record", "a_b", "a-b"),
+            RefTemplate("record", "other", "other"),
+        ),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+        time_index="timestamp",
+        condition_columns={"a-b": (False, True)},
+        conditional_enabled=True,
+        temporal_enabled=True,
+        max_lag=1,
+        metadata_columns=("timestamp",),
+    )
+    _dataset, grammar = build_dataframe_grammar(
+        frame,
+        spec,
+        name="runtime_self_condition",
+    )
+    proposed = {
+        rule.signature()
+        for rule in EnumerationProposer(grammar).propose()
+    }
+
+    def conditioned_delta(role):
+        return normalize_rule(A.Rule(
+            "record",
+            A.Compare(
+                A.Diff(A.Ref(role), 1),
+                ">=",
+                A.Const(0.0),
+            ),
+            condition=A.Condition("a-b", "==", (True,)),
+        )).signature()
+
+    assert ("record", "a-b", "a_b") in grammar.column_roles
+    assert conditioned_delta("a_b") not in proposed
+    assert conditioned_delta("other") in proposed
+
+
+def test_self_condition_mapping_is_scoped_to_rule_binder():
+    grammar = Grammar(
+        binders=("flags", "metrics"),
+        ops=(">=",),
+        ref_roles={
+            "flags": ("value",),
+            "metrics": ("value",),
+        },
+        fam_roles={"flags": (), "metrics": ()},
+        temporal_enabled=True,
+        max_lag=1,
+        conditional_enabled=True,
+        condition_columns={"flag": (False, True)},
+        column_roles=(
+            ("flags", "flag", "value"),
+            ("metrics", "metric", "value"),
+        ),
+    )
+    proposed = {
+        rule.signature()
+        for rule in EnumerationProposer(grammar).propose()
+    }
+
+    def conditioned_delta(binder):
+        return normalize_rule(A.Rule(
+            binder,
+            A.Compare(
+                A.Diff(A.Ref("value"), 1),
+                ">=",
+                A.Const(0.0),
+            ),
+            condition=A.Condition("flag", "==", (True,)),
+        )).signature()
+
+    assert conditioned_delta("flags") not in proposed
+    assert conditioned_delta("metrics") in proposed
 
 
 def test_conditional_known_signatures_and_proxy_recovery():

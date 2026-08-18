@@ -16,6 +16,7 @@ import hashlib
 import math
 import numbers
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 import numpy as np
 import pandas as pd
@@ -592,6 +593,73 @@ def _ordered_groups(frame: Frame, nm: NameModel):
     return ordered
 
 
+def _declared_temporal_cadence_ns(nm: NameModel) -> int | None:
+    """Return an adapter-declared cadence when its unit is explicit."""
+    adapter = getattr(nm, "adapter", None)
+    for attribute, multiplier in (
+        ("temporal_cadence_ns", 1),
+        ("cadence_ns", 1),
+        ("temporal_cadence_seconds", 1_000_000_000),
+        ("cadence_seconds", 1_000_000_000),
+    ):
+        value = getattr(adapter, attribute, None)
+        if value is None:
+            continue
+        try:
+            numeric = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError(
+                f"{attribute} must be a finite positive cadence"
+            ) from error
+        cadence = numeric * Decimal(multiplier)
+        if (
+            not cadence.is_finite()
+            or cadence <= 0
+            or cadence != cadence.to_integral_value()
+            or cadence > np.iinfo(np.int64).max
+        ):
+            raise ValueError(
+                f"{attribute} must represent an exact positive "
+                "datetime64[ns] cadence"
+            )
+        return int(cadence)
+    return None
+
+
+def _temporal_cadence(frame: Frame, nm: NameModel) -> int | None:
+    """One dataset cadence inferred from within typed groups, never between their phase offsets."""
+    adapter = getattr(nm, "adapter", None)
+    time_index = getattr(adapter, "time_index", "")
+    group_keys = tuple(getattr(adapter, "group_keys", ()))
+    declared = _declared_temporal_cadence_ns(nm)
+    cache_key = (
+        "temporal_cadence",
+        time_index,
+        group_keys,
+        declared,
+    )
+    if cache_key in frame.temporal_cache:
+        return frame.temporal_cache[cache_key]
+    if declared is not None:
+        frame.temporal_cache[cache_key] = declared
+        return declared
+    groups = _ordered_groups(frame, nm)
+    if groups is None:
+        return None
+    times = _time_vector(frame, time_index)
+    cadence = None
+    for rows in groups:
+        ordered = times[rows]
+        for left, right in zip(ordered, ordered[1:]):
+            if left == _NAT_NS or right == _NAT_NS:
+                continue
+            delta = int(right) - int(left)
+            if delta > 0 and (cadence is None or delta < cadence):
+                cadence = delta
+    frame.temporal_cache[cache_key] = cadence
+    return cadence
+
+
 def _consecutive_window_ends(
     frame: Frame,
     nm: NameModel,
@@ -600,6 +668,7 @@ def _consecutive_window_ends(
 ) -> np.ndarray:
     adapter = getattr(nm, "adapter", None)
     time_index = getattr(adapter, "time_index", "")
+    cadence = None if window <= 1 else _temporal_cadence(frame, nm)
     cache_key = (
         "consecutive",
         time_index,
@@ -607,6 +676,7 @@ def _consecutive_window_ends(
             np.asarray(rows, dtype=np.int64).tobytes(),
             digest_size=16,
         ).digest(),
+        cadence,
         int(window),
     )
     if cache_key in frame.temporal_cache:
@@ -616,9 +686,10 @@ def _consecutive_window_ends(
         valid[:] = True
         frame.temporal_cache[cache_key] = valid
         return valid
-    times = _datetime_ns(
-        np.asarray(frame.row_context[time_index])[rows]
-    )
+    if cadence is None:
+        frame.temporal_cache[cache_key] = valid
+        return valid
+    times = _time_vector(frame, time_index)[rows]
     diffs = [
         (
             int(times[index + 1]) - int(times[index])
@@ -630,11 +701,6 @@ def _consecutive_window_ends(
         )
         for index in range(times.size - 1)
     ]
-    positive = [delta for delta in diffs if delta is not None and delta > 0]
-    if not positive:
-        frame.temporal_cache[cache_key] = valid
-        return valid
-    cadence = min(positive)
     consecutive = np.asarray(
         [delta == cadence for delta in diffs],
         dtype=bool,

@@ -22,6 +22,12 @@ from autogram.cli import (
 )
 from autogram.discovery import validate as V
 from autogram.loader.gtib import AUTOGRAM_PROFILE_ATTR, profile_dataframe
+from autogram.schema.spec import (
+    CellCodec,
+    ColumnPattern,
+    GrammarSpec,
+    RoleOntology,
+)
 
 
 def test_explicit_raw_input_is_authoritative_for_renamed_derived_csv(tmp_path):
@@ -300,13 +306,92 @@ def test_effective_profile_advanced_requires_rule_budget(monkeypatch):
         main(["discover", "--input", "unused.pkl"])
 
 
-def test_automatic_advanced_calibration_rejects_explicit_unbounded_budget():
+def test_effective_synthetic_advanced_requires_rule_budget(monkeypatch):
+    import autogram.cli as cli_module
+    import autogram.discovery.loop as loop_module
+
+    induced = GrammarSpec(
+        name="advanced-synthetic",
+        patterns=(
+            ColumnPattern(
+                name="placeholder",
+                matcher="regex",
+                kind="unused",
+                direction="unused",
+                regex=r"^does_not_match$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ()},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+        advanced_enabled=True,
+    )
+    inducer = SimpleNamespace(
+        induce=lambda _columns, _sample_rows=None: induced
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "make_inducer",
+        lambda *_args, **_kwargs: inducer,
+    )
+    monkeypatch.setattr(
+        loop_module,
+        "run_prepared",
+        lambda *_args, **_kwargs: pytest.fail(
+            "discovery ran before the effective advanced budget guard"
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="effective advanced discovery requires a finite --max-rules",
+    ):
+        main([
+            "discover",
+            "--entities",
+            "2",
+            "--snapshots",
+            "2",
+            "--max-rules",
+            "0",
+        ])
+
+
+def test_calibration_budget_allows_only_reachable_nonadvanced_tier():
     args = build_parser().parse_args([
         "calibrate",
         "--input",
         "series.csv",
         "--known",
         "known.yaml",
+        "--max-capability-tiers",
+        "5",
+        "--max-iterations",
+        "1",
+        "--max-rules",
+        "0",
+    ])
+
+    _enforce_capability_rule_budget(args)
+
+
+def test_reachable_advanced_calibration_rejects_explicit_unbounded_budget():
+    args = build_parser().parse_args([
+        "calibrate",
+        "--input",
+        "series.csv",
+        "--known",
+        "known.yaml",
+        "--max-capability-tiers",
+        "5",
+        "--max-iterations",
+        "17",
         "--max-rules",
         "0",
     ])
