@@ -792,6 +792,66 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
     witnesses = []
     if recovery_dataset is not None and recovery_rules is not None:
         witnesses.append((recovery_dataset, recovery_rules))
+    witness_dataset_fingerprints = {}
+    witness_relation_cache = {}
+
+    def witness_dataset_fingerprint(dataset) -> str:
+        identity = id(dataset)
+        if identity in witness_dataset_fingerprints:
+            return witness_dataset_fingerprints[identity]
+        name_model = dataset.name_model
+        adapter = name_model.adapter
+        groundings = []
+        for binder in adapter.binders:
+            bindings = adapter.enumerate_bindings(
+                binder,
+                name_model,
+            )
+            for role in adapter.refs_for(binder):
+                groundings.append((
+                    "ref",
+                    binder,
+                    role,
+                    tuple(
+                        adapter.resolve_ref(
+                            role,
+                            binder,
+                            binding,
+                            name_model,
+                        )
+                        for binding in bindings
+                    ),
+                ))
+            for role in adapter.fams_for(binder):
+                groundings.append((
+                    "family",
+                    binder,
+                    role,
+                    tuple(
+                        adapter.resolve_family(
+                            role,
+                            binder,
+                            binding,
+                            name_model,
+                        )
+                        for binding in bindings
+                    ),
+                ))
+        frame = dataset.observed
+        fingerprint = _fingerprint({
+            "matrix": frame.matrix,
+            "names": frame.names,
+            "row_context": frame.row_context,
+            "relations": frame.relations,
+            "time_index": dataset.time_index,
+            "group_keys": dataset.group_keys,
+            "condition_columns": adapter.condition_columns,
+            "boolean_roles": adapter.boolean_roles,
+            "related_templates": adapter.related_templates,
+            "groundings": groundings,
+        })
+        witness_dataset_fingerprints[identity] = fingerprint
+        return fingerprint
 
     for witness_dataset, witness_rules in itertools.chain(
         witnesses,
@@ -824,91 +884,114 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
             for signature in signatures
         ]
         witness_evaluator = None
+        dataset_fingerprint = witness_dataset_fingerprint(
+            witness_dataset
+        )
         for rule in witness_rules:
-            relations = set(rule_relations(
-                rule,
-                witness_dataset,
-            ))
-            from .dsl import ast as A
-            from .dsl.binders import (
-                enumerate_bindings,
-                resolve_ref,
+            cache_key = (
+                dataset_fingerprint,
+                rule.unparse(),
             )
-
-            atom = rule.atom
-            if (
-                not relations
-                and isinstance(
-                    atom,
-                    (A.BooleanDefinition, A.BandDefinition),
+            if cache_key in witness_relation_cache:
+                relations = set(
+                    witness_relation_cache[cache_key]
                 )
-            ):
-                parameterized_tag = (
-                    "healthy_band"
-                    if isinstance(atom, A.BandDefinition)
-                    else (
-                        "sustained_definition"
-                        if isinstance(
-                            atom.predicate,
-                            A.Sustained,
-                        )
-                        else "conjunction_definition"
-                    )
-                )
-                if parameterized_tag not in known_relation_tags:
-                    continue
-                if witness_evaluator is None:
-                    witness_evaluator = DataOnlyEvaluator(
-                        witness_dataset,
-                        DiscoveryConfig(seed=seed),
-                    )
-                fitted = witness_evaluator.evaluate(rule)
+            else:
                 relations = set(rule_relations(
                     rule,
                     witness_dataset,
-                    fitted.parameters,
                 ))
-            if (
-                rule.condition is None
-                and isinstance(atom, A.Compare)
-                and atom.op in (">=", "<=", ">", "<")
-            ):
-                reverse = {
-                    ">=": "<=",
-                    "<=": ">=",
-                    ">": "<",
-                    "<": ">",
-                }
-                for measured, zero, op in (
-                    (atom.left, atom.right, atom.op),
-                    (atom.right, atom.left, reverse[atom.op]),
+                from .dsl import ast as A
+                from .dsl.binders import (
+                    enumerate_bindings,
+                    resolve_ref,
+                )
+
+                atom = rule.atom
+                if (
+                    not relations
+                    and isinstance(
+                        atom,
+                        (
+                            A.BooleanDefinition,
+                            A.BandDefinition,
+                        ),
+                    )
                 ):
-                    if not (
-                        isinstance(measured, A.Ref)
-                        and isinstance(zero, A.Const)
-                        and float(zero.value) == 0.0
-                    ):
-                        continue
-                    known_op = {
-                        ">": ">=",
-                        "<": "<=",
-                    }.get(op, op)
-                    for binding in enumerate_bindings(
-                        rule.binder,
-                        witness_dataset.name_model,
-                    ):
-                        column = resolve_ref(
-                            measured.role,
-                            rule.binder,
-                            binding,
-                            witness_dataset.name_model,
+                    parameterized_tag = (
+                        "healthy_band"
+                        if isinstance(atom, A.BandDefinition)
+                        else (
+                            "sustained_definition"
+                            if isinstance(
+                                atom.predicate,
+                                A.Sustained,
+                            )
+                            else "conjunction_definition"
                         )
-                        if column is not None:
-                            relations.add((
-                                "one_sided",
-                                column,
-                                known_op,
-                            ))
+                    )
+                    if parameterized_tag in known_relation_tags:
+                        if witness_evaluator is None:
+                            witness_evaluator = DataOnlyEvaluator(
+                                witness_dataset,
+                                DiscoveryConfig(seed=seed),
+                            )
+                        fitted = witness_evaluator.evaluate(
+                            rule
+                        )
+                        relations = set(rule_relations(
+                            rule,
+                            witness_dataset,
+                            fitted.parameters,
+                        ))
+                if (
+                    rule.condition is None
+                    and isinstance(atom, A.Compare)
+                    and atom.op in (">=", "<=", ">", "<")
+                ):
+                    reverse = {
+                        ">=": "<=",
+                        "<=": ">=",
+                        ">": "<",
+                        "<": ">",
+                    }
+                    for measured, zero, op in (
+                        (atom.left, atom.right, atom.op),
+                        (
+                            atom.right,
+                            atom.left,
+                            reverse[atom.op],
+                        ),
+                    ):
+                        if not (
+                            isinstance(measured, A.Ref)
+                            and isinstance(zero, A.Const)
+                            and float(zero.value) == 0.0
+                        ):
+                            continue
+                        known_op = {
+                            ">": ">=",
+                            "<": "<=",
+                        }.get(op, op)
+                        for binding in enumerate_bindings(
+                            rule.binder,
+                            witness_dataset.name_model,
+                        ):
+                            column = resolve_ref(
+                                measured.role,
+                                rule.binder,
+                                binding,
+                                witness_dataset.name_model,
+                            )
+                            if column is not None:
+                                relations.add((
+                                    "one_sided",
+                                    column,
+                                    known_op,
+                                ))
+                witness_relation_cache[cache_key] = (
+                    frozenset(relations)
+                )
             if not relations:
                 continue
             learned_by_tolerance = {
