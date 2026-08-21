@@ -1733,11 +1733,15 @@ def _prepare_runtime_tier_specs(
     remains pinned to tier 0.
     """
     columns = list(df.columns)
-    boolean_columns = {
-        str(column)
-        for column in df.columns
-        if pd.api.types.is_bool_dtype(df[column])
-    }
+    boolean_columns = (
+        {
+            str(column)
+            for column in df.columns
+            if pd.api.types.is_bool_dtype(df[column])
+        }
+        if hasattr(df, "dtypes")
+        else set()
+    )
     accumulated = None
     runtime_specs = []
     for tier_index, caps in enumerate(tiers):
