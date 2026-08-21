@@ -189,6 +189,40 @@ def test_profiled_aggregation_vocabulary_stays_pinned_across_tiers(
     ] == [("SUM",), ("SUM",)]
 
 
+def test_profiled_advanced_false_stays_off_until_advanced_tier(
+    monkeypatch,
+):
+    import autogram.calibrate as calibration
+
+    frame = profile_dataframe(
+        pd.DataFrame({"value": [1.0, 2.0]}),
+        advanced=False,
+    )
+    induced = replace(
+        _mini_spec(),
+        advanced_enabled=True,
+    )
+    monkeypatch.setattr(
+        calibration,
+        "induce_spec",
+        lambda _columns, _inducer: induced,
+    )
+
+    specs = calibration._prepare_runtime_tier_specs(
+        frame,
+        induced,
+        object(),
+        [{}, {"advanced": True}],
+        SearchConfig(max_rules=10_000),
+        frame.attrs["autogram_profile"],
+    )
+
+    assert [
+        spec.advanced_enabled
+        for spec in specs
+    ] == [False, True]
+
+
 def test_distinct_runtime_tiers_drop_only_provenance_duplicates():
     base = _mini_spec()
     provenance_duplicate = replace(
