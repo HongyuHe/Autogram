@@ -163,6 +163,8 @@ def test_parser_exposes_generic_temporal_and_condition_profile_flags():
         "45",
         "--window",
         "60",
+        "--cadence-seconds",
+        "60",
         "--max-lag",
         "60",
         "--run-length",
@@ -173,6 +175,7 @@ def test_parser_exposes_generic_temporal_and_condition_profile_flags():
     assert args.group_keys == ["tenant"]
     assert args.condition_columns == ["label"]
     assert args.windows == [45, 60]
+    assert args.cadence_seconds == 60
     assert args.max_lag == 60
     assert args.run_lengths == [10]
     assert args.advanced is True
@@ -215,6 +218,7 @@ def test_checked_in_gtib_config_populates_calibration_arguments():
     assert configured.time_index == "timestamp"
     assert configured.group_keys == ["consumer_id"]
     assert configured.windows == [10, 45, 60]
+    assert configured.cadence_seconds == 60
     assert configured.max_lag == 45
     assert configured.run_lengths == [10]
     assert configured.max_capability_tiers == 5
@@ -252,6 +256,7 @@ def test_unrelated_profile_override_preserves_conjunction_arity():
         pd.DataFrame({"value": [1.0, 2.0]}),
         advanced=True,
         max_conjunction_terms=4,
+        temporal_cadence_seconds=30,
     )
     unrelated = build_parser().parse_args([
         "discover",
@@ -273,6 +278,8 @@ def test_unrelated_profile_override_preserves_conjunction_arity():
 
     assert preserved.attrs["autogram_profile"]["max_conjunction_terms"] == 4
     assert overridden.attrs["autogram_profile"]["max_conjunction_terms"] == 2
+    assert preserved.attrs["autogram_profile"]["temporal_cadence_seconds"] == 30
+    assert overridden.attrs["autogram_profile"]["temporal_cadence_seconds"] == 30
 
 
 def test_advanced_discovery_requires_finite_rule_budget():

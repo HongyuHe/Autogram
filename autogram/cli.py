@@ -111,6 +111,7 @@ def _configure_dataframe_profile(df, args):
         getattr(args, "group_keys", []),
         getattr(args, "condition_columns", []),
         getattr(args, "windows", []),
+        getattr(args, "cadence_seconds", None) is not None,
         getattr(args, "max_lag", None) is not None,
         getattr(args, "run_lengths", []),
         getattr(args, "max_conjunction_terms", None) is not None,
@@ -132,6 +133,11 @@ def _configure_dataframe_profile(df, args):
         families=profile.get("families", {}),
         related_frames=profile.get("related_frames", {}),
         temporal_windows=getattr(args, "windows", []) or profile.get("temporal_windows", ()),
+        temporal_cadence_seconds=(
+            getattr(args, "cadence_seconds", None)
+            if getattr(args, "cadence_seconds", None) is not None
+            else profile.get("temporal_cadence_seconds", 0)
+        ),
         max_lag=(
             getattr(args, "max_lag", None)
             if getattr(args, "max_lag", None) is not None
@@ -194,6 +200,11 @@ def _apply_config_file(args: argparse.Namespace, argv=None) -> argparse.Namespac
     assign("group_keys", profile.get("group_keys"), "--group-key")
     assign("condition_columns", profile.get("condition_columns"), "--condition-column")
     assign("windows", profile.get("windows"), "--window")
+    assign(
+        "cadence_seconds",
+        profile.get("cadence_seconds"),
+        "--cadence-seconds",
+    )
     assign("max_lag", profile.get("max_lag"), "--max-lag")
     assign("run_lengths", profile.get("run_lengths"), "--run-length")
     assign(
@@ -419,6 +430,8 @@ def build_parser() -> argparse.ArgumentParser:
                             help="categorical or Boolean condition column; repeat as needed")
         parser.add_argument("--window", dest="windows", action="append", type=int, default=[],
                             help="allowed rolling window in rows; repeat as needed")
+        parser.add_argument("--cadence-seconds", dest="cadence_seconds", type=float, default=None,
+                            help="expected seconds between consecutive temporal observations")
         parser.add_argument("--max-lag", dest="max_lag", type=int, default=None,
                             help="maximum temporal lag in rows")
         parser.add_argument("--run-length", dest="run_lengths", action="append",

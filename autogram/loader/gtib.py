@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import math
@@ -106,6 +107,7 @@ def profile_dataframe(
     families: dict[str, Iterable[str]] | None = None,
     related_frames: dict[str, pd.DataFrame] | None = None,
     temporal_windows: Iterable[int] = (),
+    temporal_cadence_seconds: float | int | None = None,
     max_lag: int = 0,
     related_aggregates: dict[str, dict] | None = None,
     run_lengths: Iterable[int] = (),
@@ -119,6 +121,25 @@ def profile_dataframe(
 ) -> pd.DataFrame:
     """Attach layout metadata without changing the table's observed values."""
 
+    cadence = Decimal(0)
+    if temporal_cadence_seconds is not None:
+        try:
+            cadence = Decimal(str(temporal_cadence_seconds))
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError(
+                "temporal_cadence_seconds must be a finite nonnegative number"
+            ) from error
+        nanoseconds = cadence * Decimal(1_000_000_000)
+        if (
+            not cadence.is_finite()
+            or cadence < 0
+            or nanoseconds != nanoseconds.to_integral_value()
+            or nanoseconds > 2 ** 63 - 1
+        ):
+            raise ValueError(
+                "temporal_cadence_seconds must represent an exact "
+                "nonnegative datetime64[ns] cadence"
+            )
     out = frame.copy()
     groups = [str(c) for c in group_keys if c in out.columns]
     conditions = [str(c) for c in condition_columns if c in out.columns]
@@ -133,6 +154,7 @@ def profile_dataframe(
         "families": family_map,
         "related_frames": dict(related_frames or {}),
         "temporal_windows": sorted({int(window) for window in temporal_windows}),
+        "temporal_cadence_seconds": float(cadence),
         "max_lag": int(max_lag),
         "related_aggregates": dict(related_aggregates or {}),
         "run_lengths": sorted({int(window) for window in run_lengths}),
@@ -376,6 +398,40 @@ def _validated_gtib_raw(raw: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def _infer_raw_cadence_seconds(raw: pd.DataFrame) -> int:
+    """Infer the base shard scrape cadence from typed per-shard timestamp sequences."""
+    from ..dsl.evaluate import _datetime_ns, typed_group_key
+
+    times = _datetime_ns(raw["timestamp"].to_numpy())
+    consumers = raw["consumer_id"].to_numpy(dtype=object)
+    shards = raw["shard_id"].to_numpy(dtype=object)
+    groups: dict[tuple, list[int]] = {}
+    for index, (consumer, shard) in enumerate(
+        zip(consumers, shards)
+    ):
+        groups.setdefault(
+            (
+                typed_group_key(consumer),
+                typed_group_key(shard),
+            ),
+            [],
+        ).append(index)
+    cadence_ns = 0
+    for indices in groups.values():
+        ordered = sorted(int(times[index]) for index in indices)
+        for left, right in zip(ordered, ordered[1:]):
+            delta = right - left
+            if delta > 0:
+                cadence_ns = math.gcd(cadence_ns, delta)
+    if cadence_ns == 0:
+        return 10
+    if cadence_ns % 1_000_000_000:
+        raise ValueError(
+            "GTIB raw cadence must be an integral number of seconds"
+        )
+    return cadence_ns // 1_000_000_000
+
+
 def prepare_gtib(
     derived: pd.DataFrame,
     raw: pd.DataFrame | None = None,
@@ -509,22 +565,29 @@ def prepare_gtib(
             "span_end": "span_end",
             "filter_column": "type",
         }
+        event_role_values = {
+            "event_true_loss": tuple(
+                value for value in event_types
+                if value.startswith("true_loss")
+            ),
+            "event_benign_burst": (
+                ("benign_burst",)
+                if "benign_burst" in event_types
+                else ()
+            ),
+            "event_artifact": (
+                ("artifact",)
+                if "artifact" in event_types
+                else ()
+            ),
+        }
         related_aggregates.update({
-            "event_true_loss": {
+            role: {
                 **span_common,
-                "filter_values": tuple(
-                    value for value in event_types
-                    if value.startswith("true_loss")
-                ),
-            },
-            "event_benign_burst": {
-                **span_common,
-                "filter_values": ("benign_burst",),
-            },
-            "event_artifact": {
-                **span_common,
-                "filter_values": ("artifact",),
-            },
+                "filter_values": values,
+            }
+            for role, values in event_role_values.items()
+            if values
         })
 
     return profile_dataframe(
@@ -535,6 +598,7 @@ def prepare_gtib(
         families=families,
         related_frames=related,
         temporal_windows=(10, 45, 60),
+        temporal_cadence_seconds=rate_window_seconds,
         max_lag=60,
         related_aggregates=related_aggregates,
         run_lengths=(10,),
@@ -584,6 +648,9 @@ def prepare_gtib_raw(raw: pd.DataFrame) -> pd.DataFrame:
         group_keys=("consumer_id", "shard_id"),
         condition_columns=conditions,
         temporal_windows=(1,),
+        temporal_cadence_seconds=_infer_raw_cadence_seconds(
+            frame
+        ),
         max_lag=1,
     )
 

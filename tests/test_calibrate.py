@@ -326,6 +326,62 @@ def test_merge_specs_grows_search_space_and_keeps_base_authoritative():
     assert m.max_degree == 2
 
 
+def test_merge_specs_renames_nonidentical_pattern_name_collisions():
+    from autogram.loader.names import NameModel
+    from autogram.schema.compiler import compile_spec
+
+    base = GrammarSpec(
+        name="base",
+        patterns=(
+            ColumnPattern(
+                name="metric",
+                matcher="regex",
+                kind="tabular",
+                direction="a",
+                regex=r"^a$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("a_role",)},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(RefTemplate("record", "a_role", "a"),),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    new = GrammarSpec(
+        name="new",
+        patterns=(
+            ColumnPattern(
+                name="metric",
+                matcher="regex",
+                kind="tabular",
+                direction="b",
+                regex=r"^b$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("record",),
+            ref_roles={"record": ("b_role",)},
+            fam_roles={"record": ()},
+        ),
+        ref_templates=(RefTemplate("record", "b_role", "b"),),
+        family_selectors=(),
+        binder_enumerate={"record": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+
+    merged = _merge_specs(base, new, columns=("a", "b"))
+    adapter = compile_spec(merged)
+    model = NameModel.from_columns_with_adapter(("a", "b"), adapter)
+
+    assert len({pattern.name for pattern in merged.patterns}) == 2
+    assert adapter.resolve_ref("a_role", "record", {}, model) == "a"
+    assert adapter.resolve_ref("b_role", "record", {}, model) == "b"
+
+
 def test_merge_specs_is_identity_preserving_superset_of_base():
     # merging base with an empty proposal must reproduce base's expressive vocabulary exactly.
     base = _mini_spec(agg=("SUM", "AVG"), max_degree=2, role_exclusions=(frozenset({"a", "b"}),))

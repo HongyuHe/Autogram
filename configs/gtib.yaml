@@ -22,6 +22,7 @@ profile:
     - oracle_alert
     - traj_alert
   windows: [10, 45, 60]
+  cadence_seconds: 60
   max_lag: 45
   run_lengths: [10]
   max_conjunction_terms: 3

@@ -524,6 +524,9 @@ def _augment_profiled_dataframe_spec(df, spec):
                 else True
             )
         ),
+        temporal_cadence_seconds=float(
+            profile.get("temporal_cadence_seconds", 0)
+        ),
         max_lag=(
             max(
                 int(getattr(spec, "max_lag", 0)),
