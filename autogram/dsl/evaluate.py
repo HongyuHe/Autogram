@@ -388,6 +388,15 @@ def _time_vector(frame: Frame, time_index: str) -> np.ndarray:
 _MISSING_GROUP = "__missing__"
 
 
+class TypedGroupIdentity:
+    """Precomputed typed identity for hot grouped-evaluation paths."""
+
+    __slots__ = ("key",)
+
+    def __init__(self, key):
+        self.key = key
+
+
 def canonical_typed_value(value):
     """Canonical Python representation of one categorical/group value."""
     if isinstance(value, tuple):
@@ -441,10 +450,28 @@ def typed_group_key(label):
     would fragment every missing-labelled row into a group of its own, and a group of one is split
     entirely into the evaluation half where it can neither be fitted nor meaningfully gated.
     """
-    label = canonical_typed_value(label)
+    if isinstance(label, TypedGroupIdentity):
+        return label.key
     if isinstance(label, tuple):
         return ("tuple", tuple(typed_group_key(item) for item in label))
-    if is_missing_scalar(label):
+    if label is None or label is pd.NA:
+        return ("missing", _MISSING_GROUP)
+    if isinstance(label, np.datetime64):
+        if np.isnat(label):
+            return ("missing", _MISSING_GROUP)
+        label = pd.Timestamp(label)
+    elif isinstance(label, np.timedelta64):
+        if np.isnat(label):
+            return ("missing", _MISSING_GROUP)
+        label = pd.Timedelta(label)
+    elif isinstance(label, np.generic):
+        label = label.item()
+    if isinstance(label, float) and math.isnan(label):
+        return ("missing", _MISSING_GROUP)
+    if not isinstance(
+        label,
+        (str, bytes, bool, int, float, pd.Timestamp, pd.Timedelta),
+    ) and is_missing_scalar(label):
         return ("missing", _MISSING_GROUP)
     return (type(label).__name__, label)
 

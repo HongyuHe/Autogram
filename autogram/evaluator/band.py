@@ -50,12 +50,16 @@ def _grouped_split(groups: np.ndarray, holdout_frac: float, seed: int):
     # Bucketed by TYPED identity: ``True == 1`` and they hash alike, so raw bucketing merges two
     # genuinely different groups and the merged split can leave one of them out of the evaluation
     # half entirely -- a group that never reaches evaluation cannot fail the per-group gate.
-    typed = [typed_group_key(item) for item in groups.tolist()]
-    for group_index, label in enumerate(dict.fromkeys(typed)):
-        positions = np.flatnonzero(np.asarray([
-            item == label
-            for item in typed
-        ], dtype=bool))
+    buckets: dict[object, list[int]] = {}
+    for position, item in enumerate(groups.tolist()):
+        buckets.setdefault(
+            typed_group_key(item),
+            [],
+        ).append(position)
+    for group_index, positions_list in enumerate(
+        buckets.values()
+    ):
+        positions = np.asarray(positions_list, dtype=int)
         if positions.size == 1:
             evaluation.append(int(positions[0]))
             continue
