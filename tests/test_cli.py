@@ -235,6 +235,23 @@ def test_checked_in_gtib_config_populates_calibration_arguments():
     assert configured.hold_rate == 0.62
 
 
+def test_checked_in_gtib_raw_config_covers_conditional_search():
+    args = build_parser().parse_args([
+        "calibrate",
+        "--config",
+        "configs/gtib_raw.yaml",
+    ])
+
+    configured = _apply_config_file(
+        args,
+        ["calibrate", "--config", "configs/gtib_raw.yaml"],
+    )
+
+    assert configured.cadence_seconds == 10
+    assert configured.max_capability_tiers == 4
+    assert configured.max_rules == 30_000
+
+
 def test_cli_aggregation_override_reaches_dataframe_profile():
     args = build_parser().parse_args([
         "discover",

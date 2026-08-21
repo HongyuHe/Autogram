@@ -1973,6 +1973,10 @@ def _prepare_runtime_tier_specs(
                 temporal_bounds_widened=True,
                 advanced_bounds_widened=True,
                 degree_widened=True,
+                advanced_enabled=bool(
+                    profile.get("advanced", False)
+                    or caps.get("advanced", False)
+                ),
                 conditional_enabled=bool(
                     tier_index >= 3
                     and (

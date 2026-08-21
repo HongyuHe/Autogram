@@ -27,4 +27,4 @@ search:
   max_complexity: 8
   max_add_arity: 2
   max_capability_tiers: 4
-  max_rules: 5000
+  max_rules: 30000
