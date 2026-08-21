@@ -1755,6 +1755,75 @@ def test_known_split_skips_irrelevant_fitted_definition_witness(
     assert len(calibration) + len(validation) == len(known)
 
 
+def test_known_split_skips_structurally_irrelevant_definition_witness(
+    monkeypatch,
+):
+    from autogram.dsl import ast as A
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "signal": np.linspace(1.0, 20.0, 20),
+            "other": np.linspace(2.0, 40.0, 20),
+            "alert": [False] * 10 + [True] * 10,
+        }),
+        condition_columns=("alert",),
+        advanced=True,
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _mini_spec(),
+        name="irrelevant_definition_structure",
+    )
+    witness = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("alert"),
+            A.Conjunction((
+                A.Bound(A.Ref("other"), "<", None),
+            )),
+        ),
+    )
+    known = [
+        KnownInvariant(
+            "lower",
+            ":=",
+            "alert",
+            {"and": [
+                {"bound": ["signal", "<", 10.0]},
+            ]},
+        ),
+        KnownInvariant(
+            "upper",
+            ":=",
+            "alert",
+            {"and": [
+                {"bound": ["signal", "<", 11.0]},
+            ]},
+        ),
+        KnownInvariant("other", ">=", "signal", 0),
+    ]
+
+    monkeypatch.setattr(
+        "autogram.calibrate.DataOnlyEvaluator.evaluate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "a structurally irrelevant definition was evaluated"
+            )
+        ),
+    )
+
+    calibration, validation = _split_known(
+        known,
+        frac=0.5,
+        seed=0,
+        frame=dataset.observed,
+        recovery_dataset=dataset,
+        recovery_rules=[witness],
+    )
+
+    assert len(calibration) + len(validation) == len(known)
+
+
 def test_known_split_reuses_fitted_witnesses_across_equivalent_tiers(
     monkeypatch,
 ):
