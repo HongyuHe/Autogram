@@ -1762,7 +1762,10 @@ def _prepare_runtime_tier_specs(
         )
         spec = _widen_spec(
             spec,
-            all_aggs=caps.get("all_aggs", False),
+            all_aggs=bool(
+                caps.get("all_aggs", False)
+                and not profile.get("agg_kinds")
+            ),
             max_degree=caps.get("max_degree"),
             drop_exclusions=caps.get("drop_exclusions", False),
             proportional=caps.get("proportional", False),
