@@ -47,7 +47,7 @@ Provide your data as a CSV or pickled pandas DataFrame, where each numeric or Bo
 uv run autogram discover --input path/to/your_data.pkl --name mydata
 ```
 
-For grouped time series, declare the ordering and grouping columns, allowed windows, and condition columns: `uv run autogram discover --input series.csv --time-index timestamp --group-key tenant_id --condition-column label --window 60 --max-lag 60`. Add `--advanced --run-length 10 --max-rules 200000` to enumerate sustained, conjunctive, and categorical definitions (advanced discovery requires a finite `--max-rules` budget). This induces a schema, enumerates and screens candidates, prints the accepted portfolio, and writes the learned rules to `rules/mydata_<timestamp>.dl` unless `--no-save-rules` is passed.
+For grouped time series, declare the ordering and grouping columns, expected cadence, allowed windows, and condition columns: `uv run autogram discover --input series.csv --time-index timestamp --group-key tenant_id --cadence-seconds 60 --condition-column label --window 60 --max-lag 60`. An explicit cadence prevents uniformly missing periods from being mistaken for consecutive observations. Add `--advanced --run-length 10 --max-rules 200000` to enumerate sustained, conjunctive, and categorical definitions (advanced discovery requires a finite `--max-rules` budget). This induces a schema, enumerates and screens candidates, prints the accepted portfolio, and writes the learned rules to `rules/mydata_<timestamp>.dl` unless `--no-save-rules` is passed.
 
 ### GTIB example
 
@@ -139,7 +139,7 @@ List one entry per concrete grounding you want scored (for example, one `two_end
 |---------|--------------|-----------|
 | `precheck` | Verify the harness/subagent (or OpenAI key) can induce schemas before a run | `--harness`, `--schema-backend` |
 | `calibrate` | Tune knobs, (re-)induce, iterate, report known-invariant recall | `--input`, `--known`, `--band-mode`, `--ci-alpha`, `--max-iterations`, `--max-capability-tiers`, `--max-nonlinear-leaves`, `--max-linear-leaves`, `--max-conditioned-rules`, `--validation-frac`, `--out` |
-| `discover` | Induce + enumerate + screen a single dataset (or synthetic data) | `--input`, `--raw-input`, `--time-index`, `--group-key`, `--condition-column`, `--window`, `--max-lag`, `--run-length`, `--advanced`, `--aggregation`, `--max-nonlinear-leaves`, `--max-linear-leaves`, `--max-conditioned-rules`, `--band-mode`, `--tolerance`, `--hold-rate`, `--ci-alpha`, `--name`, `--json` |
+| `discover` | Induce + enumerate + screen a single dataset (or synthetic data) | `--input`, `--raw-input`, `--time-index`, `--group-key`, `--cadence-seconds`, `--condition-column`, `--window`, `--max-lag`, `--run-length`, `--advanced`, `--aggregation`, `--max-nonlinear-leaves`, `--max-linear-leaves`, `--max-conditioned-rules`, `--band-mode`, `--tolerance`, `--hold-rate`, `--ci-alpha`, `--name`, `--json` |
 | `validate` | Run the synthetic-proxy self-check | `--seed` |
 | `clean` | Remove generated discovery artifacts | `--out` |
 

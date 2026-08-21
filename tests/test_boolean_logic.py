@@ -77,6 +77,56 @@ def _sustained(values: np.ndarray, threshold: float, window: int) -> np.ndarray:
     return output
 
 
+def test_group_labels_cache_typed_group_materialization(monkeypatch):
+    import autogram.discovery.evaluate as evaluate_module
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "timestamp": pd.date_range(
+                "2026-01-01",
+                periods=4,
+                freq="1min",
+            ),
+            "series_id": ["a", "a", "b", "b"],
+            "value": [1.0, 2.0, 3.0, 4.0],
+        }),
+        time_index="timestamp",
+        group_keys=("series_id",),
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="group_label_cache",
+    )
+    calls = 0
+    original = evaluate_module._typed_object_array
+
+    def counted(values):
+        nonlocal calls
+        calls += 1
+        return original(values)
+
+    monkeypatch.setattr(
+        evaluate_module,
+        "_typed_object_array",
+        counted,
+    )
+
+    first = evaluate_module._group_labels(
+        dataset.observed,
+        dataset.name_model,
+    )
+    second = evaluate_module._group_labels(
+        dataset.observed,
+        dataset.name_model,
+        np.array([1, 3]),
+    )
+
+    assert first.tolist() == ["a", "a", "b", "b"]
+    assert second.tolist() == ["a", "b"]
+    assert calls == 1
+
+
 def test_conjunction_cap_enumerates_every_arity_from_two():
     for cap in (2, 3, 4):
         grammar = Grammar(
