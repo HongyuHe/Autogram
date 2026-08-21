@@ -426,6 +426,16 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
             ]
             for candidates, signature in zip(expansions, signatures)
         ]
+    known_relation_tags = set()
+    for candidates in expansions:
+        for candidate in candidates or ():
+            while (
+                isinstance(candidate, tuple)
+                and candidate[:1] == ("conditional",)
+            ):
+                candidate = candidate[1][1]
+            if isinstance(candidate, tuple) and candidate:
+                known_relation_tags.add(candidate[0])
     parent = list(range(len(known)))
 
     def atomic_sign_recovery_key(signature):
@@ -833,6 +843,20 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                     (A.BooleanDefinition, A.BandDefinition),
                 )
             ):
+                parameterized_tag = (
+                    "healthy_band"
+                    if isinstance(atom, A.BandDefinition)
+                    else (
+                        "sustained_definition"
+                        if isinstance(
+                            atom.predicate,
+                            A.Sustained,
+                        )
+                        else "conjunction_definition"
+                    )
+                )
+                if parameterized_tag not in known_relation_tags:
+                    continue
                 if witness_evaluator is None:
                     witness_evaluator = DataOnlyEvaluator(
                         witness_dataset,

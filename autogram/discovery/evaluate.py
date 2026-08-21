@@ -22,6 +22,7 @@ from ..dsl.evaluate import (
     _ordered_groups,
     _union_overflow,
     _window_overflow,
+    TypedGroupIdentity,
     _typed_object_array,
     eval_term,
     eval_term_overflow,
@@ -149,15 +150,20 @@ def _group_labels(frame, name_model, row_indices=None):
         labels = frame.temporal_cache[cache_key]
     else:
         if len(keys) == 1:
-            labels = _typed_object_array(sources[0])
+            raw_labels = _typed_object_array(sources[0])
         else:
             columns = [
                 _typed_object_array(source)
                 for source in sources
             ]
-            labels = np.empty(frame.n_rows, dtype=object)
+            raw_labels = np.empty(frame.n_rows, dtype=object)
             for index, values in enumerate(zip(*columns)):
-                labels[index] = tuple(values)
+                raw_labels[index] = tuple(values)
+        labels = np.empty(frame.n_rows, dtype=object)
+        for index, value in enumerate(raw_labels):
+            labels[index] = TypedGroupIdentity(
+                typed_group_key(value)
+            )
         frame.temporal_cache[cache_key] = labels
     if row_indices is not None:
         labels = labels[np.asarray(row_indices, dtype=int)]
@@ -2114,21 +2120,14 @@ def _parameter_masks(
         evaluation = np.zeros(valid.size, dtype=bool)
         # Typed identity again: a raw split can merge two groups and leave one of them entirely out
         # of the evaluation half, where it can no longer fail the per-group gate.
-        typed_groups = [_typed_label(item) for item in groups.tolist()]
-        typed_array = np.empty(len(typed_groups), dtype=object)
-        typed_array[:] = typed_groups
-        for group_index, label in enumerate(
-            dict.fromkeys(typed_array[valid].tolist())
-        ):
-            indices = np.flatnonzero(
-                valid
-                & np.asarray([
-                    item == label
-                    for item in typed_groups
-                ], dtype=bool)
-            )
+        group_index = 0
+        for _typed, positions in _group_positions(groups):
+            indices = positions[valid[positions]]
+            if not indices.size:
+                continue
             if indices.size == 1:
                 evaluation[indices[0]] = True
+                group_index += 1
                 continue
             rng = np.random.default_rng(
                 int(cfg.seed) + group_index
@@ -2144,6 +2143,7 @@ def _parameter_masks(
             n_eval = min(n_eval, indices.size - 1)
             evaluation[shuffled[:n_eval]] = True
             fit[shuffled[n_eval:]] = True
+            group_index += 1
         if not np.any(fit) or not np.any(evaluation):
             empty = np.zeros(valid.size, dtype=bool)
             return empty, empty

@@ -122,8 +122,18 @@ def test_group_labels_cache_typed_group_materialization(monkeypatch):
         np.array([1, 3]),
     )
 
-    assert first.tolist() == ["a", "a", "b", "b"]
-    assert second.tolist() == ["a", "b"]
+    assert [
+        evaluate_module._untyped_label(
+            evaluate_module._typed_label(value)
+        )
+        for value in first
+    ] == ["a", "a", "b", "b"]
+    assert [
+        evaluate_module._untyped_label(
+            evaluate_module._typed_label(value)
+        )
+        for value in second
+    ] == ["a", "b"]
     assert calls == 1
 
 

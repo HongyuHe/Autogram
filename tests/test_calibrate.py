@@ -1627,6 +1627,63 @@ def test_known_split_closes_over_fitted_definition_witness():
     } <= validation_names
 
 
+def test_known_split_skips_irrelevant_fitted_definition_witness(
+    monkeypatch,
+):
+    from autogram.dsl import ast as A
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "signal": np.linspace(1.0, 20.0, 20),
+            "other": np.linspace(2.0, 40.0, 20),
+            "third": np.linspace(3.0, 60.0, 20),
+            "alert": [False] * 10 + [True] * 10,
+        }),
+        condition_columns=("alert",),
+        advanced=True,
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _mini_spec(),
+        name="irrelevant_fitted_split_witness",
+    )
+    witness = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("alert"),
+            A.Conjunction((
+                A.Bound(A.Ref("signal"), "<", None),
+            )),
+        ),
+    )
+    known = [
+        KnownInvariant("first", "==", "signal", "other"),
+        KnownInvariant("second", ">=", "signal", 0),
+        KnownInvariant("third", ">=", "third", 0),
+    ]
+
+    def unexpected_evaluation(*_args, **_kwargs):
+        raise AssertionError(
+            "an irrelevant fitted definition was evaluated"
+        )
+
+    monkeypatch.setattr(
+        "autogram.calibrate.DataOnlyEvaluator.evaluate",
+        unexpected_evaluation,
+    )
+
+    calibration, validation = _split_known(
+        known,
+        frac=0.5,
+        seed=0,
+        frame=dataset.observed,
+        recovery_dataset=dataset,
+        recovery_rules=[witness],
+    )
+
+    assert len(calibration) + len(validation) == len(known)
+
+
 def test_known_split_matches_alternative_roles_and_family_witnesses():
     frame = pd.DataFrame({
         "x_n0": np.ones(20),
