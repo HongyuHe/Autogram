@@ -1990,6 +1990,33 @@ def _prepare_runtime_tier_specs(
     return runtime_specs
 
 
+def _distinct_runtime_tiers(tiers, runtime_specs):
+    """Drop capability tiers whose normalized runtime grammar is unchanged."""
+    out = []
+    seen = set()
+    provenance_only = {
+        "name",
+        "notes",
+        "aggregations_widened",
+        "temporal_bounds_widened",
+        "advanced_bounds_widened",
+        "degree_widened",
+        "proportional_widened",
+    }
+    for tier_index, (caps, spec) in enumerate(
+        zip(tiers, runtime_specs)
+    ):
+        payload = _spec_to_json(spec)
+        for key in provenance_only:
+            payload.pop(key, None)
+        identity = _json_fingerprint(payload)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        out.append((tier_index, caps, spec))
+    return out
+
+
 def _spec_summary(spec, tier: int, caps: dict) -> dict:
     onto = spec.ontology
     return {
@@ -2075,9 +2102,13 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
         scfg,
         profile,
     )
+    runtime_tiers = _distinct_runtime_tiers(
+        tiers,
+        runtime_tier_specs,
+    )
     split_dataset, split_grammar = build_dataframe_grammar(
         df,
-        runtime_tier_specs[-1],
+        runtime_tiers[-1][2],
         search_cfg=scfg,
         name=f"{name}_split",
     )
@@ -2099,11 +2130,13 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             # grounding only the final grammar is not a proof that every earlier witness was seen.
             # This is structural enumeration only: no candidate is evaluated or selected using the
             # known catalogue.
-            final_index = len(runtime_tier_specs) - 1
-            for tier_index, runtime_spec in enumerate(
-                runtime_tier_specs,
-            ):
-                if tier_index == final_index:
+            final_index = len(runtime_tiers) - 1
+            for position, (
+                tier_index,
+                _caps,
+                runtime_spec,
+            ) in enumerate(runtime_tiers):
+                if position == final_index:
                     dataset, grammar = (
                         split_dataset,
                         split_grammar,
@@ -2191,10 +2224,7 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     # needs scoring once across all tiers.
     null_cache: dict = {}
 
-    for ti, (caps, runtime_spec) in enumerate(zip(
-        tiers,
-        runtime_tier_specs,
-    )):
+    for ti, caps, runtime_spec in runtime_tiers:
         if iteration_budget is not None and global_iter >= iteration_budget:
             break
         if ti > 0:

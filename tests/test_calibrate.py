@@ -12,7 +12,8 @@ import pytest
 
 from autogram.config import DiscoveryConfig, SearchConfig
 from autogram.calibrate import (
-    CalibrationConfig, _capability_tiers, _derive_regime, _knob_schedule, _merge_specs,
+    CalibrationConfig, _capability_tiers, _derive_regime, _distinct_runtime_tiers,
+    _knob_schedule, _merge_specs,
     _reachable_capability_tiers, _split_known,
     _make_calibration_inducer, _spec_summary, _widen_spec, calibrate,
 )
@@ -186,6 +187,30 @@ def test_profiled_aggregation_vocabulary_stays_pinned_across_tiers(
         spec.ontology.agg_kinds
         for spec in specs
     ] == [("SUM",), ("SUM",)]
+
+
+def test_distinct_runtime_tiers_drop_only_provenance_duplicates():
+    base = _mini_spec()
+    provenance_duplicate = replace(
+        base,
+        name="fresh-name",
+        notes="fresh notes",
+        aggregations_widened=True,
+        degree_widened=True,
+    )
+    wider = replace(
+        provenance_duplicate,
+        max_degree=2,
+    )
+
+    distinct = _distinct_runtime_tiers(
+        [{}, {"all_aggs": True}, {"max_degree": 2}],
+        [base, provenance_duplicate, wider],
+    )
+
+    assert [
+        tier for tier, _caps, _spec in distinct
+    ] == [0, 2]
 
 
 def test_widen_spec_can_drop_exclusions():
