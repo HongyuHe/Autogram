@@ -1755,6 +1755,87 @@ def test_known_split_skips_irrelevant_fitted_definition_witness(
     assert len(calibration) + len(validation) == len(known)
 
 
+def test_known_split_reuses_fitted_witnesses_across_equivalent_tiers(
+    monkeypatch,
+):
+    import autogram.calibrate as calibration
+    from autogram.dsl import ast as A
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "signal": np.linspace(90.0, 112.0, 221),
+            "alert": np.linspace(90.0, 112.0, 221) < 101.0,
+        }),
+        condition_columns=("alert",),
+        advanced=True,
+    )
+    first, _grammar = build_dataframe_grammar(
+        frame,
+        _mini_spec(),
+        name="fitted_cache_first",
+    )
+    second, _grammar = build_dataframe_grammar(
+        frame,
+        _mini_spec(),
+        name="fitted_cache_second",
+    )
+    witness = A.Rule(
+        "record",
+        A.BooleanDefinition(
+            A.Ref("alert"),
+            A.Conjunction((
+                A.Bound(A.Ref("signal"), "<", None),
+            )),
+        ),
+    )
+    known = [
+        KnownInvariant(
+            "lower",
+            ":=",
+            "alert",
+            {"and": [
+                {"bound": ["signal", "<", 100.0]},
+            ]},
+        ),
+        KnownInvariant(
+            "upper",
+            ":=",
+            "alert",
+            {"and": [
+                {"bound": ["signal", "<", 101.9]},
+            ]},
+        ),
+        KnownInvariant("other", ">=", "signal", 0),
+    ]
+    calls = 0
+    original = calibration.DataOnlyEvaluator.evaluate
+
+    def counted(self, rule):
+        nonlocal calls
+        calls += 1
+        return original(self, rule)
+
+    monkeypatch.setattr(
+        calibration.DataOnlyEvaluator,
+        "evaluate",
+        counted,
+    )
+
+    _split_known(
+        known,
+        frac=0.5,
+        seed=0,
+        frame=first.observed,
+        recovery_dataset=first,
+        recovery_witnesses=(
+            (first, (witness,)),
+            (second, (witness,)),
+        ),
+    )
+
+    assert calls == 1
+
+
 def test_known_split_matches_alternative_roles_and_family_witnesses():
     frame = pd.DataFrame({
         "x_n0": np.ones(20),
