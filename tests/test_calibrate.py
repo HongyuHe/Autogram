@@ -476,6 +476,43 @@ def test_merge_specs_allows_existing_preprofile_context_groundings():
     assert merged.patterns == base.patterns
 
 
+def test_merge_specs_infers_boolean_roles_for_boolean_conditions():
+    base = GrammarSpec(
+        name="boolean-context",
+        patterns=(
+            ColumnPattern(
+                name="alert",
+                matcher="regex",
+                kind="measurement",
+                direction="alert",
+                regex=r"^alert$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("network",),
+            ref_roles={"network": ("alert",)},
+            fam_roles={"network": ()},
+        ),
+        ref_templates=(
+            RefTemplate("network", "alert", "alert"),
+        ),
+        family_selectors=(),
+        binder_enumerate={"network": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+        condition_columns={"alert": ()},
+        conditional_enabled=True,
+    )
+
+    merged = _merge_specs(
+        base,
+        base,
+        columns=("alert",),
+        boolean_columns=("alert",),
+    )
+
+    assert merged.boolean_roles["network"] == ("alert",)
+
+
 def test_merge_specs_is_identity_preserving_superset_of_base():
     # merging base with an empty proposal must reproduce base's expressive vocabulary exactly.
     base = _mini_spec(agg=("SUM", "AVG"), max_degree=2, role_exclusions=(frozenset({"a", "b"}),))

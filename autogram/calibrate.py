@@ -1165,7 +1165,12 @@ def _widen_spec(spec, *, all_aggs: bool = False, max_degree: Optional[int] = Non
     )
 
 
-def _merge_specs(base, new, columns=None):
+def _merge_specs(
+    base,
+    new,
+    columns=None,
+    boolean_columns=(),
+):
     """Union two specs' search spaces so re-induction can never *shrink* the grammar (item 2).
 
     A fresh induction each tier is non-deterministic: a role/pattern/family present in an earlier
@@ -1199,6 +1204,10 @@ def _merge_specs(base, new, columns=None):
         if columns is None
         else list(columns)
     )
+    boolean_columns = {
+        str(column)
+        for column in boolean_columns
+    }
     base_adapter = None
     base_model = None
     parsed_columns = set()
@@ -1481,6 +1490,35 @@ def _merge_specs(base, new, columns=None):
                     kept.append(role)
             filtered[binder] = tuple(kept)
         final_boolean_roles = filtered
+    if boolean_columns:
+        inferred_boolean_roles = {}
+        for binder in merged_adapter.binders:
+            bindings = enumerate_bindings(
+                binder,
+                merged_model,
+            )
+            inferred_boolean_roles[binder] = tuple(
+                role
+                for role in merged_adapter.refs_for(binder)
+                if (
+                    (
+                        grounded := {
+                            resolve_ref(
+                                role,
+                                binder,
+                                binding,
+                                merged_model,
+                            )
+                            for binding in bindings
+                        } - {None}
+                    )
+                    and grounded <= boolean_columns
+                )
+            )
+        final_boolean_roles = _union_roles(
+            final_boolean_roles,
+            inferred_boolean_roles,
+        )
     merged = replace(
         merged,
         boolean_roles=final_boolean_roles,
@@ -1695,6 +1733,11 @@ def _prepare_runtime_tier_specs(
     remains pinned to tier 0.
     """
     columns = list(df.columns)
+    boolean_columns = {
+        str(column)
+        for column in df.columns
+        if pd.api.types.is_bool_dtype(df[column])
+    }
     accumulated = None
     runtime_specs = []
     for tier_index, caps in enumerate(tiers):
@@ -1710,6 +1753,7 @@ def _prepare_runtime_tier_specs(
                 accumulated,
                 proposed,
                 columns=columns,
+                boolean_columns=boolean_columns,
             )
         )
         spec = _widen_spec(
