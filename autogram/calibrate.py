@@ -427,8 +427,59 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
             for candidates, signature in zip(expansions, signatures)
         ]
     known_relation_tags = set()
+    known_parameterized_skeletons = set()
+
+    def parameterized_skeleton(signature):
+        if not isinstance(signature, tuple) or not signature:
+            return signature
+        if signature[0] == "conditional":
+            condition, base = signature[1]
+            return (
+                "conditional",
+                (condition, parameterized_skeleton(base)),
+            )
+        if signature[0] == "healthy_band":
+            column, _center = signature[1]
+            return ("healthy_band", column)
+        if signature[0] in (
+            "sustained_definition",
+            "conjunction_definition",
+        ):
+            target, predicate = signature[1]
+
+            def predicate_skeleton(value):
+                if (
+                    isinstance(value, tuple)
+                    and value[:1] == ("bound",)
+                    and len(value) == 4
+                ):
+                    return value[:3]
+                if (
+                    isinstance(value, tuple)
+                    and value[:1] == ("sustained",)
+                    and len(value) == 3
+                ):
+                    return (
+                        "sustained",
+                        value[1],
+                        predicate_skeleton(value[2]),
+                    )
+                if isinstance(value, tuple):
+                    return tuple(
+                        predicate_skeleton(item)
+                        for item in value
+                    )
+                return value
+
+            return (
+                signature[0],
+                (target, predicate_skeleton(predicate)),
+            )
+        return signature
+
     for candidates in expansions:
         for candidate in candidates or ():
+            full_candidate = candidate
             while (
                 isinstance(candidate, tuple)
                 and candidate[:1] == ("conditional",)
@@ -436,6 +487,16 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                 candidate = candidate[1][1]
             if isinstance(candidate, tuple) and candidate:
                 known_relation_tags.add(candidate[0])
+                if candidate[0] in (
+                    "healthy_band",
+                    "sustained_definition",
+                    "conjunction_definition",
+                ):
+                    known_parameterized_skeletons.add(
+                        parameterized_skeleton(
+                            full_candidate
+                        )
+                    )
     parent = list(range(len(known)))
 
     def atomic_sign_recovery_key(signature):
@@ -930,7 +991,49 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                             else "conjunction_definition"
                         )
                     )
-                    if parameterized_tag in known_relation_tags:
+                    dummy_parameters = {}
+                    if isinstance(atom, A.BandDefinition):
+                        dummy_parameters["center"] = 0.0
+                    else:
+                        learned_thresholds = {}
+
+                        def collect_thresholds(predicate):
+                            if isinstance(predicate, A.Bound):
+                                if predicate.threshold is None:
+                                    learned_thresholds[
+                                        predicate.unparse()
+                                    ] = 0.0
+                                return
+                            if isinstance(predicate, A.Sustained):
+                                collect_thresholds(
+                                    predicate.predicate
+                                )
+                                return
+                            if isinstance(
+                                predicate,
+                                A.Conjunction,
+                            ):
+                                for child in predicate.predicates:
+                                    collect_thresholds(child)
+
+                        collect_thresholds(atom.predicate)
+                        dummy_parameters["thresholds"] = (
+                            learned_thresholds
+                        )
+                    potential_relations = rule_relations(
+                        rule,
+                        witness_dataset,
+                        dummy_parameters,
+                    )
+                    structurally_relevant = any(
+                        parameterized_skeleton(relation)
+                        in known_parameterized_skeletons
+                        for relation in potential_relations
+                    )
+                    if (
+                        parameterized_tag in known_relation_tags
+                        and structurally_relevant
+                    ):
                         if witness_evaluator is None:
                             witness_evaluator = DataOnlyEvaluator(
                                 witness_dataset,
