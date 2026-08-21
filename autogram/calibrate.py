@@ -1151,9 +1151,10 @@ def _merge_specs(base, new, columns=None):
     grounding is silently redefined, and only *adding* what ``new`` proposes:
 
     * ``patterns`` -- semantically duplicate patterns are dropped; a non-identical pattern that
-      reuses an existing arbitrary name is deterministically renamed before it is appended.
-      ``ref_templates`` / ``family_selectors`` use ``(binder, role)`` identity and keep base
-      groundings authoritative.
+      reuses an existing arbitrary name is deterministically renamed before it is appended. With
+      live columns, a new pattern must contribute a previously unparsed measurement without also
+      reclassifying a base time/group/condition/metadata column. ``ref_templates`` /
+      ``family_selectors`` use ``(binder, role)`` identity and keep base groundings authoritative.
     * ``ontology`` -- binders, per-binder ref/family roles, ops and agg kinds are unioned; base
       glyphs win.
     * ``binder_enumerate`` -- base strategy wins per binder; new binders are added.  ``max_degree``
@@ -1167,6 +1168,30 @@ def _merge_specs(base, new, columns=None):
     The result therefore admits **every** rule ``base`` did (a genuine superset) plus the novel
     vocabulary ``new`` contributes -- regardless of what the fresh proposal omitted.
     """
+    from .loader.names import NameModel
+
+    actual_columns = (
+        None
+        if columns is None
+        else list(columns)
+    )
+    base_adapter = None
+    base_model = None
+    parsed_columns = set()
+    protected_pattern_context = {
+        base.time_index,
+        *base.group_keys,
+        *base.condition_columns,
+        *base.metadata_columns,
+    } - {""}
+    if actual_columns is not None and base.patterns:
+        base_adapter = compile_spec(base)
+        base_model = NameModel.from_columns_with_adapter(
+            actual_columns,
+            base_adapter,
+        )
+        parsed_columns = set(base_model.by_name)
+
     patterns = list(base.patterns)
     pattern_names = {pattern.name for pattern in patterns}
     pattern_semantics = {
@@ -1186,6 +1211,25 @@ def _merge_specs(base, new, columns=None):
                 pattern,
                 name=f"{name}__reinduced_{serial}",
             )
+        if actual_columns is not None:
+            candidate_adapter = compile_spec(replace(
+                base,
+                patterns=tuple((*patterns, pattern)),
+            ))
+            candidate_model = NameModel.from_columns_with_adapter(
+                actual_columns,
+                candidate_adapter,
+            )
+            introduced = (
+                set(candidate_model.by_name)
+                - parsed_columns
+            )
+            if (
+                not introduced
+                or introduced & protected_pattern_context
+            ):
+                continue
+            parsed_columns.update(introduced)
         patterns.append(pattern)
         pattern_names.add(pattern.name)
         pattern_semantics.add(semantic)
@@ -1332,18 +1376,8 @@ def _merge_specs(base, new, columns=None):
         resolve_family,
         resolve_ref,
     )
-    from .loader.names import NameModel
 
-    actual_columns = list(columns)
     actual_column_set = set(actual_columns)
-    base_adapter = None
-    base_model = None
-    if base.patterns:
-        base_adapter = compile_spec(base)
-        base_model = NameModel.from_columns_with_adapter(
-            actual_columns,
-            base_adapter,
-        )
     base_interpreted_columns = {
         base.time_index,
         *base.group_keys,
@@ -1433,6 +1467,46 @@ def _merge_specs(base, new, columns=None):
         *condition_columns,
         *metadata_columns,
     } - {""}
+    base_context_groundings = set()
+    if base_adapter is not None and base_model is not None:
+        for binder in base_adapter.binders:
+            bindings = enumerate_bindings(
+                binder,
+                base_model,
+            )
+            base_boolean_roles = set(
+                base.boolean_roles.get(binder, ())
+            )
+            for role in base_adapter.refs_for(binder):
+                for binding in bindings:
+                    column = resolve_ref(
+                        role,
+                        binder,
+                        binding,
+                        base_model,
+                    )
+                    if (
+                        column in protected_context
+                        and not (
+                            column in base.condition_columns
+                            and role in base_boolean_roles
+                        )
+                    ):
+                        base_context_groundings.add(
+                            ("ref", binder, role, column)
+                        )
+            for role in base_adapter.fams_for(binder):
+                for binding in bindings:
+                    overlap = set(resolve_family(
+                        role,
+                        binder,
+                        binding,
+                        base_model,
+                    )) & protected_context
+                    for column in overlap:
+                        base_context_groundings.add(
+                            ("family", binder, role, column)
+                        )
     grounding_conflicts = []
     for binder in merged_adapter.binders:
         boolean_roles = set(
@@ -1453,6 +1527,12 @@ def _merge_specs(base, new, columns=None):
                         column in condition_columns
                         and role in boolean_roles
                     )
+                    and (
+                        "ref",
+                        binder,
+                        role,
+                        column,
+                    ) not in base_context_groundings
                 ):
                     grounding_conflicts.append(
                         f"ref {binder}/{role} -> {column!r}"
@@ -1466,6 +1546,13 @@ def _merge_specs(base, new, columns=None):
                     merged_model,
                 )) & protected_context
                 for column in sorted(overlap):
+                    if (
+                        "family",
+                        binder,
+                        role,
+                        column,
+                    ) in base_context_groundings:
+                        continue
                     grounding_conflicts.append(
                         f"family {binder}/{role} -> {column!r}"
                     )
@@ -1475,6 +1562,15 @@ def _merge_specs(base, new, columns=None):
             + "; ".join(grounding_conflicts[:8])
         )
     novel_grounding_failures = []
+    novel_context_conflicts = []
+    new_ref_templates = {
+        (template.binder, template.role): template
+        for template in new.ref_templates
+    }
+    new_family_selectors = {
+        (selector.binder, selector.family_role): selector
+        for selector in new.family_selectors
+    }
     for binder, roles in new.ontology.ref_roles.items():
         base_roles = set(base.ontology.ref_roles.get(binder, ()))
         bindings = enumerate_bindings(binder, merged_model)
@@ -1490,9 +1586,29 @@ def _merge_specs(base, new, columns=None):
                 ) is not None
                 for binding in bindings
             ):
-                novel_grounding_failures.append(
-                    f"ref {binder}/{role}"
+                template = new_ref_templates.get(
+                    (binder, role)
                 )
+                intended_context = set()
+                if template is not None:
+                    for binding in bindings or ({},):
+                        try:
+                            column = template.template.format(
+                                **binding
+                            )
+                        except (KeyError, IndexError):
+                            continue
+                        if column in protected_context:
+                            intended_context.add(column)
+                if intended_context:
+                    novel_context_conflicts.extend(
+                        f"ref {binder}/{role} -> {column!r}"
+                        for column in sorted(intended_context)
+                    )
+                else:
+                    novel_grounding_failures.append(
+                        f"ref {binder}/{role}"
+                    )
     for binder, roles in new.ontology.fam_roles.items():
         base_roles = set(base.ontology.fam_roles.get(binder, ()))
         bindings = enumerate_bindings(binder, merged_model)
@@ -1508,9 +1624,28 @@ def _merge_specs(base, new, columns=None):
                 )
                 for binding in bindings
             ):
-                novel_grounding_failures.append(
-                    f"family {binder}/{role}"
+                selector = new_family_selectors.get(
+                    (binder, role)
                 )
+                intended_context = (
+                    set(selector.columns) & protected_context
+                    if selector is not None
+                    else set()
+                )
+                if intended_context:
+                    novel_context_conflicts.extend(
+                        f"family {binder}/{role} -> {column!r}"
+                        for column in sorted(intended_context)
+                    )
+                else:
+                    novel_grounding_failures.append(
+                        f"family {binder}/{role}"
+                    )
+    if novel_context_conflicts:
+        raise ValueError(
+            "re-induced context columns also ground numeric grammar roles: "
+            + "; ".join(novel_context_conflicts[:8])
+        )
     if novel_grounding_failures:
         raise ValueError(
             "re-induced roles lost all runtime groundings after merge: "

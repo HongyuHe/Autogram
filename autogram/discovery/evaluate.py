@@ -129,16 +129,36 @@ def _group_labels(frame, name_model, row_indices=None):
         for key in keys
     ):
         return None
-    if len(keys) == 1:
-        labels = _typed_object_array(frame.row_context[keys[0]])
+    sources = tuple(
+        np.asarray(frame.row_context[key])
+        for key in keys
+    )
+    cache_key = (
+        "evaluation_group_labels",
+        keys,
+        tuple(
+            (
+                id(source),
+                source.shape,
+                source.dtype.str,
+            )
+            for source in sources
+        ),
+    )
+    if cache_key in frame.temporal_cache:
+        labels = frame.temporal_cache[cache_key]
     else:
-        columns = [
-            _typed_object_array(frame.row_context[key])
-            for key in keys
-        ]
-        labels = np.empty(frame.n_rows, dtype=object)
-        for index, values in enumerate(zip(*columns)):
-            labels[index] = tuple(values)
+        if len(keys) == 1:
+            labels = _typed_object_array(sources[0])
+        else:
+            columns = [
+                _typed_object_array(source)
+                for source in sources
+            ]
+            labels = np.empty(frame.n_rows, dtype=object)
+            for index, values in enumerate(zip(*columns)):
+                labels[index] = tuple(values)
+        frame.temporal_cache[cache_key] = labels
     if row_indices is not None:
         labels = labels[np.asarray(row_indices, dtype=int)]
     return labels
@@ -232,6 +252,25 @@ def _binding_key(binding: dict) -> tuple:
     return tuple(sorted(binding.items()))
 
 
+def _group_positions(groups) -> list[tuple[object, np.ndarray]]:
+    """First-seen typed group identities and their row positions in one linear pass."""
+    buckets: dict[object, list[int]] = {}
+    for index, item in enumerate(
+        np.asarray(groups, dtype=object).tolist()
+    ):
+        buckets.setdefault(
+            _typed_label(item),
+            [],
+        ).append(index)
+    return [
+        (
+            typed,
+            np.asarray(positions, dtype=int),
+        )
+        for typed, positions in buckets.items()
+    ]
+
+
 def _group_hold_gate(
     holds,
     groups,
@@ -262,17 +301,16 @@ def _group_hold_gate(
     rates = {}
     lows = {}
     accepted = True
-    ordered_typed = list(dict.fromkeys(_typed_label(item) for item in groups.tolist()))
+    grouped_positions = _group_positions(groups)
+    ordered_typed = [
+        typed for typed, _positions in grouped_positions
+    ]
     display = _display_keys(ordered_typed)
-    for typed in ordered_typed:
-        label = typed[1]
-        mask = np.asarray([
-            _typed_label(item) == typed
-            for item in groups
-        ], dtype=bool)
-        count = int(np.count_nonzero(mask))
+    hold_values = np.asarray(holds, dtype=bool)
+    for typed, positions in grouped_positions:
+        count = int(positions.size)
         group_lo, _group_hi, group_rate = wilson(
-            int(np.count_nonzero(np.asarray(holds)[mask])),
+            int(np.count_nonzero(hold_values[positions])),
             count,
             z=z,
         )
@@ -1620,18 +1658,13 @@ def _fit_proportional(g, frame, nm, cfg):
     coefficients: dict[str, float] = {}
     coefficient_by_point = np.full(g.n_points, np.nan, dtype=float)
     evaluation_mask = np.zeros(g.n_points, dtype=bool)
-    for group_index, typed in enumerate(
-        dict.fromkeys(_typed_label(item) for item in labels.tolist())
+    for group_index, (typed, local_positions) in enumerate(
+        _group_positions(labels)
     ):
-        label = typed[1]
-        mask = np.asarray(
-            [_typed_label(item) == typed for item in labels], dtype=bool,
-        )
-        left = g.left[mask]
-        right = g.right[mask]
+        left = g.left[local_positions]
+        right = g.right[local_positions]
         finite = np.isfinite(left) & np.isfinite(right)
         usable = finite & (right != 0.0)
-        local_positions = np.flatnonzero(mask)
         usable_positions = local_positions[usable]
         zero_predictor_positions = local_positions[
             finite & ~usable
@@ -1671,7 +1704,7 @@ def _fit_proportional(g, frame, nm, cfg):
         # silently replace the other's, and the finite-arithmetic guard would then check the wrong
         # coefficient. Stringification happens only when the parameters are reported.
         coefficients[typed] = coefficient
-        coefficient_by_point[mask] = coefficient
+        coefficient_by_point[local_positions] = coefficient
         evaluation_mask[eval_positions] = True
         evaluation_mask[zero_predictor_positions] = True
     if not coefficients or not np.any(evaluation_mask):

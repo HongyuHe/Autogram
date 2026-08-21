@@ -382,6 +382,100 @@ def test_merge_specs_renames_nonidentical_pattern_name_collisions():
     assert adapter.resolve_ref("b_role", "record", {}, model) == "b"
 
 
+def test_merge_specs_rejects_new_patterns_that_reclassify_base_context():
+    from autogram.loader.names import NameModel
+    from autogram.schema.compiler import compile_spec
+
+    base = GrammarSpec(
+        name="base",
+        patterns=(
+            ColumnPattern(
+                name="metric",
+                matcher="regex",
+                kind="tabular",
+                direction="value",
+                regex=r"^value$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("cell",),
+            ref_roles={"cell": ("self",)},
+            fam_roles={"cell": ()},
+        ),
+        ref_templates=(RefTemplate("cell", "self", "{col}"),),
+        family_selectors=(),
+        binder_enumerate={"cell": "per_measured_col"},
+        cell_codec=CellCodec(kind="scalar"),
+        time_index="timestamp",
+    )
+    later = replace(
+        base,
+        patterns=(
+            ColumnPattern(
+                name="metric",
+                matcher="regex",
+                kind="tabular",
+                direction="value",
+                regex=r"^(?:value|timestamp)$",
+            ),
+        ),
+    )
+
+    merged = _merge_specs(
+        base,
+        later,
+        columns=("timestamp", "value"),
+    )
+    adapter = compile_spec(merged)
+    model = NameModel.from_columns_with_adapter(
+        ("timestamp", "value"),
+        adapter,
+    )
+
+    assert set(model.by_name) == {"value"}
+    assert len(merged.patterns) == 1
+
+
+def test_merge_specs_allows_existing_preprofile_context_groundings():
+    base = GrammarSpec(
+        name="preprofile",
+        patterns=(
+            ColumnPattern(
+                name="value",
+                matcher="regex",
+                kind="measurement",
+                direction="value",
+                regex=r"^value$",
+            ),
+            ColumnPattern(
+                name="timestamp",
+                matcher="regex",
+                kind="metadata",
+                direction="",
+                regex=r"^timestamp$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("cell",),
+            ref_roles={"cell": ("self",)},
+            fam_roles={"cell": ()},
+        ),
+        ref_templates=(RefTemplate("cell", "self", "{col}"),),
+        family_selectors=(),
+        binder_enumerate={"cell": "per_measured_col"},
+        cell_codec=CellCodec(kind="scalar"),
+        time_index="timestamp",
+    )
+
+    merged = _merge_specs(
+        base,
+        base,
+        columns=("timestamp", "value"),
+    )
+
+    assert merged.patterns == base.patterns
+
+
 def test_merge_specs_is_identity_preserving_superset_of_base():
     # merging base with an empty proposal must reproduce base's expressive vocabulary exactly.
     base = _mini_spec(agg=("SUM", "AVG"), max_degree=2, role_exclusions=(frozenset({"a", "b"}),))
