@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from autogram.config import DiscoveryConfig
+from autogram.config import DiscoveryConfig, SearchConfig
 from autogram.calibrate import (
     CalibrationConfig, _capability_tiers, _derive_regime, _knob_schedule, _merge_specs,
     _reachable_capability_tiers, _split_known,
@@ -152,6 +152,40 @@ def test_widen_spec_unions_without_duplicates_and_never_lowers_degree():
     w = _widen_spec(spec, all_aggs=True, max_degree=1)   # asking for degree 1 must not lower 2
     assert w.max_degree == 2
     assert len(w.ontology.agg_kinds) == len(set(w.ontology.agg_kinds)) == 4
+
+
+def test_profiled_aggregation_vocabulary_stays_pinned_across_tiers(
+    monkeypatch,
+):
+    import autogram.calibrate as calibration
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "value": [1.0, 2.0],
+            "part": [1.0, 2.0],
+        }),
+        families={"parts": ("part",)},
+        agg_kinds=("SUM",),
+    )
+    monkeypatch.setattr(
+        calibration,
+        "induce_spec",
+        lambda _columns, _inducer: _mini_spec(),
+    )
+
+    specs = calibration._prepare_runtime_tier_specs(
+        frame,
+        _mini_spec(),
+        object(),
+        [{}, {"all_aggs": True}],
+        SearchConfig(max_rules=10_000),
+        frame.attrs["autogram_profile"],
+    )
+
+    assert [
+        spec.ontology.agg_kinds
+        for spec in specs
+    ] == [("SUM",), ("SUM",)]
 
 
 def test_widen_spec_can_drop_exclusions():
