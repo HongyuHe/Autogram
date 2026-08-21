@@ -1150,9 +1150,10 @@ def _merge_specs(base, new, columns=None):
     accumulated ``base`` spec, keeping ``base`` authoritative on every conflict so no existing
     grounding is silently redefined, and only *adding* what ``new`` proposes:
 
-    * ``patterns`` / ``ref_templates`` / ``family_selectors`` -- base kept; a new entry is appended
-      only when its identity key (pattern name, ``(binder, role)``, ``(binder, family_role)``) is
-      unseen, so a shared role keeps ``base``'s grounding.
+    * ``patterns`` -- semantically duplicate patterns are dropped; a non-identical pattern that
+      reuses an existing arbitrary name is deterministically renamed before it is appended.
+      ``ref_templates`` / ``family_selectors`` use ``(binder, role)`` identity and keep base
+      groundings authoritative.
     * ``ontology`` -- binders, per-binder ref/family roles, ops and agg kinds are unioned; base
       glyphs win.
     * ``binder_enumerate`` -- base strategy wins per binder; new binders are added.  ``max_degree``
@@ -1166,8 +1167,29 @@ def _merge_specs(base, new, columns=None):
     The result therefore admits **every** rule ``base`` did (a genuine superset) plus the novel
     vocabulary ``new`` contributes -- regardless of what the fresh proposal omitted.
     """
-    seen_pat = {p.name for p in base.patterns}
-    patterns = base.patterns + tuple(p for p in new.patterns if p.name not in seen_pat)
+    patterns = list(base.patterns)
+    pattern_names = {pattern.name for pattern in patterns}
+    pattern_semantics = {
+        replace(pattern, name="")
+        for pattern in patterns
+    }
+    for pattern in new.patterns:
+        semantic = replace(pattern, name="")
+        if semantic in pattern_semantics:
+            continue
+        name = pattern.name
+        if name in pattern_names:
+            serial = 2
+            while f"{name}__reinduced_{serial}" in pattern_names:
+                serial += 1
+            pattern = replace(
+                pattern,
+                name=f"{name}__reinduced_{serial}",
+            )
+        patterns.append(pattern)
+        pattern_names.add(pattern.name)
+        pattern_semantics.add(semantic)
+    patterns = tuple(patterns)
 
     seen_ref = {(t.binder, t.role) for t in base.ref_templates}
     ref_templates = base.ref_templates + tuple(
@@ -1254,6 +1276,9 @@ def _merge_specs(base, new, columns=None):
         condition_columns=conditions,
         temporal_enabled=bool(
             base.temporal_enabled or new.temporal_enabled
+        ),
+        temporal_cadence_seconds=float(
+            base.temporal_cadence_seconds
         ),
         max_lag=max(base.max_lag, new.max_lag),
         windows=tuple(sorted({*base.windows, *new.windows})),
@@ -1449,6 +1474,48 @@ def _merge_specs(base, new, columns=None):
             "re-induced context columns also ground numeric grammar roles: "
             + "; ".join(grounding_conflicts[:8])
         )
+    novel_grounding_failures = []
+    for binder, roles in new.ontology.ref_roles.items():
+        base_roles = set(base.ontology.ref_roles.get(binder, ()))
+        bindings = enumerate_bindings(binder, merged_model)
+        for role in roles:
+            if role in base_roles:
+                continue
+            if not any(
+                resolve_ref(
+                    role,
+                    binder,
+                    binding,
+                    merged_model,
+                ) is not None
+                for binding in bindings
+            ):
+                novel_grounding_failures.append(
+                    f"ref {binder}/{role}"
+                )
+    for binder, roles in new.ontology.fam_roles.items():
+        base_roles = set(base.ontology.fam_roles.get(binder, ()))
+        bindings = enumerate_bindings(binder, merged_model)
+        for role in roles:
+            if role in base_roles:
+                continue
+            if not any(
+                resolve_family(
+                    role,
+                    binder,
+                    binding,
+                    merged_model,
+                )
+                for binding in bindings
+            ):
+                novel_grounding_failures.append(
+                    f"family {binder}/{role}"
+                )
+    if novel_grounding_failures:
+        raise ValueError(
+            "re-induced roles lost all runtime groundings after merge: "
+            + "; ".join(novel_grounding_failures[:8])
+        )
     return merged
 
 
@@ -1537,6 +1604,9 @@ def _spec_summary(spec, tier: int, caps: dict) -> dict:
         "agg_kinds": list(onto.agg_kinds),
         "max_degree": spec.max_degree,
         "temporal_enabled": spec.temporal_enabled,
+        "temporal_cadence_seconds": (
+            spec.temporal_cadence_seconds
+        ),
         "max_lag": spec.max_lag,
         "windows": list(spec.windows),
         "advanced_enabled": spec.advanced_enabled,

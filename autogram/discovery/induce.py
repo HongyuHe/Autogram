@@ -13,6 +13,7 @@ import json
 import os
 import re
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
@@ -247,7 +248,7 @@ def _schema_prompt(columns, sample_rows) -> str:
         "Top-level keys MUST be exactly: name, patterns, ontology, ref_templates, "
         "family_selectors, binder_enumerate, cell_codec, noisy_kind, demand_kind, "
         "link_marker_direction, max_degree, role_exclusions, notes, time_index, group_keys, "
-        "condition_columns, temporal_enabled, max_lag, windows, conditional_enabled, "
+        "condition_columns, temporal_enabled, temporal_cadence_seconds, max_lag, windows, conditional_enabled, "
         "max_condition_values, related_templates, boolean_roles, advanced_enabled, run_lengths, "
         "max_conjunction_terms, metadata_columns, band_enabled. The object must contain key 'ontology'. Use empty strings, arrays, "
         "or objects and false capability flags when a feature is not present.\n\n"
@@ -261,7 +262,9 @@ def _schema_prompt(columns, sample_rows) -> str:
         "column, mode, parent_keys, child_keys, partition_keys, parent_time, child_time, "
         "window_seconds, reset_column, validity_columns, span_start, span_end, filter_column, "
         "filter_values. binder_enumerate must be a JSON object whose values are "
-        "plain strategy strings, never objects or column lists.\n\n"
+        "plain strategy strings, never objects or column lists. "
+        "temporal_cadence_seconds is numeric; use 0 unless an explicit dataset profile supplies "
+        "the cadence.\n\n"
         "Use these Autogram role conventions:\n"
         "1. Always include binder 'cell' with ref role 'self', fam roles [], strategy "
         "per_measured_col, and ref template '{col}'.\n"
@@ -392,6 +395,7 @@ def _spec_to_json(spec: GrammarSpec) -> dict:
             for key, values in spec.condition_columns.items()
         },
         "temporal_enabled": spec.temporal_enabled,
+        "temporal_cadence_seconds": spec.temporal_cadence_seconds,
         "max_lag": spec.max_lag,
         "windows": list(spec.windows),
         "conditional_enabled": spec.conditional_enabled,
@@ -1459,6 +1463,36 @@ def _spec_from_json(payload) -> GrammarSpec:
             )
         return value
 
+    def json_cadence_seconds() -> float:
+        value = payload.get("temporal_cadence_seconds", 0)
+        if isinstance(value, bool) or not isinstance(
+            value,
+            (int, float),
+        ):
+            raise ValueError(
+                "induced schema field 'temporal_cadence_seconds' "
+                "must be a finite nonnegative number"
+            )
+        try:
+            seconds = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError(
+                "induced schema field 'temporal_cadence_seconds' "
+                "must be a finite nonnegative number"
+            ) from error
+        nanoseconds = seconds * Decimal(1_000_000_000)
+        if (
+            not seconds.is_finite()
+            or seconds < 0
+            or nanoseconds != nanoseconds.to_integral_value()
+            or nanoseconds > 2 ** 63 - 1
+        ):
+            raise ValueError(
+                "induced schema field 'temporal_cadence_seconds' "
+                "must represent an exact nonnegative datetime64[ns] cadence"
+            )
+        return float(seconds)
+
     onto = payload["ontology"]
     noisy_kind = str(payload.get("noisy_kind") or "measurement")
     demand_kind = str(payload.get("demand_kind") or "demand")
@@ -1524,6 +1558,7 @@ def _spec_from_json(payload) -> GrammarSpec:
         group_keys=tuple(str(c) for c in payload.get("group_keys", ())),
         condition_columns=_condition_columns(payload.get("condition_columns", {})),
         temporal_enabled=temporal_enabled,
+        temporal_cadence_seconds=json_cadence_seconds(),
         max_lag=json_int("max_lag", 0, minimum=0),
         windows=json_ints("windows", minimum=1),
         conditional_enabled=json_bool("conditional_enabled"),

@@ -7,9 +7,10 @@ import pandas as pd
 import pytest
 
 from autogram.cli import _load_dataframe
-from autogram.config import DiscoveryConfig
+from autogram.config import DiscoveryConfig, SearchConfig
 from autogram.discovery.evaluate import DataOnlyEvaluator
 from autogram.discovery.loop import build_dataframe_grammar
+from autogram.discovery.validate import prepare_runtime_null_controls
 from autogram.dsl import ast as A
 from autogram.dsl.evaluate import eval_term
 from autogram.loader.gtib import (
@@ -692,6 +693,48 @@ def test_gtib_materialization_infers_two_minute_rate_cadence():
     assert related["raw_input_rate"]["window_seconds"] == 120
 
 
+def test_gtib_profile_retains_rate_cadence_across_uniform_gaps():
+    derived = pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=3,
+            freq="2min",
+        ),
+        "consumer_id": ["consumer"] * 3,
+        "minute_index": [0, 2, 4],
+        "input_rate_bytes_per_min": [1.0, 2.0, 3.0],
+    })
+
+    prepared = prepare_gtib(derived)
+    dataset, _grammar = build_dataframe_grammar(
+        prepared,
+        _base_spec(),
+        name="gtib_uniform_gap_cadence",
+    )
+    lagged = eval_term(
+        A.Lag(A.Ref("input_rate_bytes_per_min"), 1),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert prepared.attrs[AUTOGRAM_PROFILE_ATTR][
+        "temporal_cadence_seconds"
+    ] == 60
+    assert np.isnan(lagged).all()
+
+
+def test_gtib_raw_profile_retains_scrape_cadence():
+    _derived, raw = _tables()
+
+    prepared = prepare_gtib_raw(raw)
+
+    assert prepared.attrs[AUTOGRAM_PROFILE_ATTR][
+        "temporal_cadence_seconds"
+    ] == 10
+
+
 def test_event_related_join_uses_inferred_rate_cadence():
     derived = pd.DataFrame({
         "timestamp": pd.date_range(
@@ -724,6 +767,45 @@ def test_event_related_join_uses_inferred_rate_cadence():
     )
 
     assert values.tolist() == [1.0, 0.0]
+
+
+def test_benign_only_event_catalog_omits_empty_span_roles_from_nulls():
+    derived = pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=4,
+            freq="1min",
+        ),
+        "consumer_id": ["consumer"] * 4,
+        "minute_index": [0, 1, 2, 3],
+        "input_rate_bytes_per_min": [1.0, 1.0, 1.0, 1.0],
+        "is_benign_burst": [False, True, False, False],
+    })
+    events = pd.DataFrame({
+        "consumer_id": ["consumer"],
+        "type": ["benign_burst"],
+        "span_start": [pd.Timestamp("2026-01-01 00:01:00")],
+        "span_end": [pd.Timestamp("2026-01-01 00:02:00")],
+    })
+
+    prepared = prepare_gtib(derived, events=events)
+    dataset, grammar = build_dataframe_grammar(
+        prepared,
+        _base_spec(),
+        name="benign_only_events",
+    )
+    roles = {
+        template.role
+        for template in dataset.name_model.adapter.related_templates.values()
+    }
+
+    assert roles == {"event_benign_burst"}
+    prepare_runtime_null_controls(
+        dataset,
+        grammar,
+        SearchConfig(max_rules=1000),
+        rules=[],
+    )
 
 
 def test_rate_cadence_inference_groups_independent_consumer_origins():

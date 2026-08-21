@@ -150,6 +150,7 @@ def _profile(
     windows=(3,),
     max_lag=3,
     max_degree=1,
+    temporal_cadence_seconds=None,
 ) -> pd.DataFrame:
     return profile_dataframe(
         frame,
@@ -158,6 +159,7 @@ def _profile(
         temporal_windows=windows,
         max_lag=max_lag,
         max_degree=max_degree,
+        temporal_cadence_seconds=temporal_cadence_seconds,
     )
 
 
@@ -348,13 +350,12 @@ def test_declared_temporal_cadence_overrides_a_sparse_observed_minimum():
         ),
         "series_id": ["sparse"] * 3,
         "x": [0.0, 2.0, 4.0],
-    }), windows=(2,), max_lag=1)
+    }), windows=(2,), max_lag=1, temporal_cadence_seconds=60)
     dataset, _grammar = build_dataframe_grammar(
         frame,
         _base_spec(),
         name="declared_temporal_cadence",
     )
-    dataset.name_model.adapter.temporal_cadence_seconds = 60
 
     lagged = eval_term(
         A.Lag(A.Ref("x"), 1),

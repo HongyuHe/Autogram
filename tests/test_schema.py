@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -283,6 +284,19 @@ def test_induced_zero_conjunction_cap_uses_protocol_default():
     payload["max_conjunction_terms"] = 0
 
     assert _spec_from_json(payload).max_conjunction_terms == 3
+
+
+def test_temporal_cadence_round_trips_through_schema_and_compiler():
+    spec = replace(
+        _node_template_spec(),
+        temporal_cadence_seconds=1.5,
+    )
+
+    restored = _spec_from_json(_spec_to_json(spec))
+    adapter = compile_spec(restored)
+
+    assert restored.temporal_cadence_seconds == 1.5
+    assert adapter.temporal_cadence_seconds == 1.5
 
 
 @pytest.mark.parametrize(

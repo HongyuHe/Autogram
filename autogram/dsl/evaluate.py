@@ -605,6 +605,8 @@ def _declared_temporal_cadence_ns(nm: NameModel) -> int | None:
         value = getattr(adapter, attribute, None)
         if value is None:
             continue
+        if value == 0:
+            continue
         try:
             numeric = Decimal(str(value))
         except (InvalidOperation, TypeError, ValueError) as error:

@@ -20,6 +20,7 @@ import numbers
 import re
 import string
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from typing import Dict, Tuple
 
 from ..dsl import ast as A
@@ -52,6 +53,7 @@ _MAX_CONJUNCTION_TERMS = 16
 _MAX_CONDITION_VALUES = 1024
 _MAX_CONDITION_DOMAIN = 64
 _MAX_REGEX_LENGTH = 4096
+_MAX_DATETIME_NS = 2 ** 63 - 1
 
 
 _BINDING_FIELDS = {
@@ -71,6 +73,30 @@ def _validate_bounded_int(label: str, value, *, minimum: int, maximum: int) -> N
     ):
         raise CompileError(
             f"{label} must be an integer in [{minimum}, {maximum}]"
+        )
+
+
+def _validate_temporal_cadence_seconds(value) -> None:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise CompileError(
+            "temporal_cadence_seconds must be a finite nonnegative number"
+        )
+    try:
+        seconds = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise CompileError(
+            "temporal_cadence_seconds must be a finite nonnegative number"
+        ) from error
+    nanoseconds = seconds * Decimal(1_000_000_000)
+    if (
+        not seconds.is_finite()
+        or seconds < 0
+        or nanoseconds != nanoseconds.to_integral_value()
+        or nanoseconds > _MAX_DATETIME_NS
+    ):
+        raise CompileError(
+            "temporal_cadence_seconds must represent an exact nonnegative "
+            "datetime64[ns] cadence"
         )
 
 
@@ -289,6 +315,9 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
     if spec.cell_codec.kind not in CELL_CODECS:
         raise CompileError(f"unknown cell codec {spec.cell_codec.kind!r}")
     _validate_bounded_int("max_degree", spec.max_degree, minimum=1, maximum=_MAX_DEGREE)
+    _validate_temporal_cadence_seconds(
+        spec.temporal_cadence_seconds
+    )
     _validate_bounded_int("max_lag", spec.max_lag, minimum=0, maximum=_MAX_LAG)
     if len(spec.windows) > _MAX_WINDOW_COUNT:
         raise CompileError(
@@ -489,6 +518,9 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
             for key, values in spec.condition_columns.items()
         },
         temporal_enabled=bool(spec.temporal_enabled),
+        temporal_cadence_seconds=float(
+            spec.temporal_cadence_seconds
+        ),
         max_lag=int(spec.max_lag),
         windows=tuple(sorted({int(window) for window in spec.windows})),
         conditional_enabled=bool(spec.conditional_enabled),

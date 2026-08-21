@@ -99,6 +99,7 @@ class SchemaAdapter:
     group_keys: Tuple[str, ...] = ()
     condition_columns: Dict[str, Tuple[object, ...]] = field(default_factory=dict)
     temporal_enabled: bool = False
+    temporal_cadence_seconds: float = 0.0
     max_lag: int = 0
     windows: Tuple[int, ...] = ()
     conditional_enabled: bool = False
