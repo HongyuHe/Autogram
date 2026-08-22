@@ -769,7 +769,7 @@ def test_event_related_join_uses_inferred_rate_cadence():
     assert values.tolist() == [1.0, 0.0]
 
 
-def test_benign_only_event_catalog_omits_empty_span_roles_from_nulls():
+def test_benign_only_event_catalog_keeps_empty_span_roles_null_safe():
     derived = pd.DataFrame({
         "timestamp": pd.date_range(
             "2026-01-01",
@@ -799,7 +799,11 @@ def test_benign_only_event_catalog_omits_empty_span_roles_from_nulls():
         for template in dataset.name_model.adapter.related_templates.values()
     }
 
-    assert roles == {"event_benign_burst"}
+    assert roles == {
+        "event_true_loss",
+        "event_benign_burst",
+        "event_artifact",
+    }
     prepare_runtime_null_controls(
         dataset,
         grammar,

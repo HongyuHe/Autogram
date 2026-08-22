@@ -1447,6 +1447,14 @@ def _runtime_relation_null(
         template for template in templates
         if template.mode == "span_any"
     ]
+    active_span_templates = [
+        template
+        for template in span_templates
+        if (
+            not template.filter_column
+            or bool(template.filter_values)
+        )
+    ]
     # Each scrubbed span role gets one declared label that no peer admits. Candidate selections are
     # accepted only after their real span/window projection is balanced and distinct, then checked
     # again together so private-label leakage cannot weaken the false-discovery control.
@@ -1460,7 +1468,7 @@ def _runtime_relation_null(
                 for value in template.filter_values
             ),
         )
-        for template in span_templates
+        for template in active_span_templates
     ]
     missing_key = typed_group_key(pd.NA)
     no_private_filter = object()
@@ -1538,7 +1546,9 @@ def _runtime_relation_null(
         used_public_masks = set()
         used_public_values = []
         accepted_public_masks = []
-        for template_index, template in enumerate(span_templates):
+        for template_index, template in enumerate(
+            active_span_templates
+        ):
             required = {
                 template.parent_time,
                 *template.parent_keys,
