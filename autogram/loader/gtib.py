@@ -565,29 +565,22 @@ def prepare_gtib(
             "span_end": "span_end",
             "filter_column": "type",
         }
-        event_role_values = {
-            "event_true_loss": tuple(
-                value for value in event_types
-                if value.startswith("true_loss")
-            ),
-            "event_benign_burst": (
-                ("benign_burst",)
-                if "benign_burst" in event_types
-                else ()
-            ),
-            "event_artifact": (
-                ("artifact",)
-                if "artifact" in event_types
-                else ()
-            ),
-        }
         related_aggregates.update({
-            role: {
+            "event_true_loss": {
                 **span_common,
-                "filter_values": values,
-            }
-            for role, values in event_role_values.items()
-            if values
+                "filter_values": tuple(
+                    value for value in event_types
+                    if value.startswith("true_loss")
+                ),
+            },
+            "event_benign_burst": {
+                **span_common,
+                "filter_values": ("benign_burst",),
+            },
+            "event_artifact": {
+                **span_common,
+                "filter_values": ("artifact",),
+            },
         })
 
     return profile_dataframe(
