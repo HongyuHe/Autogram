@@ -223,6 +223,43 @@ def test_profiled_advanced_false_stays_off_until_advanced_tier(
     ] == [False, True]
 
 
+def test_profiled_degree_and_proportionality_apply_at_tier_zero(
+    monkeypatch,
+):
+    import autogram.calibrate as calibration
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "x": [1.0, 2.0],
+            "y": [2.0, 4.0],
+        }),
+        max_degree=2,
+        proportional=True,
+    )
+    induced = _mini_spec(max_degree=1)
+    monkeypatch.setattr(
+        calibration,
+        "induce_spec",
+        lambda _columns, _inducer: induced,
+    )
+
+    specs = calibration._prepare_runtime_tier_specs(
+        frame,
+        induced,
+        object(),
+        [{}, {"max_degree": 2, "proportional": True}],
+        SearchConfig(max_rules=10_000),
+        frame.attrs["autogram_profile"],
+    )
+
+    assert specs[0].max_degree == 2
+    assert "~∝" in specs[0].ontology.ops
+    assert [tier for tier, _caps, _spec in _distinct_runtime_tiers(
+        [{}, {"max_degree": 2, "proportional": True}],
+        specs,
+    )] == [0]
+
+
 def test_distinct_runtime_tiers_drop_only_provenance_duplicates():
     base = _mini_spec()
     provenance_duplicate = replace(

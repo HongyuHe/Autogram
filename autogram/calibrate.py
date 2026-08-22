@@ -1973,6 +1973,18 @@ def _prepare_runtime_tier_specs(
                 temporal_bounds_widened=True,
                 advanced_bounds_widened=True,
                 degree_widened=True,
+                max_degree=max(
+                    int(spec.max_degree),
+                    max(
+                        1,
+                        int(profile.get("max_degree", 0)),
+                    ),
+                ),
+                proportional_widened=bool(
+                    spec.proportional_widened
+                    or profile.get("proportional", False)
+                    or caps.get("proportional", False)
+                ),
                 advanced_enabled=bool(
                     profile.get("advanced", False)
                     or caps.get("advanced", False)
