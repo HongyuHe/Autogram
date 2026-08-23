@@ -1990,10 +1990,10 @@ def _prepare_runtime_tier_specs(
                     or caps.get("advanced", False)
                 ),
                 conditional_enabled=bool(
-                    tier_index >= 3
-                    and (
-                        spec.conditional_enabled
-                        or bool(profile.get("condition_columns"))
+                    bool(profile.get("condition_columns"))
+                    or (
+                        tier_index >= 3
+                        and spec.conditional_enabled
                     )
                 ),
                 band_enabled=bool(

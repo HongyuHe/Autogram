@@ -260,6 +260,37 @@ def test_profiled_degree_and_proportionality_apply_at_tier_zero(
     )] == [0]
 
 
+def test_profiled_conditions_apply_at_tier_zero(
+    monkeypatch,
+):
+    import autogram.calibrate as calibration
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "label": ["normal", "alert"],
+            "value": [1.0, 2.0],
+        }),
+        condition_columns=("label",),
+    )
+    induced = _mini_spec()
+    monkeypatch.setattr(
+        calibration,
+        "induce_spec",
+        lambda _columns, _inducer: induced,
+    )
+
+    specs = calibration._prepare_runtime_tier_specs(
+        frame,
+        induced,
+        object(),
+        [{}, {"temporal": True}],
+        SearchConfig(max_rules=10_000),
+        frame.attrs["autogram_profile"],
+    )
+
+    assert specs[0].conditional_enabled
+
+
 def test_distinct_runtime_tiers_drop_only_provenance_duplicates():
     base = _mini_spec()
     provenance_duplicate = replace(
