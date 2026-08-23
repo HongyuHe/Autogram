@@ -217,6 +217,10 @@ def test_checked_in_gtib_config_populates_calibration_arguments():
     assert configured.known == "configs/gtib_known.yaml"
     assert configured.time_index == "timestamp"
     assert configured.group_keys == ["consumer_id"]
+    assert configured.condition_columns == [
+        "archetype",
+        "label",
+    ]
     assert configured.windows == [10, 45, 60]
     assert configured.cadence_seconds == 60
     assert configured.max_lag == 45
