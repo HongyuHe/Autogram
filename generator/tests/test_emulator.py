@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from gtib_emulator import cli
 from gtib_emulator.config import load_config
 from gtib_emulator.generate import run
 from gtib_emulator.invariants import check_all
@@ -38,11 +39,56 @@ def result():
     return run(_small_config())
 
 
+def _fill_object_column(
+    frame: pd.DataFrame,
+    mask: np.ndarray,
+    column: str,
+    value,
+) -> None:
+    frame[column] = frame[column].astype(object)
+    index = frame.index[np.asarray(mask, dtype=bool)]
+    frame.loc[index, column] = pd.Series(
+        [value] * len(index),
+        index=index,
+        dtype=object,
+    )
+
+
 def test_hard_invariants_pass(result):
     cfg = result.config
-    results = check_all(cfg, result.records, result.events)
+    results = check_all(
+        cfg,
+        result.records,
+        result.events,
+        result.raw,
+    )
     hard_failures = [r for r in results if r.tier == "hard" and not r.passed]
     assert not hard_failures, [f"{r.name}: {r.detail}" for r in hard_failures]
+
+
+@pytest.mark.parametrize("command", ("generate", "validate"))
+def test_cli_validation_rejects_corrupted_raw(
+    result,
+    command,
+    monkeypatch,
+    capsys,
+):
+    corrupted = copy.copy(result)
+    corrupted.raw = result.raw.iloc[1:].reset_index(drop=True)
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda *_args, **_kwargs: result.config,
+    )
+    monkeypatch.setattr(cli, "run", lambda _cfg: corrupted)
+    monkeypatch.setattr(cli, "write_outputs", lambda _result: {})
+
+    exit_code = cli.main([command])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "raw_identity_grid" in captured.out
+    assert "raw rows=" in captured.out
 
 
 @pytest.mark.parametrize(
@@ -150,8 +196,12 @@ def test_hard_checks_reject_missing_consumer_identity(
     assert "missing or invalid consumer_id" in grid.detail
 
 
-def test_derived_identity_grid_preserves_nested_typed_consumers(result):
+def test_identity_grids_preserve_nested_typed_consumers_and_shards(
+    result,
+):
     records = copy.deepcopy(result.records)
+    raw = result.raw.copy()
+    events = result.events.copy()
     identities = (
         ("region", ("consumer", True)),
         ("region", ("consumer", 1)),
@@ -159,7 +209,50 @@ def test_derived_identity_grid_preserves_nested_typed_consumers(result):
         ("region", ("consumer", 1.0)),
     )
     for record, identity in zip(records, identities):
+        old_consumer = record["consumer"].consumer_id
+        raw_consumer = (
+            raw["consumer_id"].to_numpy(dtype=object) == old_consumer
+        )
+        event_consumer = (
+            events["consumer_id"].to_numpy(dtype=object) == old_consumer
+            if not events.empty
+            else np.zeros(0, dtype=bool)
+        )
+        old_shards = list(record["consumer"].shard_ids)
+        typed_components = (True, 1, "1", 1.0)
+        new_shards = [
+            ("shard", typed_components[index])
+            for index in range(len(old_shards))
+        ]
+        for old_shard, new_shard in zip(old_shards, new_shards):
+            shard_mask = (
+                raw_consumer
+                & (
+                    raw["shard_id"].to_numpy(dtype=object)
+                    == old_shard
+                )
+            )
+            _fill_object_column(
+                raw,
+                shard_mask,
+                "shard_id",
+                new_shard,
+            )
+        _fill_object_column(
+            raw,
+            raw_consumer,
+            "consumer_id",
+            identity,
+        )
+        if not events.empty:
+            _fill_object_column(
+                events,
+                event_consumer,
+                "consumer_id",
+                identity,
+            )
         record["consumer"].consumer_id = identity
+        record["consumer"].shard_ids = new_shards
         frame = record["frame"]
         frame["consumer_id"] = pd.Series(
             [identity] * len(frame),
@@ -167,14 +260,184 @@ def test_derived_identity_grid_preserves_nested_typed_consumers(result):
             dtype=object,
         )
 
-    checks = check_all(result.config, records, result.events)
+    checks = check_all(result.config, records, events, raw)
+    grids = {
+        check.name: check
+        for check in checks
+        if check.name in {"raw_identity_grid", "derived_identity_grid"}
+    }
+
+    assert grids["raw_identity_grid"].passed, grids[
+        "raw_identity_grid"
+    ].detail
+    assert grids["derived_identity_grid"].passed, grids[
+        "derived_identity_grid"
+    ].detail
+
+
+def test_hard_checks_reject_duplicate_typed_shard_ids(result):
+    records = copy.deepcopy(result.records)
+    raw = result.raw.copy()
+    consumer = records[0]["consumer"]
+    first_shard, duplicate_shard = consumer.shard_ids[:2]
+    consumer.shard_ids[1] = first_shard
+    duplicate_mask = (
+        (raw["consumer_id"] == consumer.consumer_id)
+        & (raw["shard_id"] == duplicate_shard)
+    )
+    raw.loc[duplicate_mask, "shard_id"] = first_shard
+
+    assert raw.duplicated(
+        ["timestamp", "consumer_id", "shard_id"]
+    ).any()
+
+    checks = check_all(result.config, records, result.events, raw)
     grid = next(
         check
         for check in checks
-        if check.name == "derived_identity_grid"
+        if check.name == "raw_identity_grid"
     )
 
-    assert grid.passed, grid.detail
+    assert not grid.passed
+    assert "duplicate typed shard_id" in grid.detail
+    assert "duplicate global (timestamp, consumer_id, shard_id)" in (
+        grid.detail
+    )
+
+    source_checks = check_all(result.config, records, result.events)
+    source_grid = next(
+        check
+        for check in source_checks
+        if check.name == "raw_identity_grid"
+    )
+    assert not source_grid.passed
+    assert "duplicate typed shard_id" in source_grid.detail
+
+
+@pytest.mark.parametrize(
+    ("corruption", "detail"),
+    (
+        ("missing_shard", "missing=1"),
+        ("extra_shard", "extra=1"),
+        ("missing_row", "raw rows="),
+        ("extra_row", "duplicate global"),
+        ("timestamp_cadence", "raw timestamps"),
+        ("timestamp_order", "raw timestamps"),
+        ("shard_order", "row order or identity alignment"),
+    ),
+)
+def test_hard_checks_reject_malformed_raw_identity_grid(
+    result,
+    corruption,
+    detail,
+):
+    raw = result.raw.copy()
+    consumer = result.records[0]["consumer"]
+    first_shard, second_shard = consumer.shard_ids[:2]
+    first_shard_mask = (
+        (raw["consumer_id"] == consumer.consumer_id)
+        & (raw["shard_id"] == first_shard)
+    )
+
+    if corruption == "missing_shard":
+        raw = raw.loc[~first_shard_mask].reset_index(drop=True)
+    elif corruption == "extra_shard":
+        extra = raw.loc[first_shard_mask].copy()
+        extra["shard_id"] = "unexpected_shard"
+        raw = pd.concat([raw, extra], ignore_index=True)
+    elif corruption == "missing_row":
+        raw = raw.iloc[1:].reset_index(drop=True)
+    elif corruption == "extra_row":
+        raw = pd.concat(
+            [raw, raw.iloc[[0]].copy()],
+            ignore_index=True,
+        )
+    elif corruption == "timestamp_cadence":
+        raw.loc[raw.index[1], "timestamp"] += np.timedelta64(1, "s")
+    elif corruption == "timestamp_order":
+        timestamps = raw.loc[
+            raw.index[:2],
+            "timestamp",
+        ].to_numpy(copy=True)
+        raw.loc[raw.index[:2], "timestamp"] = timestamps[::-1]
+    else:
+        first = raw.index[
+            first_shard_mask
+            & (raw["timestamp"] == raw["timestamp"].iloc[0])
+        ][0]
+        second = raw.index[
+            (raw["consumer_id"] == consumer.consumer_id)
+            & (raw["shard_id"] == second_shard)
+            & (raw["timestamp"] == raw["timestamp"].iloc[0])
+        ][0]
+        raw.loc[[first, second], "shard_id"] = [
+            second_shard,
+            first_shard,
+        ]
+
+    checks = check_all(
+        result.config,
+        result.records,
+        result.events,
+        raw,
+    )
+    grid = next(
+        check
+        for check in checks
+        if check.name == "raw_identity_grid"
+    )
+
+    assert not grid.passed
+    assert detail in grid.detail
+
+
+@pytest.mark.parametrize(
+    ("corruption", "detail"),
+    (
+        ("not_dataframe", "expected DataFrame"),
+        ("missing_column", "missing identity columns"),
+        ("missing_consumer", "missing or invalid typed"),
+        ("malformed_timestamp", "missing or invalid typed"),
+    ),
+)
+def test_malformed_raw_tables_fail_hard_without_raising(
+    result,
+    corruption,
+    detail,
+):
+    raw = result.raw.copy()
+    if corruption == "not_dataframe":
+        malformed = {"timestamp": []}
+    elif corruption == "missing_column":
+        malformed = raw.drop(columns=["shard_id"])
+    elif corruption == "missing_consumer":
+        malformed = raw
+        _fill_object_column(
+            malformed,
+            np.arange(len(malformed)) == 0,
+            "consumer_id",
+            ("region", ("consumer", pd.NA)),
+        )
+    else:
+        malformed = raw
+        malformed["timestamp"] = malformed["timestamp"].astype(object)
+        malformed.loc[malformed.index[0], "timestamp"] = "not-a-timestamp"
+
+    checks = check_all(
+        result.config,
+        result.records,
+        result.events,
+        malformed,
+    )
+    grid = next(
+        check
+        for check in checks
+        if check.name == "raw_identity_grid"
+    )
+
+    assert grid.tier == "hard"
+    assert not grid.passed
+    assert detail in grid.detail
 
 
 def test_hard_checks_detect_corrupted_static_alert(result):

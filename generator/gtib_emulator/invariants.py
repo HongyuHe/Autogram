@@ -325,11 +325,361 @@ def _generated_derived_grid(
     )
 
 
+def _generated_raw_grid(
+    cfg: EmulatorConfig,
+    records: list[dict[str, Any]],
+    raw: pd.DataFrame | None,
+) -> tuple[bool, str]:
+    """Validate the exact typed shard grid emitted by the generator."""
+
+    try:
+        return _generated_raw_grid_impl(cfg, records, raw)
+    except Exception as exc:
+        return (
+            False,
+            "raw grid validation rejected malformed input without raising: "
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _generated_raw_grid_impl(
+    cfg: EmulatorConfig,
+    records: list[dict[str, Any]],
+    raw: pd.DataFrame | None,
+) -> tuple[bool, str]:
+    expected_consumers = int(cfg.scale.n_consumers)
+    expected_steps = int(cfg.n_raw_steps)
+    start_ns = int(pd.Timestamp(cfg.time.start_timestamp).value)
+    cadence_ns = int(cfg.time.raw_scrape_seconds) * 1_000_000_000
+    issues: list[str] = []
+    expected_pairs: list[
+        tuple[
+            Any,
+            Any,
+            tuple[Any, Any] | None,
+            tuple[Any, Any] | None,
+        ]
+    ] = []
+    expected_consumer_keys: set[tuple[Any, Any]] = set()
+    seen_consumers: dict[tuple[Any, Any], int] = {}
+
+    if len(records) != expected_consumers:
+        issues.append(
+            f"consumer records={len(records)} (expected {expected_consumers})"
+        )
+
+    for record_index, rec in enumerate(records):
+        consumer = rec.get("consumer") if isinstance(rec, dict) else None
+        consumer_id = getattr(consumer, "consumer_id", None)
+        consumer_key = _typed_identity_key(consumer_id)
+        if consumer_key is None:
+            issues.append(
+                f"record {record_index} has missing or invalid raw consumer_id "
+                f"{consumer_id!r}"
+            )
+        else:
+            previous = seen_consumers.get(consumer_key)
+            if previous is not None:
+                issues.append(
+                    f"record {record_index} has duplicate raw consumer_id "
+                    f"{consumer_id!r} (first seen in record {previous})"
+                )
+            else:
+                seen_consumers[consumer_key] = record_index
+                expected_consumer_keys.add(consumer_key)
+
+        shard_ids = getattr(consumer, "shard_ids", None)
+        if isinstance(shard_ids, (str, bytes)) or shard_ids is None:
+            issues.append(
+                f"record {record_index} has invalid shard_ids "
+                f"{shard_ids!r}"
+            )
+            continue
+        try:
+            shards = list(shard_ids)
+        except (TypeError, ValueError):
+            issues.append(
+                f"record {record_index} has non-iterable shard_ids "
+                f"{shard_ids!r}"
+            )
+            continue
+
+        if not (
+            int(cfg.scale.shards_min)
+            <= len(shards)
+            <= int(cfg.scale.shards_max)
+        ):
+            issues.append(
+                f"record {record_index} shards={len(shards)} "
+                f"(expected {cfg.scale.shards_min}.."
+                f"{cfg.scale.shards_max})"
+            )
+
+        obs = rec.get("obs") if isinstance(rec, dict) else None
+        input_counted = getattr(obs, "input_counted", None)
+        if np.shape(input_counted) != (len(shards), expected_steps):
+            issues.append(
+                f"record {record_index} observed shard grid shape="
+                f"{np.shape(input_counted)} (expected "
+                f"({len(shards)}, {expected_steps}))"
+            )
+
+        seen_shards: dict[tuple[Any, Any], int] = {}
+        for shard_index, shard_id in enumerate(shards):
+            shard_key = _typed_identity_key(shard_id)
+            if shard_key is None:
+                issues.append(
+                    f"record {record_index} shard {shard_index} has missing "
+                    f"or invalid shard_id {shard_id!r}"
+                )
+            else:
+                previous = seen_shards.get(shard_key)
+                if previous is not None:
+                    issues.append(
+                        f"record {record_index} has duplicate typed shard_id "
+                        f"{shard_id!r} at shard positions {previous} and "
+                        f"{shard_index}"
+                    )
+                else:
+                    seen_shards[shard_key] = shard_index
+            expected_pairs.append(
+                (
+                    consumer_id,
+                    shard_id,
+                    consumer_key,
+                    shard_key,
+                )
+            )
+
+    expected_total_rows = len(expected_pairs) * expected_steps
+    expected_pair_keys = {
+        (consumer_key, shard_key)
+        for _, _, consumer_key, shard_key in expected_pairs
+        if consumer_key is not None and shard_key is not None
+    }
+    if len(expected_pair_keys) != len(expected_pairs):
+        issues.append(
+            f"unique expected typed consumer/shard identities="
+            f"{len(expected_pair_keys)} (expected {len(expected_pairs)})"
+        )
+
+    if raw is None:
+        if issues:
+            return False, _raw_grid_detail(issues)
+        return (
+            True,
+            f"{len(expected_consumer_keys)} typed consumers and "
+            f"{len(expected_pairs)} unique typed consumer/shard identities "
+            f"define {expected_total_rows} ordered raw rows on the configured "
+            "scrape cadence.",
+        )
+
+    if not isinstance(raw, pd.DataFrame):
+        issues.append(
+            f"raw table has type {type(raw).__name__}, expected DataFrame"
+        )
+        return False, _raw_grid_detail(issues)
+
+    if not cfg.output.write_raw and raw.empty:
+        if issues:
+            return False, _raw_grid_detail(issues)
+        return (
+            True,
+            "raw output is disabled; the typed consumer/shard source grid is "
+            "valid.",
+        )
+
+    if len(raw) != expected_total_rows:
+        issues.append(
+            f"raw rows={len(raw)} (expected {expected_total_rows})"
+        )
+
+    missing_columns = [
+        column
+        for column in ("timestamp", "consumer_id", "shard_id")
+        if column not in raw.columns
+    ]
+    if missing_columns:
+        issues.append(f"raw table missing identity columns {missing_columns}")
+        return False, _raw_grid_detail(issues)
+
+    timestamp_values = raw["timestamp"].to_numpy(dtype=object)
+    consumer_values = raw["consumer_id"].to_numpy(dtype=object)
+    shard_values = raw["shard_id"].to_numpy(dtype=object)
+    try:
+        timestamps = pd.to_datetime(
+            timestamp_values,
+            errors="coerce",
+            utc=True,
+            format="mixed",
+        )
+        timestamp_ns = np.asarray(
+            timestamps.as_unit("ns").asi8,
+            dtype=np.int64,
+        )
+    except (AttributeError, OverflowError, TypeError, ValueError):
+        timestamp_ns = np.full(
+            len(raw),
+            np.iinfo(np.int64).min,
+            dtype=np.int64,
+        )
+
+    nat_ns = np.iinfo(np.int64).min
+    invalid_identities = 0
+    timestamp_mismatches = 0
+    alignment_mismatches = 0
+    first_alignment_mismatch: tuple[int, Any, Any, Any, Any] | None = None
+    seen_global: dict[
+        tuple[int, tuple[Any, Any], tuple[Any, Any]],
+        int,
+    ] = {}
+    duplicate_global = 0
+    first_duplicate: tuple[int, int, Any, Any, Any] | None = None
+    observed_consumer_keys: set[tuple[Any, Any]] = set()
+    observed_pair_keys: set[
+        tuple[tuple[Any, Any], tuple[Any, Any]]
+    ] = set()
+
+    for position, (timestamp, consumer_id, shard_id) in enumerate(
+        zip(timestamp_ns, consumer_values, shard_values)
+    ):
+        consumer_key = _typed_identity_key(consumer_id)
+        shard_key = _typed_identity_key(shard_id)
+        identity_ok = (
+            int(timestamp) != nat_ns
+            and consumer_key is not None
+            and shard_key is not None
+        )
+        if not identity_ok:
+            invalid_identities += 1
+        if consumer_key is not None:
+            observed_consumer_keys.add(consumer_key)
+        if consumer_key is not None and shard_key is not None:
+            observed_pair_keys.add((consumer_key, shard_key))
+        if identity_ok:
+            identity = (int(timestamp), consumer_key, shard_key)
+            previous = seen_global.get(identity)
+            if previous is not None:
+                duplicate_global += 1
+                if first_duplicate is None:
+                    first_duplicate = (
+                        previous,
+                        position,
+                        timestamp_values[position],
+                        consumer_id,
+                        shard_id,
+                    )
+            else:
+                seen_global[identity] = position
+
+        if position >= expected_total_rows or expected_steps <= 0:
+            continue
+        block = position // expected_steps
+        step = position % expected_steps
+        expected_consumer, expected_shard, _, _ = expected_pairs[block]
+        expected_timestamp = start_ns + step * cadence_ns
+        if int(timestamp) != expected_timestamp:
+            timestamp_mismatches += 1
+        if (
+            not _identity_equal(consumer_id, expected_consumer)
+            or not _identity_equal(shard_id, expected_shard)
+        ):
+            alignment_mismatches += 1
+            if first_alignment_mismatch is None:
+                first_alignment_mismatch = (
+                    position,
+                    consumer_id,
+                    shard_id,
+                    expected_consumer,
+                    expected_shard,
+                )
+
+    missing_consumers = expected_consumer_keys - observed_consumer_keys
+    extra_consumers = observed_consumer_keys - expected_consumer_keys
+    if missing_consumers or extra_consumers:
+        issues.append(
+            "raw consumer identities differ from records: "
+            f"missing={len(missing_consumers)}, extra={len(extra_consumers)}"
+        )
+    missing_pairs = expected_pair_keys - observed_pair_keys
+    extra_pairs = observed_pair_keys - expected_pair_keys
+    if missing_pairs or extra_pairs:
+        issues.append(
+            "raw shard identities differ from records: "
+            f"missing={len(missing_pairs)}, extra={len(extra_pairs)}"
+        )
+    if invalid_identities:
+        issues.append(
+            f"{invalid_identities} raw rows have a missing or invalid typed "
+            "(timestamp, consumer_id, shard_id) identity"
+        )
+    if duplicate_global and first_duplicate is not None:
+        first, duplicate, timestamp, consumer_id, shard_id = first_duplicate
+        issues.append(
+            f"{duplicate_global} duplicate global "
+            "(timestamp, consumer_id, shard_id) identities; first duplicate "
+            f"{timestamp!r}, {consumer_id!r}, {shard_id!r} occurs at rows "
+            f"{first} and {duplicate}"
+        )
+    if len(seen_global) != expected_total_rows:
+        issues.append(
+            f"unique global raw row identities={len(seen_global)} "
+            f"(expected {expected_total_rows})"
+        )
+    if timestamp_mismatches:
+        issues.append(
+            f"{timestamp_mismatches} raw timestamps do not equal start + "
+            "step * raw_scrape_seconds in shard-major row order"
+        )
+    if alignment_mismatches and first_alignment_mismatch is not None:
+        (
+            position,
+            consumer_id,
+            shard_id,
+            expected_consumer,
+            expected_shard,
+        ) = first_alignment_mismatch
+        issues.append(
+            f"{alignment_mismatches} raw rows violate consumer/shard row "
+            f"order or identity alignment; first at row {position}: "
+            f"got ({consumer_id!r}, {shard_id!r}), expected "
+            f"({expected_consumer!r}, {expected_shard!r})"
+        )
+
+    if issues:
+        return False, _raw_grid_detail(issues)
+    return (
+        True,
+        f"{len(expected_consumer_keys)} typed consumers and "
+        f"{len(expected_pairs)} unique typed consumer/shard identities emit "
+        f"{expected_total_rows} globally unique rows in exact shard-major "
+        "order on the configured scrape cadence.",
+    )
+
+
+def _raw_grid_detail(issues: list[str]) -> str:
+    shown = "; ".join(issues[:10])
+    if len(issues) > 10:
+        shown += f"; plus {len(issues) - 10} more"
+    return shown
+
+
 def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
-              events: pd.DataFrame) -> list[InvariantResult]:
-    """Run every invariant over all per-consumer records."""
+              events: pd.DataFrame,
+              raw: pd.DataFrame | None = None) -> list[InvariantResult]:
+    """Run every invariant, including the emitted raw table when supplied."""
 
     results: list[InvariantResult] = []
+    raw_grid_ok, raw_grid_detail = _generated_raw_grid(
+        cfg,
+        records,
+        raw,
+    )
+    results.append(_hard(
+        "raw_identity_grid",
+        raw_grid_ok,
+        raw_grid_detail,
+    ))
     derived_records, grid_ok, grid_detail = _generated_derived_grid(
         cfg,
         records,

@@ -1721,8 +1721,10 @@ def _proportional_subsample(g, frame, nm, cfg):
 
     ``ground`` samples before it knows that ``(0, 0)`` is neutral for proportionality. A large
     neutral population can therefore consume the whole coreset and leave too few non-zero
-    predictors to fit or score. When subsampling was active, redraw from the full non-neutral
-    population using the grounder's deterministic group stratification. Full operands and row
+    predictors to fit or score. Redraw from the full non-neutral population while reserving every
+    zero-predictor violation and enough coefficient-bearing rows to fit every declared group. If
+    the cap cannot represent that evidence honestly, keep the full non-neutral population instead
+    of letting a coreset turn a viable group into an unfittable one. Full operands and row
     identities remain attached to the replacement so support and universal overflow checks still
     use the unsampled population.
     """
@@ -1742,15 +1744,81 @@ def _proportional_subsample(g, frame, nm, cfg):
         ~((full_right == 0.0) & (full_left == 0.0))
     )
     if evidence.size > cap:
-        sampled = _stratified_subsample(
-            full_rows[evidence],
+        coefficient_positions = evidence[
+            full_right[evidence] != 0.0
+        ]
+        zero_predictor_violations = evidence[
+            (full_right[evidence] == 0.0)
+            & (full_left[evidence] != 0.0)
+        ]
+        # The fit split needs two rows and its holdout needs one, regardless of a lower
+        # configured viability floor.
+        minimum = max(3, int(cfg.min_proportional_points))
+        full_groups = _group_labels(
             frame,
             nm,
-            cap,
-            int(cfg.seed),
+            full_rows,
         )
-        if sampled is not None:
-            evidence = evidence[sampled]
+        if full_groups is None:
+            n_groups = 1
+            full_viable = coefficient_positions.size >= minimum
+        else:
+            full_group_positions = _group_positions(full_groups)
+            n_groups = len(full_group_positions)
+            full_viable = all(
+                np.count_nonzero(
+                    full_right[positions] != 0.0
+                ) >= minimum
+                for _typed, positions in full_group_positions
+            )
+        required = (
+            zero_predictor_violations.size
+            + minimum * n_groups
+        )
+        if full_viable and required <= cap:
+            coefficient_cap = (
+                cap - zero_predictor_violations.size
+            )
+            sampled = _stratified_subsample(
+                full_rows[coefficient_positions],
+                frame,
+                nm,
+                coefficient_cap,
+                int(cfg.seed),
+            )
+            if sampled is not None:
+                candidate = np.sort(np.concatenate((
+                    coefficient_positions[sampled],
+                    zero_predictor_violations,
+                )))
+                candidate_groups = _group_labels(
+                    frame,
+                    nm,
+                    full_rows[candidate],
+                )
+                if candidate_groups is None:
+                    honest = (
+                        np.count_nonzero(
+                            full_right[candidate] != 0.0
+                        )
+                        >= minimum
+                    )
+                else:
+                    candidate_group_positions = _group_positions(
+                        candidate_groups
+                    )
+                    honest = (
+                        len(candidate_group_positions) == n_groups
+                        and all(
+                            np.count_nonzero(
+                                full_right[candidate[positions]] != 0.0
+                            ) >= minimum
+                            for _typed, positions
+                            in candidate_group_positions
+                        )
+                    )
+                if honest:
+                    evidence = candidate
 
     left = full_left[evidence]
     right = full_right[evidence]

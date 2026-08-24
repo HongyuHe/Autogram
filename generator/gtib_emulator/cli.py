@@ -55,7 +55,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         _print_summary(result, written)
 
     if not args.no_validate:
-        results = check_all(cfg, result.records, result.events)
+        results = check_all(cfg, result.records, result.events, result.raw)
         hard_failed = _print_invariants(results, quiet=args.quiet)
         if hard_failed:
             print("\nFAIL: one or more HARD invariants were violated.", file=sys.stderr)
@@ -66,7 +66,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
 def _cmd_validate(args: argparse.Namespace) -> int:
     cfg = load_config(args.config, _overrides_from_args(args))
     result = run(cfg)
-    results = check_all(cfg, result.records, result.events)
+    results = check_all(cfg, result.records, result.events, result.raw)
     hard_failed = _print_invariants(results, quiet=False)
     return 1 if hard_failed else 0
 
