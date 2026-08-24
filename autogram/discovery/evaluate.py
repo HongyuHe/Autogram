@@ -6,7 +6,7 @@ interval.  MDL is computed for tie-breaking, never as an acceptance gate.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 
 import numpy as np
@@ -20,6 +20,7 @@ from ..dsl.evaluate import (
     _condition_mask,
     _consecutive_window_ends,
     _ordered_groups,
+    _stratified_subsample,
     _union_overflow,
     _window_overflow,
     TypedGroupIdentity,
@@ -548,11 +549,14 @@ class DataOnlyEvaluator:
                 f"grounded 0 points for binder {rule.binder!r} "
                 f"({g.n_bindings}/{g.n_candidates} non-degenerate bindings)",
             )
+        if op == "~∝":
+            g = _proportional_subsample(g, frame, nm, cfg)
 
         rho = g.rho
         scale = g.scale
-        overflow_support = None
+        effective_support = None
         parameters = {}
+        proportional_zero_violations = None
         evaluation_groups = _group_labels(
             frame,
             nm,
@@ -591,6 +595,9 @@ class DataOnlyEvaluator:
             # between them.
             full_left = g.full_left if g.full_left is not None else g.left
             full_right = g.full_right if g.full_right is not None else g.right
+            # ``0 = c * 0`` is true for every coefficient, so these rows neither identify nor
+            # validate proportionality. They must leave both the scored population and support.
+            full_neutral = (full_right == 0.0) & (full_left == 0.0)
             full_coefficient = self._coefficient_for_points(
                 coefficients, frame, nm, g, full_left.size,
             )
@@ -650,12 +657,21 @@ class DataOnlyEvaluator:
                             rule,
                             "proportional law overflowed on every evaluated row",
                         )
-                overflow_support = self._support_excluding(g, fit_blown)
+            full_excluded = full_neutral.copy()
+            if fit_overflow is not None:
+                full_excluded |= fit_overflow
+            excluded_points = int(np.count_nonzero(full_excluded))
+            effective_support = self._support_excluding(
+                g,
+                excluded_points,
+            )
+            if excluded_points:
                 support_rejection = self._graded_support_rejection(
                     rule,
                     g,
-                    fit_blown,
-                    excluded_mask=fit_overflow,
+                    excluded_points,
+                    excluded_mask=full_excluded,
+                    exclusion_reason="proportional exclusions",
                 )
                 if support_rejection is not None:
                     return support_rejection
@@ -666,6 +682,10 @@ class DataOnlyEvaluator:
                 "coefficient": float(robust_median(np.asarray(list(coefficients.values()), dtype=float))),
                 "coefficients": _reported_coefficients(coefficients),
             }
+            proportional_zero_violations = (
+                (g.right[evaluation_mask] == 0.0)
+                & (g.left[evaluation_mask] != 0.0)
+            )
             rho = rho[evaluation_mask]
             scale = scale[evaluation_mask]
             # `_fit_proportional` sliced the group labels with the mask it returned; narrowing the
@@ -713,25 +733,78 @@ class DataOnlyEvaluator:
             if cfg.band_mode == "adaptive" and op in ("~=", "~∝"):
                 # item 4: per-candidate self-calibrated band (knee + split-conformal holdout),
                 # capped at the global tolerance so it can only *tighten*, never widen-to-accept.
-                bf, _cov = fit_band_auto(op, rho, scale, cfg.band_holdout_frac, cfg.seed,
-                                         cap=cfg.tolerance,
-                                         groups=evaluation_groups)
+                band_positions = np.arange(rho.size)
+                if (
+                    op == "~∝"
+                    and proportional_zero_violations is not None
+                ):
+                    # A non-zero response at a zero predictor is false independently of both the
+                    # coefficient and the learned band. Keep every such row for final scoring, but
+                    # never let it calibrate the tolerance or disappear into that calibration split.
+                    band_positions = band_positions[
+                        ~proportional_zero_violations
+                    ]
+                    if not band_positions.size:
+                        return self._reject(
+                            rule,
+                            "adaptive proportional band had no coefficient-validation points",
+                        )
+                band_groups = (
+                    evaluation_groups[band_positions]
+                    if evaluation_groups is not None
+                    else None
+                )
+                bf, _cov = fit_band_auto(
+                    op,
+                    rho[band_positions],
+                    scale[band_positions],
+                    cfg.band_holdout_frac,
+                    cfg.seed,
+                    cap=cfg.tolerance,
+                    groups=band_groups,
+                )
                 if evaluation_groups is not None and bf.n_eval == 0:
                     return self._reject(
                         rule,
                         "adaptive band could not retain every declared group",
                     )
                 eps = max(float(bf.eps), 1e-9)
-                rho = rho[bf.eval_indices]
-                scale = scale[bf.eval_indices]
+                evaluation_positions = band_positions[
+                    bf.eval_indices
+                ]
+                if (
+                    op == "~∝"
+                    and proportional_zero_violations is not None
+                    and np.any(proportional_zero_violations)
+                ):
+                    evaluation_positions = np.sort(np.concatenate((
+                        evaluation_positions,
+                        np.flatnonzero(
+                            proportional_zero_violations
+                        ),
+                    )))
+                rho = rho[evaluation_positions]
+                scale = scale[evaluation_positions]
                 rel = np.abs(rho) / scale
                 if evaluation_groups is not None:
                     evaluation_groups = evaluation_groups[
-                        bf.eval_indices
+                        evaluation_positions
                     ]
+                if proportional_zero_violations is not None:
+                    proportional_zero_violations = (
+                        proportional_zero_violations[
+                            evaluation_positions
+                        ]
+                    )
             else:
                 eps = cfg.tolerance
             holds = violation_magnitude(op, rho, scale) <= eps + 1e-15
+            if (
+                op == "~∝"
+                and proportional_zero_violations is not None
+            ):
+                # These are mathematical violations even when a caller configures a tolerance >= 1.
+                holds[proportional_zero_violations] = False
         k = int(np.count_nonzero(holds))
         z = z_for_alpha(cfg.ci_alpha)
         lo, hi, phat = wilson(k, int(holds.size), z=z)
@@ -756,7 +829,7 @@ class DataOnlyEvaluator:
         return Evaluation(
             rule=rule, accepted=ok, reason=reason, eps=eps,
             hold_rate=phat, hold_rate_lo=lo, hold_rate_hi=hi, statistic="hold_rate",
-            support=(g.support if overflow_support is None else overflow_support),
+            support=(g.support if effective_support is None else effective_support),
             n_points=int(holds.size), n_bindings=g.n_bindings,
             mdl_gain=gain, strictness=strict, descriptor=descriptor, threshold=thr,
             raw_exact_sign=g.raw_exact_sign,
@@ -923,16 +996,16 @@ class DataOnlyEvaluator:
         return mapped
 
     @staticmethod
-    def _support_excluding(g, blown: int) -> float:
-        """``g.support`` with ``blown`` further rows removed from the graded population.
+    def _support_excluding(g, excluded: int) -> float:
+        """``g.support`` with further rows removed from the graded population.
 
-        Tolerated overflow is still not evidence: the rows leave the scored population, so the
-        reported support has to leave with them.
+        Neither tolerated overflow nor coefficient-neutral proportional rows are evidence, so the
+        reported support has to shrink with either exclusion.
         """
         graded = int(g.graded_points)
         if graded <= 0:
             return g.support
-        remaining = max(0, graded - int(blown))
+        remaining = max(0, graded - int(excluded))
         return float(g.support) * (float(remaining) / float(graded))
 
     def _graded_support_rejection(
@@ -942,8 +1015,9 @@ class DataOnlyEvaluator:
         blown: int,
         *,
         excluded_mask=None,
+        exclusion_reason="overflow",
     ):
-        """Re-apply the conditioned support floor after overflowed rows are excluded, else ``None``."""
+        """Re-apply the conditioned support floor after scored rows are excluded, else ``None``."""
         if rule.condition is None:
             return None
         rows = (
@@ -962,8 +1036,9 @@ class DataOnlyEvaluator:
         ):
             return self._reject(
                 rule,
-                "condition support below minimum after overflow "
-                f"({graded} points, {support:.3f} of rows)",
+                "condition support below minimum after "
+                f"{exclusion_reason} ({graded} source rows, "
+                f"{support:.3f} of rows)",
             )
         return None
 
@@ -1641,10 +1716,91 @@ class DataOnlyEvaluator:
         )
 
 
+def _proportional_subsample(g, frame, nm, cfg):
+    """Rebuild an active coreset from the full coefficient-relevant population.
+
+    ``ground`` samples before it knows that ``(0, 0)`` is neutral for proportionality. A large
+    neutral population can therefore consume the whole coreset and leave too few non-zero
+    predictors to fit or score. When subsampling was active, redraw from the full non-neutral
+    population using the grounder's deterministic group stratification. Full operands and row
+    identities remain attached to the replacement so support and universal overflow checks still
+    use the unsampled population.
+    """
+
+    cap = int(cfg.subsample)
+    full_left = g.full_left if g.full_left is not None else g.left
+    full_right = g.full_right if g.full_right is not None else g.right
+    full_rows = (
+        g.full_row_indices
+        if g.full_row_indices is not None
+        else g.row_indices
+    )
+    if cap <= 0 or full_left.size <= cap:
+        return g
+
+    evidence = np.flatnonzero(
+        ~((full_right == 0.0) & (full_left == 0.0))
+    )
+    if evidence.size > cap:
+        sampled = _stratified_subsample(
+            full_rows[evidence],
+            frame,
+            nm,
+            cap,
+            int(cfg.seed),
+        )
+        if sampled is not None:
+            evidence = evidence[sampled]
+
+    left = full_left[evidence]
+    right = full_right[evidence]
+    rows = full_rows[evidence]
+    with np.errstate(over="ignore", invalid="ignore"):
+        rho = left - right
+    scale = np.maximum(np.abs(left), np.abs(right))
+    scale = np.maximum(
+        scale,
+        _positive_scale_floor(scale[scale > 0]),
+    )
+    return replace(
+        g,
+        rho=rho,
+        scale=scale,
+        left=left,
+        right=right,
+        row_indices=rows,
+    )
+
+
 def _fit_proportional(g, frame, nm, cfg):
     """Fit a robust through-origin slope globally or once per declared row group."""
 
     keys = tuple(getattr(getattr(nm, "adapter", None), "group_keys", ()))
+    full_rows = (
+        g.full_row_indices
+        if g.full_row_indices is not None
+        else g.row_indices
+    )
+    full_left = g.full_left if g.full_left is not None else g.left
+    full_right = g.full_right if g.full_right is not None else g.right
+    full_labels = _group_labels(frame, nm, full_rows)
+    if full_labels is None:
+        full_labels = np.full(
+            full_left.size,
+            GLOBAL_GROUP,
+            dtype=object,
+        )
+    for _typed, full_positions in _group_positions(full_labels):
+        finite = (
+            np.isfinite(full_left[full_positions])
+            & np.isfinite(full_right[full_positions])
+        )
+        usable = finite & (full_right[full_positions] != 0.0)
+        if np.count_nonzero(usable) < int(cfg.min_proportional_points):
+            # Fit viability is a full-population property: a coreset that omits a zero-only
+            # declared group cannot make that group coefficient-bearing.
+            return None
+
     if keys and all(key in frame.row_context for key in keys):
         if len(keys) == 1:
             labels = _typed_object_array(
@@ -1672,15 +1828,13 @@ def _fit_proportional(g, frame, nm, cfg):
         finite = np.isfinite(left) & np.isfinite(right)
         usable = finite & (right != 0.0)
         usable_positions = local_positions[usable]
-        zero_predictor_positions = local_positions[
-            finite & ~usable
+        zero_predictor_violations = local_positions[
+            finite & (right == 0.0) & (left != 0.0)
         ]
         if usable_positions.size < int(cfg.min_proportional_points):
-            if usable_positions.size:
-                return None
-            coefficient_by_point[zero_predictor_positions] = 0.0
-            evaluation_mask[zero_predictor_positions] = True
-            continue
+            # A group containing only x == 0 rows does not identify a coefficient. In particular,
+            # an all-(0, 0) group cannot manufacture a vacuous perfect proportional law.
+            return None
         rng = np.random.default_rng(int(cfg.seed) + group_index)
         shuffled = rng.permutation(usable_positions)
         n_eval = max(1, int(round(float(cfg.parameter_holdout_frac) * shuffled.size)))
@@ -1712,7 +1866,7 @@ def _fit_proportional(g, frame, nm, cfg):
         coefficients[typed] = coefficient
         coefficient_by_point[local_positions] = coefficient
         evaluation_mask[eval_positions] = True
-        evaluation_mask[zero_predictor_positions] = True
+        evaluation_mask[zero_predictor_violations] = True
     if not coefficients or not np.any(evaluation_mask):
         return None
     return (

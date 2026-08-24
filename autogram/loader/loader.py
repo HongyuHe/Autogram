@@ -217,7 +217,28 @@ def _is_missing_scalar(value) -> bool:
     return isinstance(missing, (bool, np.bool_)) and bool(missing)
 
 
-def _declared_boolean_columns(nm: NameModel) -> set:
+def _grounded_boolean_columns(nm: NameModel) -> dict[str, tuple[str, ...]]:
+    """Resolve binder-scoped Boolean roles to their concrete runtime columns."""
+    adapter = nm.adapter
+    grounded = {}
+    for binder in getattr(adapter, "binders", ()):
+        roles = tuple(getattr(adapter, "boolean_roles", {}).get(binder, ()))
+        columns = []
+        seen = set()
+        for binding in adapter.enumerate_bindings(binder, nm):
+            for role in roles:
+                column = adapter.resolve_ref(role, binder, binding, nm)
+                if column is not None and column not in seen:
+                    seen.add(column)
+                    columns.append(column)
+        grounded[binder] = tuple(columns)
+    return grounded
+
+
+def _declared_boolean_columns(
+    nm: NameModel,
+    grounded: dict[str, tuple[str, ...]] | None = None,
+) -> set:
     """Resolve schema-declared Boolean conditions and ref roles to columns."""
     adapter = nm.adapter
     declared = {
@@ -228,15 +249,12 @@ def _declared_boolean_columns(nm: NameModel) -> set:
         if values
         and all(isinstance(value, (bool, np.bool_)) for value in values)
     }
-    for binder in getattr(adapter, "binders", ()):
-        roles = tuple(getattr(adapter, "boolean_roles", {}).get(binder, ()))
-        if not roles:
-            continue
-        for binding in adapter.enumerate_bindings(binder, nm):
-            for role in roles:
-                column = adapter.resolve_ref(role, binder, binding, nm)
-                if column is not None:
-                    declared.add(column)
+    for columns in (
+        grounded
+        if grounded is not None
+        else _grounded_boolean_columns(nm)
+    ).values():
+        declared.update(columns)
     return declared
 
 
@@ -306,14 +324,24 @@ def build_dataset(columns, matrix: np.ndarray, adapter, name: str,
     metadata_columns = tuple(
         getattr(adapter, "metadata_columns", ()) or ()
     )
+    grounded_boolean_columns = _grounded_boolean_columns(nm)
+    category_case_columns = tuple(
+        column
+        for binder in getattr(adapter, "binders", ())
+        for column in grounded_boolean_columns.get(binder, ())
+    )
     context_order = tuple(dict.fromkeys((
         time_index,
         *group_keys,
         *condition_columns,
+        *category_case_columns,
         *metadata_columns,
     )))
     context_columns = set(context_order) - {""}
-    declared_boolean_columns = _declared_boolean_columns(nm)
+    declared_boolean_columns = _declared_boolean_columns(
+        nm,
+        grounded_boolean_columns,
+    )
     ordered = [
         column
         for column in (list(nm.low_cols) + list(nm.high_cols))
@@ -378,12 +406,22 @@ def load_dataframe(df, adapter, name: str, timestamps=None) -> Dataset:
     """Build a :class:`Dataset` from an in-memory DataFrame via a compiled adapter codec."""
     columns = list(df.columns)
     nm = NameModel.from_columns_with_adapter(columns, adapter)
-    declared_boolean_columns = _declared_boolean_columns(nm)
+    grounded_boolean_columns = _grounded_boolean_columns(nm)
+    category_case_columns = {
+        column
+        for columns in grounded_boolean_columns.values()
+        for column in columns
+    }
+    declared_boolean_columns = _declared_boolean_columns(
+        nm,
+        grounded_boolean_columns,
+    )
     metadata = {
         adapter.time_index,
         *adapter.group_keys,
         *adapter.condition_columns,
         *adapter.metadata_columns,
+        *category_case_columns,
     } - {""}
     ordered = [
         c for c in (list(nm.low_cols) + list(nm.high_cols))

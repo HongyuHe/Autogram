@@ -55,6 +55,9 @@ class Grammar:
     max_conditioned_rules: int = 0
     band_enabled: bool = False
     legacy_compat: bool = False
+    # Concrete Boolean columns grounded per binder for categorical priority cases. They are
+    # intentionally separate from condition_columns, which alone controls conditioned expansion.
+    category_case_columns: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
 
     def refs_for(self, binder: str) -> Tuple[str, ...]:
         return tuple(self.ref_roles.get(binder, ()))
@@ -67,6 +70,9 @@ class Grammar:
 
     def booleans_for(self, binder: str) -> Tuple[str, ...]:
         return tuple(self.boolean_roles.get(binder, ()))
+
+    def category_cases_for(self, binder: str) -> Tuple[str, ...]:
+        return tuple(self.category_case_columns.get(binder, ()))
 
     def boolean_related_for(self, binder: str) -> Tuple[str, ...]:
         return tuple(self.boolean_related_roles.get(binder, ()))

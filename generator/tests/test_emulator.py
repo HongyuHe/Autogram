@@ -12,7 +12,9 @@ or from inside ``generator/``::
 from __future__ import annotations
 
 import copy
+
 import numpy as np
+import pandas as pd
 import pytest
 
 from gtib_emulator.config import load_config
@@ -41,6 +43,138 @@ def test_hard_invariants_pass(result):
     results = check_all(cfg, result.records, result.events)
     hard_failures = [r for r in results if r.tier == "hard" and not r.passed]
     assert not hard_failures, [f"{r.name}: {r.detail}" for r in hard_failures]
+
+
+@pytest.mark.parametrize(
+    ("corruption", "detail"),
+    (
+        ("row_count", "rows="),
+        ("minute_order", "minute_index"),
+        ("timestamp_cadence", "timestamps"),
+        ("timestamp_malformed", "timestamps"),
+        ("consumer_identity", "consumer_id"),
+    ),
+)
+def test_hard_checks_reject_malformed_derived_identity_grid(
+    result,
+    corruption,
+    detail,
+):
+    records = [
+        {
+            **record,
+            "frame": record["frame"].copy(),
+        }
+        for record in result.records
+    ]
+    frame = records[0]["frame"]
+    if corruption == "row_count":
+        records[0]["frame"] = frame.iloc[:-1].copy()
+    elif corruption == "minute_order":
+        minute = frame.columns.get_loc("minute_index")
+        frame.iloc[[0, 1], minute] = [1, 0]
+    elif corruption == "timestamp_cadence":
+        frame.loc[frame.index[1], "timestamp"] += np.timedelta64(1, "s")
+    elif corruption == "timestamp_malformed":
+        frame["timestamp"] = frame["timestamp"].astype(object)
+        frame.loc[frame.index[1], "timestamp"] = "not-a-timestamp"
+    else:
+        frame["consumer_id"] = frame["consumer_id"].astype(object)
+        frame.loc[frame.index[1], "consumer_id"] = None
+
+    checks = check_all(result.config, records, result.events)
+    grid = next(
+        check
+        for check in checks
+        if check.name == "derived_identity_grid"
+    )
+
+    assert not grid.passed
+    assert detail in grid.detail
+
+
+def test_hard_checks_reject_duplicate_generated_consumer(result):
+    records = list(result.records)
+    records[1] = copy.deepcopy(records[0])
+
+    checks = check_all(result.config, records, result.events)
+    grid = next(
+        check
+        for check in checks
+        if check.name == "derived_identity_grid"
+    )
+
+    assert not grid.passed
+    assert "duplicate consumer_id" in grid.detail
+    assert "duplicate global (consumer_id, minute_index)" in grid.detail
+
+
+def test_hard_checks_reject_missing_generated_consumer(result):
+    records = list(result.records[:-1])
+
+    checks = check_all(result.config, records, result.events)
+    grid = next(
+        check
+        for check in checks
+        if check.name == "derived_identity_grid"
+    )
+
+    assert not grid.passed
+    assert "unique consumer identities=" in grid.detail
+
+
+@pytest.mark.parametrize(
+    "missing_identity",
+    (
+        None,
+        pd.NA,
+        ("region", ("consumer", pd.NA)),
+    ),
+)
+def test_hard_checks_reject_missing_consumer_identity(
+    result,
+    missing_identity,
+):
+    records = list(result.records)
+    records[0] = copy.deepcopy(records[0])
+    records[0]["consumer"].consumer_id = missing_identity
+
+    checks = check_all(result.config, records, result.events)
+    grid = next(
+        check
+        for check in checks
+        if check.name == "derived_identity_grid"
+    )
+
+    assert not grid.passed
+    assert "missing or invalid consumer_id" in grid.detail
+
+
+def test_derived_identity_grid_preserves_nested_typed_consumers(result):
+    records = copy.deepcopy(result.records)
+    identities = (
+        ("region", ("consumer", True)),
+        ("region", ("consumer", 1)),
+        ("region", ("consumer", "1")),
+        ("region", ("consumer", 1.0)),
+    )
+    for record, identity in zip(records, identities):
+        record["consumer"].consumer_id = identity
+        frame = record["frame"]
+        frame["consumer_id"] = pd.Series(
+            [identity] * len(frame),
+            index=frame.index,
+            dtype=object,
+        )
+
+    checks = check_all(result.config, records, result.events)
+    grid = next(
+        check
+        for check in checks
+        if check.name == "derived_identity_grid"
+    )
+
+    assert grid.passed, grid.detail
 
 
 def test_hard_checks_detect_corrupted_static_alert(result):
@@ -110,6 +244,60 @@ def test_hard_checks_reject_unflagged_infinite_counter(result):
     records[0]["obs"].input_counted[0, 0] = np.inf
     records[0]["obs"].missing_flag[0, 0] = False
     records[0]["obs"].active_flag[0, 0] = True
+
+    checks = check_all(result.config, records, result.events)
+    finite = next(
+        check
+        for check in checks
+        if check.name == "reported_telemetry_is_finite"
+    )
+
+    assert not finite.passed
+
+
+def test_hard_checks_reject_infinite_derived_value(result):
+    records = [
+        {
+            **record,
+            "frame": record["frame"].copy(),
+        }
+        for record in result.records
+    ]
+    records[0]["frame"].loc[
+        records[0]["frame"].index[1],
+        "input_rate_bytes_per_min",
+    ] = np.inf
+
+    checks = check_all(result.config, records, result.events)
+    finite = next(
+        check
+        for check in checks
+        if check.name == "reported_telemetry_is_finite"
+    )
+
+    assert not finite.passed
+
+
+@pytest.mark.parametrize(
+    ("missing", "active", "value"),
+    (
+        (True, True, 0.0),
+        (False, False, 0.0),
+        (True, True, np.inf),
+        (False, True, np.nan),
+    ),
+)
+def test_hard_checks_enforce_counter_missingness_and_finiteness(
+    result,
+    missing,
+    active,
+    value,
+):
+    records = copy.deepcopy(result.records)
+    obs = records[0]["obs"]
+    obs.missing_flag[0, 0] = missing
+    obs.active_flag[0, 0] = active
+    obs.input_counted[0, 0] = value
 
     checks = check_all(result.config, records, result.events)
     finite = next(

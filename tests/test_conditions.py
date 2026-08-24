@@ -10,7 +10,8 @@ import pandas as pd
 import pytest
 
 from autogram.config import DiscoveryConfig
-from autogram.discovery.evaluate import DataOnlyEvaluator
+from autogram.discovery.archive import ParetoArchive
+from autogram.discovery.evaluate import DataOnlyEvaluator, Evaluation
 from autogram.discovery import synth, validate as validation
 from autogram.discovery.known import KnownInvariant, _signature, recover_known, shapes_for_invariant
 from autogram.discovery.loop import build_dataframe_grammar
@@ -28,7 +29,7 @@ from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
 from autogram.loader.gtib import profile_dataframe
 from autogram.logic.solver import is_trivial
-from autogram.logic.solver import equivalent
+from autogram.logic.solver import equivalent, subsumes
 from autogram.schema.spec import (
     CellCodec,
     ColumnPattern,
@@ -186,6 +187,82 @@ def test_structured_rule_signatures_do_not_collide_on_condition_text():
         ),
     )
     assert category_a.signature() != category_b.signature()
+
+
+def test_category_solver_and_archive_use_typed_structural_identity():
+    first = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (
+                ("a", True),
+                ("b", 1),
+                ("a->true, b", True),
+            ),
+            "default",
+        ),
+    )
+    second = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (
+                ("a->true, b", 1),
+                ("a", True),
+                ("b", True),
+            ),
+            "default",
+        ),
+    )
+    assert first.unparse() == second.unparse()
+    assert first.signature() != second.signature()
+    assert not equivalent(first, second)
+    assert not subsumes(first, second)
+    assert not subsumes(second, first)
+
+    typed_true = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (("flag", True),),
+            False,
+        ),
+    )
+    typed_one = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (("flag", 1),),
+            0,
+        ),
+    )
+    assert not equivalent(typed_true, typed_one)
+    assert not subsumes(typed_true, typed_one)
+    assert not subsumes(typed_one, typed_true)
+
+    def evaluation(rule):
+        return Evaluation(
+            rule=rule,
+            accepted=True,
+            reason="test",
+            eps=0.0,
+            hold_rate=1.0,
+            hold_rate_lo=0.99,
+            hold_rate_hi=1.0,
+            statistic="hold_rate",
+            support=1.0,
+            n_points=100,
+            n_bindings=1,
+            mdl_gain=1.0,
+            strictness="definition",
+            descriptor=("record", 3),
+        )
+
+    archive = ParetoArchive()
+    assert archive.add(evaluation(first))
+    assert archive.add(evaluation(second))
+    assert len(archive.portfolio(non_redundant=False)) == 2
+    assert len(archive.portfolio(non_redundant=True)) == 2
 
 
 def test_condition_masks_are_cached_per_frame():

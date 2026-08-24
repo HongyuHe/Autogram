@@ -846,19 +846,15 @@ class EnumerationProposer:
         if binder != "record" and "record" in self.G.binders:
             return
 
-        conditions = self.G.condition_columns
-        bool_columns = [
-            column
-            for column, values in conditions.items()
-            if typed_binary_domain(values)
-        ]
+        target_columns = self.G.condition_columns
+        bool_columns = list(self.G.category_cases_for(binder))
         category_columns = [
             column
-            for column, values in conditions.items()
+            for column, values in target_columns.items()
             if values and not typed_binary_domain(values)
         ]
         for target_column in category_columns:
-            target_values = typed_unique(conditions[target_column])
+            target_values = typed_unique(target_columns[target_column])
             for default in target_values:
                 default_key = typed_group_key(default)
                 labels = tuple(

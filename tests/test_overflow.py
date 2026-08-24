@@ -510,6 +510,52 @@ def test_conditioned_fit_overflow_keeps_full_frame_support_denominator():
     assert result.support == pytest.approx(0.099)
 
 
+def test_conditioned_proportional_combines_neutral_and_overflow_support_exclusions():
+    n = 1000
+    selected = np.arange(n) < 21
+    x = np.ones(n)
+    y = np.ones(n)
+    y[selected] = 1e308
+    x[19] = 0.0
+    y[19] = 0.0
+    x[20] = 10.0
+    y[20] = 1e308
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "x": x,
+            "y": y,
+            "label": np.where(selected, "selected", "other"),
+        }),
+        condition_columns=("label",),
+        proportional=True,
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="conditioned_proportional_combined_exclusions",
+    )
+    rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~\u221d", A.Ref("x")),
+        condition=A.Condition("label", "==", ("selected",)),
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.05,
+            hold_rate_threshold=0.1,
+            band_mode="global",
+            seed=1,
+            max_overflow_fraction=0.05,
+        ),
+    ).evaluate(rule)
+
+    assert not result.accepted
+    assert "condition support below minimum after proportional exclusions" in result.reason
+    assert "19 source rows" in result.reason
+
+
 def test_tolerated_band_overflow_group_still_fails_group_gate():
     frame = profile_dataframe(
         pd.DataFrame({
@@ -861,6 +907,49 @@ def test_tolerated_post_fit_overflow_still_shrinks_reported_support():
         break
     else:                                                   # pragma: no cover - fixture guard
         raise AssertionError("no seed placed the overflowing row in the evaluation split")
+
+
+@pytest.mark.parametrize(
+    ("subsample", "expected_n_points"),
+    (
+        (0, (239, 240)),
+        (100, (29, 30)),
+        (500, (149, 150)),
+        (1000, (239, 240)),
+    ),
+)
+def test_tolerated_proportional_overflow_and_neutral_rows_share_support_exclusions(
+    subsample,
+    expected_n_points,
+):
+    n = 1000
+    x = np.ones(n)
+    y = np.full(n, 1e308)
+    x[800:999] = 0.0
+    y[800:999] = 0.0
+    x[999] = 10.0
+    dataset = _dataset(
+        pd.DataFrame({"x": x, "y": y}),
+        "proportional_neutral_overflow_support",
+    )
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.05,
+            hold_rate_threshold=0.62,
+            band_mode="global",
+            seed=0,
+            subsample=subsample,
+            max_overflow_fraction=0.01,
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~\u221d", A.Ref("x")),
+    ))
+
+    assert result.accepted
+    assert result.support == pytest.approx(0.8)
+    assert result.n_points in expected_n_points
 
 
 def test_reported_group_keys_survive_labels_that_stringify_alike():

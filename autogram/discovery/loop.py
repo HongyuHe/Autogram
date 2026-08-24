@@ -86,10 +86,36 @@ def _runtime_column_roles(ds: Dataset, G: Grammar) -> tuple[tuple[object, ...], 
     return tuple(pairs)
 
 
+def _runtime_category_case_columns(
+    G: Grammar,
+    column_roles: tuple[tuple[object, ...], ...],
+) -> dict[str, tuple[str, ...]]:
+    columns_by_binder = {}
+    for binder in G.binders:
+        boolean_roles = set(G.booleans_for(binder))
+        columns = []
+        seen = set()
+        for mapped_binder, column, role in column_roles:
+            if mapped_binder != binder or role not in boolean_roles:
+                continue
+            key = typed_group_key(column)
+            if key in seen:
+                continue
+            seen.add(key)
+            columns.append(column)
+        columns_by_binder[binder] = tuple(columns)
+    return columns_by_binder
+
+
 def _attach_runtime_column_roles(ds: Dataset, G: Grammar) -> Grammar:
+    column_roles = _runtime_column_roles(ds, G)
     return replace(
         G,
-        column_roles=_runtime_column_roles(ds, G),
+        column_roles=column_roles,
+        category_case_columns=_runtime_category_case_columns(
+            G,
+            column_roles,
+        ),
     )
 
 

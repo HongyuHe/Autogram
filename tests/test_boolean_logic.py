@@ -995,14 +995,25 @@ def test_categorical_priority_map_is_evaluated_and_enumerated():
     label[is_artifact] = "artifact"
     label[is_benign] = "benign_burst"
     label[is_true_loss] = "true_loss"
-    frame = _profile(pd.DataFrame({
-        "timestamp": pd.date_range("2026-01-01", periods=n, freq="1min"),
-        "series_id": "a",
-        "is_true_loss": is_true_loss,
-        "is_benign_burst": is_benign,
-        "is_artifact": is_artifact,
-        "label": label,
-    }))
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "timestamp": pd.date_range("2026-01-01", periods=n, freq="1min"),
+            "series_id": "a",
+            "archetype": np.where(np.arange(n) % 2, "bursty", "steady"),
+            "is_true_loss": is_true_loss,
+            "is_benign_burst": is_benign,
+            "is_artifact": is_artifact,
+            "label": label,
+        }),
+        time_index="timestamp",
+        group_keys=("series_id",),
+        condition_columns=("archetype", "label"),
+        temporal_windows=(3, 5),
+        max_lag=5,
+        run_lengths=(3,),
+        advanced=True,
+        max_conjunction_terms=3,
+    )
     dataset, grammar = build_dataframe_grammar(frame, _base_spec(), name="category")
     rule = A.Rule(
         "record",
@@ -1017,6 +1028,30 @@ def test_categorical_priority_map_is_evaluated_and_enumerated():
         ),
     )
 
+    case_columns = {
+        "is_true_loss",
+        "is_benign_burst",
+        "is_artifact",
+    }
+    assert set(grammar.condition_columns) == {"archetype", "label"}
+    assert set(grammar.category_cases_for("record")) == case_columns
+    assert case_columns <= set(dataset.row_context)
+
+    def condition_columns(condition):
+        if condition.op == "all":
+            return set().union(*(
+                condition_columns(child)
+                for child in condition.values
+                if isinstance(child, A.Condition)
+            ))
+        return {condition.column}
+
+    enumerated_condition_columns = set().union(*(
+        condition_columns(condition)
+        for condition in EnumerationProposer(grammar)._conditions()
+    ))
+    assert enumerated_condition_columns == {"archetype", "label"}
+    assert enumerated_condition_columns.isdisjoint(case_columns)
     assert is_admissible(rule, grammar)[0] is True
     result = DataOnlyEvaluator(
         dataset,
@@ -1143,15 +1178,15 @@ def test_categorical_enumeration_is_boolean_column_rename_invariant():
             ref_roles={"record": ()},
             fam_roles={"record": ()},
             condition_columns={
-                first_flag: (False, True),
-                "flag_b": (False, True),
-                "flag_c": (False, True),
                 "category": (
                     "baseline",
                     "class_a",
                     "class_b",
                     "class_c",
                 ),
+            },
+            category_case_columns={
+                "record": (first_flag, "flag_b", "flag_c"),
             },
             advanced_enabled=True,
         )
@@ -1165,6 +1200,40 @@ def test_categorical_enumeration_is_boolean_column_rename_invariant():
 
     assert lexical == neutral
     assert neutral > 0
+
+
+def test_categorical_case_columns_are_binder_scoped():
+    grammar = Grammar(
+        binders=("left", "right"),
+        ops=("~=", "=="),
+        ref_roles={"left": (), "right": ()},
+        fam_roles={"left": (), "right": ()},
+        condition_columns={"label": ("cold", "hot")},
+        category_case_columns={
+            "left": ("left_flag",),
+            "right": ("right_flag",),
+        },
+        advanced_enabled=True,
+    )
+    left_rule = A.Rule(
+        "left",
+        A.CategoryDefinition(
+            "label",
+            (("left_flag", "hot"),),
+            "cold",
+        ),
+    )
+    cross_binder_rule = A.Rule(
+        "left",
+        A.CategoryDefinition(
+            "label",
+            (("right_flag", "hot"),),
+            "cold",
+        ),
+    )
+
+    assert is_admissible(left_rule, grammar)[0]
+    assert not is_admissible(cross_binder_rule, grammar)[0]
 
 
 def test_boolean_refs_are_excluded_from_numeric_search():

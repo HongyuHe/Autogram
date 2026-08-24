@@ -345,6 +345,21 @@ def test_definition_null_accepts_no_advanced_definitions():
         inducer=_SyntheticInducer(),
     )
     assert suite.definition_null is not None
+    case_columns = {
+        name
+        for name, values in suite.definition_null.ds.row_context.items()
+        if np.asarray(values).dtype.kind == "b"
+    }
+    assert set(
+        suite.definition_null.G.category_cases_for("node")
+    ) == case_columns
+    assert case_columns.isdisjoint(
+        suite.definition_null.G.condition_columns
+    )
+    assert any(
+        isinstance(rule.atom, A.CategoryDefinition)
+        for rule in suite.definition_null.proposer.propose()
+    )
     assert null_definitions_at(
         suite.definition_null,
         DiscoveryConfig(
@@ -506,6 +521,17 @@ def test_joint_grid_scores_new_proxy_compactly_and_safely(shape):
         seed=0,
         inducer=_SyntheticInducer(),
     )
+    if shape == "categorical":
+        proxy = suite.positives[0]
+        target, cases, _default = next(iter(proxy.planted["categorical"]))
+        case_columns = {column for column, _value in cases}
+        assert set(proxy.G.category_cases_for("node")) == case_columns
+        assert target in proxy.G.condition_columns
+        assert case_columns.isdisjoint(proxy.G.condition_columns)
+        assert any(
+            rule.signature() == _rule("categorical").signature()
+            for rule in proxy.proposer.propose()
+        )
     candidate = evaluate_grid_candidate(
         suite,
         tolerance=0.05,
@@ -516,6 +542,8 @@ def test_joint_grid_scores_new_proxy_compactly_and_safely(shape):
     outcome = candidate.proxies[0]
 
     assert outcome.recovery >= 0.8, candidate.evidence()
+    if shape == "categorical":
+        assert outcome.recovery == 1.0
     assert outcome.compact, candidate.evidence()
     assert candidate.null_equalities == 0
     assert candidate.null_temporal == 0
