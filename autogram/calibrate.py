@@ -2029,7 +2029,7 @@ def _prepare_runtime_tier_specs(
     ))
 
 
-_RUNTIME_TIER_PROVENANCE_FIELDS = {
+_RUNTIME_TIER_NON_SEARCH_FIELDS = {
     "name",
     "notes",
     "aggregations_widened",
@@ -2039,11 +2039,31 @@ _RUNTIME_TIER_PROVENANCE_FIELDS = {
     "proportional_widened",
 }
 
+_RUNTIME_TIER_ONTOLOGY_NON_SEARCH_FIELDS = {
+    "ref_glyphs",
+    "fam_glyphs",
+}
+
+_RUNTIME_TIER_PATTERN_NON_SEARCH_FIELDS = {
+    "name",
+}
+
 
 def _runtime_tier_identity(spec) -> str:
+    """Hash only fields that can change enumeration, grounding, or evaluation."""
     payload = _spec_to_json(spec)
-    for key in _RUNTIME_TIER_PROVENANCE_FIELDS:
+    for key in _RUNTIME_TIER_NON_SEARCH_FIELDS:
         payload.pop(key, None)
+    for key in _RUNTIME_TIER_ONTOLOGY_NON_SEARCH_FIELDS:
+        payload["ontology"].pop(key, None)
+    payload["patterns"] = [
+        {
+            key: value
+            for key, value in pattern.items()
+            if key not in _RUNTIME_TIER_PATTERN_NON_SEARCH_FIELDS
+        }
+        for pattern in payload["patterns"]
+    ]
     return _json_fingerprint(payload)
 
 

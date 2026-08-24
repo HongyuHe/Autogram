@@ -14,13 +14,14 @@ from autogram.config import DiscoveryConfig, SearchConfig
 from autogram.calibrate import (
     CalibrationConfig, _capability_tiers, _derive_regime, _distinct_runtime_tiers,
     _knob_schedule, _merge_specs,
-    _reachable_capability_tiers, _split_known,
+    _reachable_capability_tiers, _runtime_tier_identity, _split_known,
     _make_calibration_inducer, _spec_summary, _widen_spec, calibrate,
 )
 from autogram.discovery.known import KnownInvariant, load_known
 from autogram.discovery.known import _signature as _known_signature
 from autogram.discovery.induce import SchemaInducer
 from autogram.discovery.loop import build_dataframe_grammar
+from autogram.discovery.propose import EnumerationProposer
 from autogram.discovery.regime import ProxyEntry, RegimeSpec
 from autogram.loader.gtib import profile_dataframe
 from autogram.loader.loader import build_dataset
@@ -291,12 +292,58 @@ def test_profiled_conditions_apply_at_tier_zero(
     assert specs[0].conditional_enabled
 
 
-def test_distinct_runtime_tiers_drop_only_provenance_duplicates():
+def test_runtime_tier_identity_ignores_glyphs_without_changing_candidates():
+    base = _sum_witness_spec(include_family=True)
+    glyph_only = replace(
+        base,
+        ontology=replace(
+            base.ontology,
+            ref_glyphs={"total": "T", "unused_ref": "R"},
+            fam_glyphs={"parts": "P", "unused_fam": "F"},
+        ),
+    )
+    frame = pd.DataFrame({
+        column: [1.0, 2.0]
+        for column in ("total", "a", "x", "y", "q")
+    })
+    search_cfg = SearchConfig(
+        max_complexity=6,
+        max_add_arity=2,
+    )
+
+    assert _runtime_tier_identity(base) == _runtime_tier_identity(
+        glyph_only
+    )
+    _, base_grammar = build_dataframe_grammar(
+        frame,
+        base,
+        search_cfg=search_cfg,
+    )
+    _, glyph_grammar = build_dataframe_grammar(
+        frame,
+        glyph_only,
+        search_cfg=search_cfg,
+    )
+    assert {
+        rule.signature()
+        for rule in EnumerationProposer(base_grammar).propose()
+    } == {
+        rule.signature()
+        for rule in EnumerationProposer(glyph_grammar).propose()
+    }
+
+
+def test_distinct_runtime_tiers_drop_only_presentation_and_provenance_duplicates():
     base = _mini_spec()
     provenance_duplicate = replace(
         base,
         name="fresh-name",
         notes="fresh notes",
+        ontology=replace(
+            base.ontology,
+            ref_glyphs={"a": "A"},
+            fam_glyphs={"fam": "F"},
+        ),
         aggregations_widened=True,
         degree_widened=True,
     )
@@ -1205,7 +1252,7 @@ def test_calibrate_applies_max_iterations_globally_across_tiers(
     assert report["grammar_reinductions"] == 0
 
 
-def test_calibrate_budgets_distinct_runtime_tiers_after_deduplication(
+def test_calibrate_budget_ignores_glyph_only_reinduction_and_reaches_tier2(
     monkeypatch,
     tmp_path,
 ):
@@ -1232,7 +1279,20 @@ def test_calibrate_budgets_distinct_runtime_tiers_after_deduplication(
 
     def counted_induction(_columns, _inducer, *_args, **_kwargs):
         induction_calls.append(True)
-        return _mini_spec()
+        serial = len(induction_calls)
+        spec = _mini_spec()
+        return replace(
+            spec,
+            ontology=replace(
+                spec.ontology,
+                ref_glyphs={
+                    f"unused_ref_{serial}": f"R{serial}",
+                },
+                fam_glyphs={
+                    f"unused_fam_{serial}": f"F{serial}",
+                },
+            ),
+        )
 
     monkeypatch.setattr(
         calibration,

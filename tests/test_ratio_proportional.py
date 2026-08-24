@@ -495,6 +495,190 @@ def test_proportional_subsampling_is_neutral_aware_per_group():
     }
 
 
+def test_grouped_proportional_subsampling_falls_back_below_group_minimum():
+    n_groups = 10
+    rows_per_group = 100
+    group = np.repeat(
+        [f"group-{index}" for index in range(n_groups)],
+        rows_per_group,
+    )
+    x = np.tile(np.arange(1.0, rows_per_group + 1.0), n_groups)
+    coefficient = np.repeat(
+        np.arange(1.0, n_groups + 1.0),
+        rows_per_group,
+    )
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "group_id": group,
+            "x": x,
+            "y": coefficient * x,
+        }),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="proportional_grouped_minimum_fallback",
+    )
+    rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+    )
+
+    for subsample in range(10, 80):
+        result = DataOnlyEvaluator(
+            dataset,
+            DiscoveryConfig(
+                tolerance=1e-9,
+                hold_rate_threshold=0.62,
+                band_mode="global",
+                seed=0,
+                subsample=subsample,
+            ),
+        ).evaluate(rule)
+
+        assert result.accepted, (subsample, result.reason)
+        assert result.n_points == 300
+        assert result.support == 1.0
+        assert len(result.parameters["coefficients"]) == n_groups
+
+
+@pytest.mark.parametrize(
+    ("minimum", "subsample"),
+    ((1, 2), (2, 4)),
+)
+def test_grouped_proportional_small_quota_matches_unsampled(
+    minimum,
+    subsample,
+):
+    group = np.repeat(["a", "b"], 24)
+    x = np.tile(np.arange(1.0, 25.0), 2)
+    y = np.where(group == "a", 2.0 * x, 3.0 * x)
+    frame = profile_dataframe(
+        pd.DataFrame({"group_id": group, "x": x, "y": y}),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name=f"proportional_small_quota_{minimum}",
+    )
+    rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+    )
+
+    def evaluate(cap):
+        return DataOnlyEvaluator(
+            dataset,
+            DiscoveryConfig(
+                tolerance=1e-9,
+                hold_rate_threshold=0.62,
+                band_mode="global",
+                seed=0,
+                subsample=cap,
+                min_proportional_points=minimum,
+            ),
+        ).evaluate(rule)
+
+    unsampled = evaluate(0)
+    sampled = evaluate(subsample)
+
+    assert unsampled.accepted
+    assert sampled.accepted == unsampled.accepted
+    assert sampled.n_points == unsampled.n_points
+    assert sampled.hold_rate == unsampled.hold_rate
+    assert sampled.support == unsampled.support
+    assert (
+        sampled.parameters["coefficients"]
+        == unsampled.parameters["coefficients"]
+        == {"a": 2.0, "b": 3.0}
+    )
+
+
+def test_grouped_proportional_subsample_reserves_typed_groups_and_violations():
+    from autogram.discovery.evaluate import _proportional_subsample
+    from autogram.dsl.evaluate import ground, typed_group_key
+
+    rows_per_group = 105
+    labels = np.empty(2 * rows_per_group, dtype=object)
+    labels[:rows_per_group] = True
+    labels[rows_per_group:] = 1
+    group_x = np.concatenate((
+        np.arange(1.0, 101.0),
+        np.zeros(5),
+    ))
+    x = np.tile(group_x, 2)
+    y = np.concatenate((
+        2.0 * group_x,
+        3.0 * group_x,
+    ))
+    y[100:105] = 1.0
+    y[205:210] = 1.0
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "group_id": labels,
+            "x": x,
+            "y": y,
+        }),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="proportional_grouped_reserved_evidence",
+    )
+    rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+    )
+    config = DiscoveryConfig(
+        tolerance=1e-9,
+        hold_rate_threshold=0.1,
+        band_mode="global",
+        seed=4,
+        subsample=26,
+    )
+    grounded = ground(
+        rule,
+        dataset.observed,
+        dataset.name_model,
+        subsample=config.subsample,
+        seed=config.seed,
+    )
+
+    sampled = _proportional_subsample(
+        grounded,
+        dataset.observed,
+        dataset.name_model,
+        config,
+    )
+    repeated = _proportional_subsample(
+        grounded,
+        dataset.observed,
+        dataset.name_model,
+        config,
+    )
+
+    assert sampled.n_points == config.subsample
+    assert np.array_equal(sampled.row_indices, repeated.row_indices)
+    selected_labels = [
+        typed_group_key(label)
+        for label in labels[sampled.row_indices].tolist()
+    ]
+    assert len(set(selected_labels)) == 2
+    for group_key in set(selected_labels):
+        positions = np.asarray(
+            [key == group_key for key in selected_labels],
+            dtype=bool,
+        )
+        assert np.count_nonzero(sampled.right[positions] != 0.0) == 8
+        assert np.count_nonzero(
+            (sampled.right[positions] == 0.0)
+            & (sampled.left[positions] != 0.0)
+        ) == 5
+
+
 def test_proportional_subsampling_keeps_zero_predictor_violations():
     x = np.concatenate((
         np.zeros(9900),
