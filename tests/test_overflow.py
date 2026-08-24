@@ -723,6 +723,54 @@ def test_proportional_overflow_is_caught_even_when_the_subsample_misses_it():
     assert "overflow" in result.reason
 
 
+def test_grouped_proportional_fallback_keeps_full_overflow_guard():
+    n_groups = 10
+    rows_per_group = 100
+    group = np.repeat(
+        [f"group-{index}" for index in range(n_groups)],
+        rows_per_group,
+    )
+    x = np.ones(n_groups * rows_per_group)
+    coefficients = np.repeat(
+        np.arange(1.0, n_groups + 1.0),
+        rows_per_group,
+    )
+    coefficients[:rows_per_group] = 1e308
+    y = coefficients * x
+    x[50] = 10.0
+    y[50] = 1e308
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "group_id": group,
+            "x": x,
+            "y": y,
+        }),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="grouped_proportional_subsample_overflow",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.05,
+            hold_rate_threshold=0.62,
+            band_mode="global",
+            seed=0,
+            subsample=79,
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+    ))
+
+    assert not result.accepted
+    assert "overflow" in result.reason
+
+
 def test_base_and_post_fit_overflow_share_one_cap():
     """Round-30 review: two disjoint sub-cap overflows must not pass a single cap between them."""
     n = 100
