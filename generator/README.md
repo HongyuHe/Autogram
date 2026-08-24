@@ -116,12 +116,14 @@ These follow directly from the generation process and are the executable contrac
 3. **Monotone true loss.** Cumulative true loss only ever increases: `cum_lost_bytes` is non-decreasing.
 4. **Monotone counters between resets.** Observed counters are non-decreasing except at flagged `reset_flag` steps (task restarts).
 5. **Non-negative rates.** Derived `input_rate` and `output_rate` are ≥ 0.
+6. **Exact generated derived grid.** The generator emits exactly `n_consumers` distinct, non-missing typed consumer identities and `n_consumers × n_minutes` derived rows. Within every consumer record, `minute_index` is exactly `0..n_minutes-1` in row order, `timestamp == start_timestamp + minute_index × rate_window_seconds`, and every row carries that record's consumer identity. Across all records, each typed `(consumer_id, minute_index)` identity occurs exactly once; nested tuple identities are valid when every component is non-missing. This is a generator-output contract; the Autogram loader intentionally still accepts valid slices and gaps.
+7. **Exact counter missingness and finiteness.** A raw counter for a missing scrape or inactive shard is exactly `NaN`; an active, unflagged counter is finite. Infinity is never valid in raw or derived telemetry.
 
 **Soft invariants (statistical expectations of normal operation — checked with tolerances):**
 
-6. **Healthy band.** For steady (non-bursty) consumers during `normal` minutes, the instantaneous 1-minute completeness ratio sits in a tight band around `healthy_ratio_mean` (~0.998) and is **rarely below the alert threshold** (< ~0.1% of the time). Calm, healthy operation looks healthy.
-7. **Benign mechanisms lose no bytes.** Over a `benign_burst` or `artifact` span that does not overlap a true-loss event, cumulative true loss does not increase — the dip is a queueing/measurement effect that fully recovers. Deliberate precedence-probe overlaps are excluded from this attribution check because simultaneous true loss legitimately increases the shared counter.
-8. **True-loss events accumulate a deficit.** Over any true-loss span, cumulative true loss strictly increases — the deficit is real and (because loss is monotone) never recovers.
+8. **Healthy band.** For steady (non-bursty) consumers during `normal` minutes, the instantaneous 1-minute completeness ratio sits in a tight band around `healthy_ratio_mean` (~0.998) and is **rarely below the alert threshold** (< ~0.1% of the time). Calm, healthy operation looks healthy.
+9. **Benign mechanisms lose no bytes.** Over a `benign_burst` or `artifact` span that does not overlap a true-loss event, cumulative true loss does not increase — the dip is a queueing/measurement effect that fully recovers. Deliberate precedence-probe overlaps are excluded from this attribution check because simultaneous true loss legitimately increases the shared counter.
+10. **True-loss events accumulate a deficit.** Over any true-loss span, cumulative true loss strictly increases — the deficit is real and (because loss is monotone) never recovers.
 
 **Behavioural expectations that make the dataset useful (demonstrated, not asserted as invariants):**
 

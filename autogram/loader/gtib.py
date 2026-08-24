@@ -290,8 +290,6 @@ def _infer_rate_window_seconds(derived: pd.DataFrame) -> int:
     """Infer the timestamp step represented by one increment of ``minute_index``."""
     from ..dsl.evaluate import _datetime_ns, typed_group_key
 
-    from ..dsl.evaluate import typed_group_key
-
     times = _datetime_ns(derived["timestamp"].to_numpy())
     minutes = derived["minute_index"].to_numpy(dtype=np.int64)
     consumers = derived["consumer_id"].to_numpy(dtype=object)
@@ -340,6 +338,17 @@ def _infer_rate_window_seconds(derived: pd.DataFrame) -> int:
     return nanoseconds // 1_000_000_000
 
 
+def _identity_missing(value) -> bool:
+    """Whether a scalar or any nested tuple component is missing."""
+
+    from ..dsl.evaluate import canonical_typed_value, is_missing_scalar
+
+    value = canonical_typed_value(value)
+    if isinstance(value, tuple):
+        return any(_identity_missing(component) for component in value)
+    return is_missing_scalar(value)
+
+
 def _validated_gtib_raw(raw: pd.DataFrame) -> pd.DataFrame:
     """Copy and normalize a raw table after validating its shard-grain identity."""
     missing = sorted(_GTIB_RAW_REQUIRED_COLUMNS - set(raw.columns))
@@ -348,16 +357,8 @@ def _validated_gtib_raw(raw: pd.DataFrame) -> pd.DataFrame:
 
     from ..dsl.evaluate import (
         _datetime_ns,
-        canonical_typed_value,
-        is_missing_scalar,
         typed_group_key,
     )
-
-    def identity_missing(value) -> bool:
-        value = canonical_typed_value(value)
-        if isinstance(value, tuple):
-            return any(identity_missing(component) for component in value)
-        return is_missing_scalar(value)
 
     frame = raw.copy()
     timestamp_ns = _datetime_ns(frame["timestamp"].to_numpy())
@@ -371,9 +372,9 @@ def _validated_gtib_raw(raw: pd.DataFrame) -> pd.DataFrame:
         missing_components = []
         if int(timestamp) == nat_ns:
             missing_components.append("timestamp")
-        if identity_missing(consumer):
+        if _identity_missing(consumer):
             missing_components.append("consumer_id")
-        if identity_missing(shard):
+        if _identity_missing(shard):
             missing_components.append("shard_id")
         if missing_components:
             raise ValueError(
@@ -461,8 +462,7 @@ def prepare_gtib(
         raw_minutes,
     ):
         if (
-            consumer is None
-            or bool(pd.isna(consumer))
+            _identity_missing(consumer)
             or not isinstance(minute, (int, np.integer))
             or isinstance(minute, (bool, np.bool_))
             or int(minute) < 0

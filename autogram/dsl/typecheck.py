@@ -19,7 +19,7 @@ role table -- this is what lets genuinely new roles (invented for a fresh datase
 from __future__ import annotations
 
 from . import ast as A
-from .evaluate import typed_binary_domain, typed_group_key
+from .evaluate import typed_group_key
 
 
 def _roles_ok(term: A.Term, binder: str, G) -> bool:
@@ -313,20 +313,21 @@ def is_admissible(rule: A.Rule, G) -> tuple:
     if isinstance(atom, A.CategoryDefinition):
         if not getattr(G, "advanced_enabled", False):
             return False, "categorical definitions are not enabled"
-        columns = getattr(G, "condition_columns", {})
-        if atom.target_column not in columns:
+        target_columns = getattr(G, "condition_columns", {})
+        if atom.target_column not in target_columns:
             return False, "categorical target column is not declared"
         target_values = {
             typed_group_key(value)
-            for value in columns[atom.target_column]
+            for value in target_columns[atom.target_column]
         }
         if typed_group_key(atom.default) not in target_values:
             return False, "categorical default is not an observed target value"
         if not atom.cases:
             return False, "categorical definition needs at least one case"
+        case_columns = set(G.category_cases_for(rule.binder))
         for column, value in atom.cases:
-            if column not in columns or not typed_binary_domain(columns[column]):
-                return False, "categorical cases must use declared Boolean columns"
+            if column not in case_columns:
+                return False, "categorical cases must use binder-scoped Boolean columns"
             if typed_group_key(value) not in target_values:
                 return False, "categorical case emits an unknown target value"
         if rule.complexity() > G.complexity_cap(rule.binder):

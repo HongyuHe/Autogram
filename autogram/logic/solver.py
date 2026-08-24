@@ -7,6 +7,7 @@ from typing import Dict, Tuple
 import z3
 
 from ..dsl import ast as A
+from ..dsl.evaluate import typed_group_key
 
 
 def _leaf_key(term: A.Term) -> Tuple:
@@ -31,6 +32,28 @@ def _var_name(key: Tuple) -> str:
         str(component).encode("utf-8").hex()
         for component in key
     )
+
+
+def _category_definition_key(atom: A.CategoryDefinition) -> Tuple:
+    key = [
+        "category_definition",
+        "target",
+        atom.target_column,
+        "case_count",
+        len(atom.cases),
+    ]
+    for index, (column, value) in enumerate(atom.cases):
+        key.extend((
+            "case",
+            index,
+            column,
+            typed_group_key(value),
+        ))
+    key.extend((
+        "default",
+        typed_group_key(atom.default),
+    ))
+    return tuple(key)
 
 
 def _term_expr(term: A.Term, env: Dict[Tuple, z3.ArithRef]) -> z3.ArithRef:
@@ -74,7 +97,7 @@ def atom_expr(atom, env: Dict[Tuple, z3.ArithRef] | None = None) -> z3.BoolRef:
         target = _term_expr(atom.target, env) != 0
         return target == _predicate_expr(atom.predicate, env)
     if isinstance(atom, A.CategoryDefinition):
-        key = ("category_definition", atom.unparse())
+        key = _category_definition_key(atom)
         if key not in env:
             env[key] = z3.Bool(_var_name(key))
         return env[key]

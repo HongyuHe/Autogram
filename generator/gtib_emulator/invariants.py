@@ -42,11 +42,303 @@ def _soft(name: str, ok: bool, detail: str) -> InvariantResult:
     return InvariantResult(name, "soft", bool(ok), detail)
 
 
+def _identity_missing(value: Any) -> bool:
+    """Whether a scalar or any nested tuple component is missing."""
+
+    if isinstance(value, tuple):
+        return any(_identity_missing(component) for component in value)
+    if value is None or value is pd.NA:
+        return True
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        return bool(np.isnat(value))
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(missing, (bool, np.bool_)) and bool(missing)
+
+
+def _typed_identity_key(value: Any) -> tuple[Any, Any] | None:
+    """Return a hashable recursive identity that keeps scalar types distinct."""
+
+    if _identity_missing(value):
+        return None
+    if isinstance(value, tuple):
+        components = tuple(_typed_identity_key(item) for item in value)
+        if any(component is None for component in components):
+            return None
+        return (tuple, components)
+    if isinstance(value, np.datetime64):
+        value = pd.Timestamp(value)
+    elif isinstance(value, np.timedelta64):
+        value = pd.Timedelta(value)
+    elif isinstance(value, np.generic):
+        value = value.item()
+    if _identity_missing(value):
+        return None
+    key = (type(value), value)
+    try:
+        hash(key)
+    except (TypeError, ValueError):
+        return None
+    return key
+
+
+def _identity_equal(actual: Any, expected: Any) -> bool:
+    """Compare one generated identity with typed, missing-safe semantics."""
+
+    actual_key = _typed_identity_key(actual)
+    expected_key = _typed_identity_key(expected)
+    if actual_key is None or expected_key is None:
+        return False
+    try:
+        equal = actual_key == expected_key
+    except (TypeError, ValueError):
+        return False
+    return isinstance(equal, (bool, np.bool_)) and bool(equal)
+
+
+def _identity_mask(values: np.ndarray, expected: Any) -> np.ndarray:
+    """Rows whose typed identity equals ``expected``."""
+
+    return np.fromiter(
+        (_identity_equal(value, expected) for value in values),
+        dtype=bool,
+        count=len(values),
+    )
+
+
+def _generated_derived_grid(
+    cfg: EmulatorConfig,
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool, str]:
+    """Validate the exact per-consumer identity grid emitted by the generator."""
+
+    expected_consumers = int(cfg.scale.n_consumers)
+    expected_rows = int(
+        cfg.n_raw_steps // cfg.raw_steps_per_minute
+    )
+    expected_total_rows = expected_consumers * expected_rows
+    start_ns = int(pd.Timestamp(cfg.time.start_timestamp).value)
+    cadence_ns = int(cfg.time.rate_window_seconds) * 1_000_000_000
+    expected_timestamps = (
+        start_ns
+        + np.arange(expected_rows, dtype=np.int64) * cadence_ns
+    )
+    issues: list[str] = []
+    valid_records: list[dict[str, Any]] = []
+    total_rows = 0
+    seen_consumers: dict[tuple[Any, Any], int] = {}
+    seen_row_identities: dict[
+        tuple[tuple[Any, Any], int],
+        tuple[int, int],
+    ] = {}
+    invalid_row_identities = 0
+    duplicate_row_identities = 0
+    first_duplicate_row: tuple[
+        tuple[int, int],
+        tuple[int, int],
+        Any,
+        int,
+    ] | None = None
+
+    if len(records) != expected_consumers:
+        issues.append(
+            f"consumer records={len(records)} (expected {expected_consumers})"
+        )
+
+    for record_index, rec in enumerate(records):
+        frame = rec.get("frame") if isinstance(rec, dict) else None
+        consumer = rec.get("consumer") if isinstance(rec, dict) else None
+        consumer_id = getattr(consumer, "consumer_id", None)
+        consumer_key = _typed_identity_key(consumer_id)
+        record_ok = True
+        if consumer_key is None:
+            issues.append(
+                f"record {record_index} has missing or invalid consumer_id "
+                f"{consumer_id!r}"
+            )
+            record_ok = False
+        else:
+            previous = seen_consumers.get(consumer_key)
+            if previous is not None:
+                issues.append(
+                    f"record {record_index} has duplicate consumer_id "
+                    f"{consumer_id!r} (first seen in record {previous})"
+                )
+                record_ok = False
+            else:
+                seen_consumers[consumer_key] = record_index
+
+        if not isinstance(frame, pd.DataFrame):
+            issues.append(f"record {record_index} has no derived DataFrame")
+            continue
+
+        total_rows += len(frame)
+        if len(frame) != expected_rows:
+            issues.append(
+                f"record {record_index} rows={len(frame)} "
+                f"(expected {expected_rows})"
+            )
+            record_ok = False
+
+        missing_columns = [
+            column
+            for column in ("timestamp", "consumer_id", "minute_index")
+            if column not in frame.columns
+        ]
+        if missing_columns:
+            issues.append(
+                f"record {record_index} missing identity columns "
+                f"{missing_columns}"
+            )
+            record_ok = False
+
+        if (
+            "consumer_id" in frame.columns
+            and "minute_index" in frame.columns
+        ):
+            row_consumers = frame["consumer_id"].to_numpy(dtype=object)
+            row_minutes = frame["minute_index"].to_numpy(dtype=object)
+            for row_position, (row_consumer, minute) in enumerate(
+                zip(row_consumers, row_minutes)
+            ):
+                row_consumer_key = _typed_identity_key(row_consumer)
+                minute_ok = (
+                    isinstance(minute, (int, np.integer))
+                    and not isinstance(minute, (bool, np.bool_))
+                    and int(minute) >= 0
+                )
+                if row_consumer_key is None or not minute_ok:
+                    invalid_row_identities += 1
+                    continue
+                row_identity = (row_consumer_key, int(minute))
+                previous_row = seen_row_identities.get(row_identity)
+                if previous_row is not None:
+                    duplicate_row_identities += 1
+                    if first_duplicate_row is None:
+                        first_duplicate_row = (
+                            previous_row,
+                            (record_index, row_position),
+                            row_consumer,
+                            int(minute),
+                        )
+                else:
+                    seen_row_identities[row_identity] = (
+                        record_index,
+                        row_position,
+                    )
+
+        if len(frame) == expected_rows and "minute_index" in frame.columns:
+            minute_values = frame["minute_index"].to_numpy(dtype=object)
+            minute_ok = all(
+                isinstance(value, (int, np.integer))
+                and not isinstance(value, (bool, np.bool_))
+                and int(value) == position
+                for position, value in enumerate(minute_values)
+            )
+            if not minute_ok:
+                issues.append(
+                    f"record {record_index} minute_index is not exactly "
+                    f"0..{expected_rows - 1} in row order"
+                )
+                record_ok = False
+
+        if len(frame) == expected_rows and "timestamp" in frame.columns:
+            try:
+                timestamps = pd.to_datetime(
+                    frame["timestamp"].to_numpy(dtype=object),
+                    errors="coerce",
+                    utc=True,
+                )
+                timestamp_ns = np.asarray(
+                    timestamps.as_unit("ns").asi8,
+                    dtype=np.int64,
+                )
+                timestamp_ok = np.array_equal(
+                    timestamp_ns,
+                    expected_timestamps,
+                )
+            except (AttributeError, OverflowError, TypeError, ValueError):
+                timestamp_ok = False
+            if not timestamp_ok:
+                issues.append(
+                    f"record {record_index} timestamps do not equal "
+                    "start + minute_index * rate_window_seconds"
+                )
+                record_ok = False
+
+        if len(frame) == expected_rows and "consumer_id" in frame.columns:
+            consumer_ok = consumer_key is not None and all(
+                _identity_equal(value, consumer_id)
+                for value in frame["consumer_id"].to_numpy(dtype=object)
+            )
+            if not consumer_ok:
+                issues.append(
+                    f"record {record_index} consumer_id rows do not match "
+                    f"{consumer_id!r}"
+                )
+                record_ok = False
+
+        if record_ok:
+            valid_records.append(rec)
+
+    if total_rows != expected_total_rows:
+        issues.append(
+            f"derived rows={total_rows} (expected {expected_total_rows})"
+        )
+    if len(seen_consumers) != expected_consumers:
+        issues.append(
+            f"unique consumer identities={len(seen_consumers)} "
+            f"(expected {expected_consumers})"
+        )
+    if invalid_row_identities:
+        issues.append(
+            f"{invalid_row_identities} global derived rows have a missing or "
+            "invalid (consumer_id, minute_index) identity"
+        )
+    if duplicate_row_identities and first_duplicate_row is not None:
+        first, duplicate, consumer_id, minute = first_duplicate_row
+        issues.append(
+            f"{duplicate_row_identities} duplicate global "
+            "(consumer_id, minute_index) identities; first duplicate "
+            f"{consumer_id!r}, minute {minute} occurs at records/rows "
+            f"{first} and {duplicate}"
+        )
+    if len(seen_row_identities) != expected_total_rows:
+        issues.append(
+            f"unique global derived row identities="
+            f"{len(seen_row_identities)} (expected {expected_total_rows})"
+        )
+
+    if issues:
+        shown = "; ".join(issues[:8])
+        if len(issues) > 8:
+            shown += f"; plus {len(issues) - 8} more"
+        return valid_records, False, shown
+    return (
+        valid_records,
+        True,
+        f"{expected_consumers} typed consumer identities each emit "
+        f"{expected_rows} ordered rows on the configured cadence, with "
+        "globally unique (consumer_id, minute_index) identities.",
+    )
+
+
 def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
               events: pd.DataFrame) -> list[InvariantResult]:
     """Run every invariant over all per-consumer records."""
 
     results: list[InvariantResult] = []
+    derived_records, grid_ok, grid_detail = _generated_derived_grid(
+        cfg,
+        records,
+    )
+    results.append(_hard(
+        "derived_identity_grid",
+        grid_ok,
+        grid_detail,
+    ))
 
     # -- Hard: every physical state value is finite --------------------------
     physical_fields = (
@@ -144,7 +436,10 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
         np.asarray(rec["phys"].backlog)
         for rec in records
     ]
-    backlog_values_finite = all(np.all(np.isfinite(v)) for v in backlogs)
+    backlog_values_finite = (
+        bool(backlogs)
+        and all(np.all(np.isfinite(v)) for v in backlogs)
+    )
     min_backlog = (
         min(float(np.min(v)) for v in backlogs)
         if backlog_values_finite
@@ -178,7 +473,7 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
 
     # -- Hard: derived rates non-negative ------------------------------------
     neg_rates = 0
-    for rec in records:
+    for rec in derived_records:
         f = rec["frame"]
         for col in ("input_rate_bytes_per_min", "output_rate_bytes_per_min"):
             v = f[col].to_numpy()
@@ -187,24 +482,52 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
         "derived_rates_non_negative", neg_rates == 0,
         f"{neg_rates} negative derived rate values (should be 0)."))
 
-    nonfinite_reported = 0
+    masked_counter_not_nan = 0
+    present_counter_nonfinite = 0
+    counter_infinite = 0
+    counter_shape_mismatches = 0
     derived_infinite = 0
     for rec in records:
         obs = rec["obs"]
-        allowed_missing = obs.missing_flag | ~obs.active_flag
+        absent = np.asarray(obs.missing_flag) | ~np.asarray(
+            obs.active_flag
+        )
         for counter in (obs.input_counted, obs.output_counted):
-            nonfinite_reported += int(np.count_nonzero(
-                ~np.isfinite(counter) & ~allowed_missing
+            values = np.asarray(counter)
+            if values.shape != absent.shape:
+                counter_shape_mismatches += 1
+                continue
+            try:
+                is_nan = np.isnan(values)
+                is_finite = np.isfinite(values)
+                is_infinite = np.isinf(values)
+            except TypeError:
+                counter_shape_mismatches += 1
+                continue
+            masked_counter_not_nan += int(np.count_nonzero(
+                absent & ~is_nan
             ))
+            present_counter_nonfinite += int(np.count_nonzero(
+                ~absent & ~is_finite
+            ))
+            counter_infinite += int(np.count_nonzero(is_infinite))
+    for rec in derived_records:
         numeric = rec["frame"].select_dtypes(include=[np.number])
         derived_infinite += int(np.count_nonzero(
             np.isinf(numeric.to_numpy(dtype=float))
         ))
     results.append(_hard(
         "reported_telemetry_is_finite",
-        nonfinite_reported == 0 and derived_infinite == 0,
-        f"{nonfinite_reported} unflagged nonfinite counter values and "
-        f"{derived_infinite} infinite derived values.",
+        masked_counter_not_nan == 0
+        and present_counter_nonfinite == 0
+        and counter_infinite == 0
+        and counter_shape_mismatches == 0
+        and derived_infinite == 0,
+        f"{masked_counter_not_nan} missing/inactive counter values were "
+        f"not NaN, {present_counter_nonfinite} present counter values were "
+        f"non-finite, {counter_infinite} counter values were infinite, "
+        f"{counter_shape_mismatches} counter shapes/types were invalid, and "
+        f"{derived_infinite} derived values were infinite.",
     ))
 
     # -- Hard: every emitted derived identity is reproducible ----------------
@@ -227,7 +550,7 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
         output[valid] = np.asarray(raw[valid], dtype=bool)
         return output, int(np.count_nonzero(~valid))
 
-    for rec in records:
+    for rec in derived_records:
         frame = rec["frame"]
         obs = rec["obs"]
         phys = rec["phys"]
@@ -350,9 +673,14 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
         true_loss = np.zeros(len(frame), dtype=bool)
         benign = np.zeros(len(frame), dtype=bool)
         artifact = np.zeros(len(frame), dtype=bool)
-        consumer_events = events[
-            events["consumer_id"] == rec["consumer"].consumer_id
-        ] if not events.empty else events
+        consumer_events = (
+            events.loc[_identity_mask(
+                events["consumer_id"].to_numpy(dtype=object),
+                rec["consumer"].consumer_id,
+            )]
+            if not events.empty
+            else events
+        )
         for _, event in consumer_events.iterrows():
             interval_end = timestamps + pd.to_timedelta(
                 cfg.time.rate_window_seconds,
@@ -392,10 +720,10 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
         label_bad += invalid + int(np.count_nonzero(
             oracle != true_loss
         ))
-        label_bad += int(np.count_nonzero(
-            frame["consumer_id"].to_numpy(dtype=object)
-            != rec["consumer"].consumer_id
-        ))
+        label_bad += int(np.count_nonzero(~_identity_mask(
+            frame["consumer_id"].to_numpy(dtype=object),
+            rec["consumer"].consumer_id,
+        )))
     results.extend((
         _hard(
             "derived_signal_identities",
@@ -426,7 +754,11 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
     # hour after a true-loss event legitimately shows a depressed smoothed ratio;
     # that is real smoothing behaviour, not a generator fault.) Bursty tenants are
     # allowed to dip -- that dip IS the reported false-positive bug.
-    normal_ratio = _collect_steady(records, label="normal", col="completeness_ratio")
+    normal_ratio = _collect_steady(
+        derived_records,
+        label="normal",
+        col="completeness_ratio",
+    )
     if normal_ratio.size:
         med = float(np.nanmedian(normal_ratio))
         lo = cfg.pipeline.healthy_ratio_mean - 0.03
@@ -446,14 +778,14 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
     # -- Soft: benign bursts lose no bytes; true loss accumulates ------------
     benign_ok, benign_detail = _event_loss_behaviour(
         cfg,
-        records,
+        derived_records,
         events,
         benign=True,
     )
     results.append(_soft("benign_events_do_not_lose_bytes", benign_ok, benign_detail))
     loss_ok, loss_detail = _event_loss_behaviour(
         cfg,
-        records,
+        derived_records,
         events,
         benign=False,
     )
@@ -509,7 +841,16 @@ def _event_loss_behaviour(cfg: EmulatorConfig, records: list[dict[str, Any]], ev
 
     if events.empty:
         return True, "no events to check."
-    by_consumer = {rec["consumer"].consumer_id: rec for rec in records}
+    by_consumer = {
+        consumer_key: rec
+        for rec in records
+        if (
+            consumer_key := _typed_identity_key(
+                rec["consumer"].consumer_id
+            )
+        ) is not None
+    }
+    event_consumers = events["consumer_id"].to_numpy(dtype=object)
     checked = 0
     violations = 0
     overlap_skipped = 0
@@ -523,12 +864,17 @@ def _event_loss_behaviour(cfg: EmulatorConfig, records: list[dict[str, Any]], ev
         is_benign = ev["type"] in ("benign_burst", "artifact")
         if is_benign != benign:
             continue
-        rec = by_consumer.get(ev["consumer_id"])
+        event_consumer_key = _typed_identity_key(ev["consumer_id"])
+        rec = (
+            by_consumer.get(event_consumer_key)
+            if event_consumer_key is not None
+            else None
+        )
         if rec is None:
             continue
         if benign:
             overlapping_loss = events[
-                (events["consumer_id"] == ev["consumer_id"])
+                _identity_mask(event_consumers, ev["consumer_id"])
                 & ~events["type"].isin(("benign_burst", "artifact"))
                 & (events["span_start"] < ev["span_end"])
                 & (events["span_end"] > ev["span_start"])

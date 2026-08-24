@@ -1205,6 +1205,100 @@ def test_calibrate_applies_max_iterations_globally_across_tiers(
     assert report["grammar_reinductions"] == 0
 
 
+def test_calibrate_budgets_distinct_runtime_tiers_after_deduplication(
+    monkeypatch,
+    tmp_path,
+):
+    import autogram.calibrate as calibration
+
+    _fake_calibrate_env(
+        monkeypatch,
+        recall_fn=lambda _config: 0.5,
+        null_fn=lambda _config: 0,
+    )
+    tiers = _capability_tiers()
+    tiers[3] = {
+        **tiers[3],
+        "advanced": True,
+        "max_conjunction_terms": 9,
+    }
+    monkeypatch.setattr(
+        calibration,
+        "_capability_tiers",
+        lambda: tiers,
+    )
+
+    induction_calls = []
+
+    def counted_induction(_columns, _inducer, *_args, **_kwargs):
+        induction_calls.append(True)
+        return _mini_spec()
+
+    monkeypatch.setattr(
+        calibration,
+        "induce_spec",
+        counted_induction,
+    )
+    prepared_bounds = []
+    fake_prepare = calibration.prepare_proxy_suite
+
+    def capture_bound(*args, **kwargs):
+        prepared_bounds.append(
+            kwargs["null_max_conjunction_terms"]
+        )
+        return fake_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(
+        calibration,
+        "prepare_proxy_suite",
+        capture_bound,
+    )
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "x0": [1.0, 2.0],
+            "y0": [1.0, 2.0],
+        }),
+        agg_kinds=("SUM",),
+    )
+    known = _write_known(
+        tmp_path,
+        [
+            {
+                "name": f"i{index}",
+                "op": "~=",
+                "lhs": f"x{index}",
+                "rhs": f"y{index}",
+            }
+            for index in range(4)
+        ],
+    )
+
+    report = calibrate(
+        frame,
+        known,
+        CalibrationConfig(
+            max_capability_tiers=4,
+            max_iterations=5,
+            max_rules=0,
+            save_rules=False,
+        ),
+    )
+
+    assert len(induction_calls) == 3
+    assert report["iterations"] == 5
+    assert report["grammar_reinductions"] == 1
+    assert [
+        entry["grammar_tier"]
+        for entry in report["trajectory"]
+    ] == [0, 0, 0, 0, 2]
+    assert [
+        entry["tier"]
+        for entry in report["grammar_specs"]
+    ] == [0, 2]
+    assert prepared_bounds == [3]
+
+
 def test_derive_regime_rejects_custom_regime_with_no_active_entries():
     # A caller-supplied regime with nothing active would prepare no positive proxies; reject it
     # clearly before any preparation, instead of silently "calibrating" on an empty suite.
@@ -2030,6 +2124,106 @@ def test_known_split_reuses_fitted_witnesses_across_equivalent_tiers(
     )
 
     assert calls == 1
+
+
+@pytest.mark.parametrize("reversed_order", [False, True])
+def test_known_split_cache_keys_colliding_conditions_structurally(
+    monkeypatch,
+    reversed_order,
+):
+    import autogram.calibrate as calibration
+    from autogram.dsl import ast as A
+
+    frame = pd.DataFrame({
+        column: np.arange(5.0) + index
+        for index, column in enumerate(
+            ("total", "a", "x", "y", "q")
+        )
+    })
+    dataset = build_dataset(
+        frame.columns,
+        frame.to_numpy(),
+        compile_spec(_sum_witness_spec(include_family=False)),
+        "witness_cache_collision",
+    )
+    atom = A.Compare(
+        A.Ref("total"),
+        "==",
+        A.Ref("a"),
+    )
+    empty = A.Rule(
+        "record",
+        atom,
+        condition=A.Condition(
+            "",
+            "all",
+            (
+                A.Condition("a", "==", (1,)),
+                A.Condition("b == 2, c", "==", (3,)),
+            ),
+        ),
+    )
+    linking = A.Rule(
+        "record",
+        atom,
+        condition=A.Condition(
+            "",
+            "all",
+            (
+                A.Condition("a == 1, b", "==", (2,)),
+                A.Condition("c", "==", (3,)),
+            ),
+        ),
+    )
+    assert empty.unparse() == linking.unparse()
+    assert empty.signature() != linking.signature()
+
+    known = [
+        KnownInvariant("left", "==", "total", "a"),
+        KnownInvariant("right", "==", "x", "y"),
+        KnownInvariant("other", ">=", "q", 0),
+    ]
+    calls = []
+
+    def fake_relations(rule, _dataset, parameters=None):
+        assert parameters is None
+        calls.append(rule.signature())
+        if rule.signature() == empty.signature():
+            return set()
+        return {
+            _known_signature(known[0]),
+            _known_signature(known[1]),
+        }
+
+    monkeypatch.setattr(
+        calibration,
+        "rule_relations",
+        fake_relations,
+    )
+    witnesses = (empty, linking)
+    if reversed_order:
+        witnesses = witnesses[::-1]
+
+    calibration_known, validation_known = _split_known(
+        known,
+        frac=0.34,
+        seed=0,
+        recovery_dataset=dataset,
+        recovery_rules=witnesses,
+    )
+
+    sides = {
+        item.name: "calibration"
+        for item in calibration_known
+    } | {
+        item.name: "validation"
+        for item in validation_known
+    }
+    assert calls == [
+        rule.signature()
+        for rule in witnesses
+    ]
+    assert sides["left"] == sides["right"]
 
 
 def test_known_split_matches_alternative_roles_and_family_witnesses():

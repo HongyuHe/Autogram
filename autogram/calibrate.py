@@ -951,7 +951,7 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
         for rule in witness_rules:
             cache_key = (
                 dataset_fingerprint,
-                rule.unparse(),
+                rule.signature(),
             )
             if cache_key in witness_relation_cache:
                 relations = set(
@@ -1289,16 +1289,23 @@ def _capability_tiers() -> List[dict]:
 _KNOB_RUNGS_PER_TIER = 4
 
 
+def _runtime_tier_limit(max_iterations: int) -> Optional[int]:
+    """Number of distinct runtime grammars that can receive at least one attempt."""
+    if int(max_iterations) <= 0:
+        return None
+    return 1 + (
+        int(max_iterations) - 1
+    ) // _KNOB_RUNGS_PER_TIER
+
+
 def _reachable_capability_tiers(
     max_capability_tiers: int,
     max_iterations: int,
 ) -> List[dict]:
     tiers = _capability_tiers()[:max(1, int(max_capability_tiers))]
-    if int(max_iterations) > 0:
-        reachable = 1 + (
-            int(max_iterations) - 1
-        ) // _KNOB_RUNGS_PER_TIER
-        tiers = tiers[:max(1, reachable)]
+    limit = _runtime_tier_limit(max_iterations)
+    if limit is not None:
+        tiers = tiers[:limit]
     return tiers
 
 
@@ -1902,7 +1909,7 @@ def _merge_specs(
     return merged
 
 
-def _prepare_runtime_tier_specs(
+def _iter_runtime_tier_specs(
     df,
     initial_spec,
     inducer,
@@ -1929,7 +1936,6 @@ def _prepare_runtime_tier_specs(
         else set()
     )
     accumulated = None
-    runtime_specs = []
     for tier_index, caps in enumerate(tiers):
         proposed = (
             initial_spec
@@ -1966,7 +1972,7 @@ def _prepare_runtime_tier_specs(
             ),
         )
         accumulated = spec
-        runtime_specs.append(normalize_dataframe_spec(
+        yield normalize_dataframe_spec(
             df,
             replace(
                 spec,
@@ -2002,35 +2008,80 @@ def _prepare_runtime_tier_specs(
                 ),
             ),
             search_cfg,
-        ))
-    return runtime_specs
+        )
+
+
+def _prepare_runtime_tier_specs(
+    df,
+    initial_spec,
+    inducer,
+    tiers,
+    search_cfg,
+    profile,
+):
+    return list(_iter_runtime_tier_specs(
+        df,
+        initial_spec,
+        inducer,
+        tiers,
+        search_cfg,
+        profile,
+    ))
+
+
+_RUNTIME_TIER_PROVENANCE_FIELDS = {
+    "name",
+    "notes",
+    "aggregations_widened",
+    "temporal_bounds_widened",
+    "advanced_bounds_widened",
+    "degree_widened",
+    "proportional_widened",
+}
+
+
+def _runtime_tier_identity(spec) -> str:
+    payload = _spec_to_json(spec)
+    for key in _RUNTIME_TIER_PROVENANCE_FIELDS:
+        payload.pop(key, None)
+    return _json_fingerprint(payload)
+
+
+def _iter_distinct_runtime_tiers(tiers, runtime_specs):
+    """Yield normalized runtime grammars once, retaining their original tier indices."""
+    seen = set()
+    for tier_index, (caps, spec) in enumerate(
+        zip(tiers, runtime_specs)
+    ):
+        identity = _runtime_tier_identity(spec)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        yield (tier_index, caps, spec)
 
 
 def _distinct_runtime_tiers(tiers, runtime_specs):
     """Drop capability tiers whose normalized runtime grammar is unchanged."""
-    out = []
-    seen = set()
-    provenance_only = {
-        "name",
-        "notes",
-        "aggregations_widened",
-        "temporal_bounds_widened",
-        "advanced_bounds_widened",
-        "degree_widened",
-        "proportional_widened",
-    }
-    for tier_index, (caps, spec) in enumerate(
-        zip(tiers, runtime_specs)
-    ):
-        payload = _spec_to_json(spec)
-        for key in provenance_only:
-            payload.pop(key, None)
-        identity = _json_fingerprint(payload)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        out.append((tier_index, caps, spec))
-    return out
+    return list(_iter_distinct_runtime_tiers(
+        tiers,
+        runtime_specs,
+    ))
+
+
+def _select_runtime_tiers(
+    tiers,
+    runtime_specs,
+    max_iterations: int,
+):
+    """Budget attempts after normalized runtime-tier deduplication."""
+    distinct = _iter_distinct_runtime_tiers(
+        tiers,
+        runtime_specs,
+    )
+    limit = _runtime_tier_limit(max_iterations)
+    if limit is None:
+        return list(distinct)
+    return list(itertools.islice(distinct, limit))
 
 
 def _spec_summary(spec, tier: int, caps: dict) -> dict:
@@ -2074,13 +2125,13 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     profile = dict(
         getattr(df, "attrs", {}).get("autogram_profile", {})
     )
-    tiers = _reachable_capability_tiers(
+    preflight_tiers = _reachable_capability_tiers(
         cfg.max_capability_tiers,
         cfg.max_iterations,
     )
     advanced_possible = bool(profile.get("advanced", False)) or any(
         bool(caps.get("advanced", False))
-        for caps in tiers
+        for caps in preflight_tiers
     )
     if advanced_possible and not 1 <= int(cfg.max_rules) <= 500_000:
         raise ValueError(
@@ -2110,17 +2161,21 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     # not leak validation content; it merely prevents a later candidate from recovering catalogue
     # entries which were already placed on opposite sides.
     initial_spec = induce_spec(list(df.columns), inducer)
-    runtime_tier_specs = _prepare_runtime_tier_specs(
-        df,
-        initial_spec,
-        inducer,
-        tiers,
-        scfg,
-        profile,
+    configured_tiers = _reachable_capability_tiers(
+        cfg.max_capability_tiers,
+        0,
     )
-    runtime_tiers = _distinct_runtime_tiers(
-        tiers,
-        runtime_tier_specs,
+    runtime_tiers = _select_runtime_tiers(
+        configured_tiers,
+        _iter_runtime_tier_specs(
+            df,
+            initial_spec,
+            inducer,
+            configured_tiers,
+            scfg,
+            profile,
+        ),
+        cfg.max_iterations,
     )
     split_dataset, split_grammar = build_dataframe_grammar(
         df,
@@ -2185,10 +2240,10 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     null_max_conjunction_terms = int(
         profile.get("max_conjunction_terms", 3)
     )
-    for caps in tiers:
+    for _tier_index, _caps, runtime_spec in runtime_tiers:
         null_max_conjunction_terms = max(
             null_max_conjunction_terms,
-            int(caps.get("max_conjunction_terms", 3)),
+            int(runtime_spec.max_conjunction_terms),
         )
 
     # 2) prepare every selected positive proxy + the null control ONCE (schema induction per proxy);

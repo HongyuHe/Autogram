@@ -402,6 +402,70 @@ def test_raw_identity_components_must_be_nonmissing(column, value):
             prepare()
 
 
+@pytest.mark.parametrize(
+    ("table", "column"),
+    (
+        ("derived", "consumer_id"),
+        ("raw", "consumer_id"),
+        ("raw", "shard_id"),
+    ),
+)
+def test_nested_missing_identity_components_are_rejected(table, column):
+    derived, raw = _tables()
+    invalid = derived.copy() if table == "derived" else raw.copy()
+    invalid[column] = invalid[column].astype(object)
+    invalid.at[
+        invalid.index[0],
+        column,
+    ] = ("outer", ("inner", pd.NA))
+
+    if table == "derived":
+        with pytest.raises(ValueError, match="nonmissing consumer_id"):
+            prepare_gtib(invalid)
+        return
+
+    for prepare in (
+        lambda: prepare_gtib(derived, invalid),
+        lambda: prepare_gtib_raw(invalid),
+    ):
+        with pytest.raises(
+            ValueError,
+            match="raw identities require nonmissing",
+        ):
+            prepare()
+
+
+def test_valid_nested_tuple_identities_pass_raw_and_derived_validation():
+    derived, raw = _tables()
+    consumer = ("region", ("cluster", 7))
+    derived = derived.copy()
+    raw = raw.copy()
+    derived["consumer_id"] = pd.Series(
+        [consumer] * len(derived),
+        dtype=object,
+    )
+    raw["consumer_id"] = pd.Series(
+        [consumer] * len(raw),
+        dtype=object,
+    )
+    raw["shard_id"] = pd.Series(
+        [
+            ("shard", (shard, 1))
+            for shard in raw["shard_id"].to_numpy(dtype=object)
+        ],
+        dtype=object,
+    )
+
+    prepared = prepare_gtib(derived, raw)
+    prepared_raw = prepare_gtib_raw(raw)
+
+    assert len(prepared) == len(derived)
+    assert len(prepared_raw) == len(raw)
+    assert len(prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]) == 2
+
+
 def test_duplicate_raw_identity_tuple_is_rejected_at_shard_grain():
     derived, raw = _tables()
     # Rows at the same timestamp and consumer remain valid when their shard differs.

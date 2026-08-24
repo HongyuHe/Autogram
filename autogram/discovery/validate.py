@@ -2940,6 +2940,79 @@ def _proxy_boolean_roles(grammar, dataset) -> dict:
     return by_binder
 
 
+def _proxy_category_case_columns(grammar, dataset) -> dict:
+    """Ground proxy Boolean case columns without making them conditioning regimes."""
+    by_binder = {binder: [] for binder in grammar.binders}
+    seen = {binder: set() for binder in grammar.binders}
+
+    def add(binder, column) -> None:
+        key = typed_group_key(column)
+        if key in seen[binder]:
+            return
+        seen[binder].add(key)
+        by_binder[binder].append(column)
+
+    native_columns = tuple(
+        name
+        for name, values in dataset.row_context.items()
+        if pd.api.types.is_bool_dtype(np.asarray(values).dtype)
+    )
+    if native_columns:
+        native_keys = {
+            typed_group_key(column)
+            for column in native_columns
+        }
+        mapped_keys = set()
+        for binder, column, role in grammar.column_roles:
+            key = typed_group_key(column)
+            if (
+                binder in by_binder
+                and key in native_keys
+                and role in set(grammar.booleans_for(binder))
+            ):
+                add(binder, column)
+                mapped_keys.add(key)
+        primary_binder = next(
+            (
+                binder
+                for binder in ("record", "node")
+                if binder in by_binder
+            ),
+            grammar.binders[0] if grammar.binders else None,
+        )
+        if primary_binder is not None:
+            for column in native_columns:
+                if typed_group_key(column) not in mapped_keys:
+                    add(primary_binder, column)
+    else:
+        boolean_roles = {
+            binder: set(grammar.booleans_for(binder))
+            for binder in grammar.binders
+        }
+        for binder, column, role in grammar.column_roles:
+            if (
+                binder not in by_binder
+                or role not in boolean_roles[binder]
+                or column not in dataset.observed.name_to_idx
+            ):
+                continue
+            values = dataset.observed.col(column)
+            finite = values[np.isfinite(values)]
+            if (
+                not finite.size
+                or not set(np.unique(finite).tolist()) <= {0.0, 1.0}
+            ):
+                continue
+            add(binder, column)
+            dataset.row_context[column] = values
+            dataset.observed.row_context[column] = values
+
+    return {
+        binder: tuple(columns)
+        for binder, columns in by_binder.items()
+    }
+
+
 def _enable_shape_capabilities(
     grammar,
     family: str,
@@ -3087,11 +3160,25 @@ def _enable_shape_capabilities(
                 for binder, cap in grammar.max_complexity_by_binder.items()
             }
     if family in {"categorical", "definition_null"}:
-        values = (
-            _proxy_context_values(
+        if dataset is not None:
+            grammar.category_case_columns = _proxy_category_case_columns(
+                grammar,
                 dataset,
-                grammar.max_condition_values,
             )
+        category_case_keys = {
+            typed_group_key(column)
+            for columns in grammar.category_case_columns.values()
+            for column in columns
+        }
+        values = (
+            {
+                name: domain
+                for name, domain in _proxy_context_values(
+                    dataset,
+                    grammar.max_condition_values,
+                ).items()
+                if typed_group_key(name) not in category_case_keys
+            }
             if dataset is not None
             else {}
         )

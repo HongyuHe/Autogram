@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from autogram.config import DiscoveryConfig
 from autogram.cli import _portfolio_payload
@@ -170,6 +171,92 @@ def test_proportional_evaluator_checks_zero_predictor_rows():
     assert result.n_points > 30
 
 
+@pytest.mark.parametrize(
+    ("band_mode", "expected_n_points"),
+    (("global", 440), ("adaptive", 272)),
+)
+def test_proportional_zero_rows_have_coefficient_independent_semantics(
+    band_mode,
+    expected_n_points,
+):
+    x = np.concatenate((
+        np.arange(1.0, 801.0),
+        np.zeros(600),
+        np.zeros(200),
+    ))
+    y = np.concatenate((
+        2.0 * x[:800],
+        np.zeros(600),
+        np.ones(200),
+    ))
+    frame = profile_dataframe(pd.DataFrame({"x": x, "y": y}))
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name=f"proportional_zero_semantics_{band_mode}",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=2.0,
+            hold_rate_threshold=0.8,
+            band_mode=band_mode,
+            seed=0,
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+    ))
+
+    assert not result.accepted
+    assert result.n_points == expected_n_points
+    assert result.support == pytest.approx(0.625)
+    assert result.hold_rate < 0.55
+
+
+def test_conditioned_proportional_reapplies_support_floor_after_neutral_rows():
+    n_rows = 1000
+    selected = np.arange(n_rows) < 20
+    x = np.ones(n_rows)
+    y = 2.0 * x
+    x[19] = 0.0
+    y[19] = 0.0
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "x": x,
+            "y": y,
+            "label": np.where(selected, "selected", "other"),
+        }),
+        condition_columns=("label",),
+        proportional=True,
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="conditioned_proportional_neutral_support",
+    )
+    rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+        condition=A.Condition("label", "==", ("selected",)),
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=0.01,
+            hold_rate_threshold=0.1,
+            band_mode="global",
+            seed=0,
+        ),
+    ).evaluate(rule)
+
+    assert not result.accepted
+    assert "condition support below minimum after proportional exclusions" in result.reason
+    assert "19 source rows" in result.reason
+
+
 def test_exact_equality_at_float64_max_does_not_accept_zero():
     maximum = np.finfo(float).max
     frame = profile_dataframe(pd.DataFrame({
@@ -283,11 +370,18 @@ def test_exact_equality_accepts_identical_zero_and_subnormal_rows():
     assert np.isfinite(result.eps)
 
 
-def test_proportional_accepts_identical_zero_and_subnormal_rows():
+@pytest.mark.parametrize(
+    ("band_mode", "expected_n_points"),
+    (("global", 30), ("adaptive", 9)),
+)
+def test_proportional_accepts_subnormal_rows_but_treats_identical_zero_as_neutral(
+    band_mode,
+    expected_n_points,
+):
     minimum = np.nextafter(0.0, 1.0)
     values = np.concatenate((
-        np.zeros(200),
-        np.full(200, minimum),
+        np.zeros(400),
+        np.full(600, minimum),
     ))
     frame = profile_dataframe(pd.DataFrame({
         "x": values,
@@ -302,8 +396,10 @@ def test_proportional_accepts_identical_zero_and_subnormal_rows():
     result = DataOnlyEvaluator(
         dataset,
         DiscoveryConfig(
-            hold_rate_threshold=0.9,
-            band_mode="global",
+            hold_rate_threshold=0.1,
+            band_mode=band_mode,
+            seed=3,
+            subsample=101,
         ),
     ).evaluate(A.Rule(
         "record",
@@ -312,6 +408,129 @@ def test_proportional_accepts_identical_zero_and_subnormal_rows():
 
     assert result.accepted
     assert result.hold_rate == 1.0
+    assert result.n_points == expected_n_points
+    assert result.support == pytest.approx(0.6)
+    payload = _portfolio_payload(SimpleNamespace(
+        dataset=dataset,
+        rounds_run=1,
+        progress_history=[],
+        diagnostics=[],
+        portfolio=[result],
+    ))
+    assert payload["portfolio"][0]["support"] == pytest.approx(0.6)
+
+
+@pytest.mark.parametrize("subsample", (100, 500, 1000))
+def test_proportional_subsampling_ignores_neutral_rows(subsample):
+    x = np.concatenate((
+        np.zeros(9900),
+        np.arange(1.0, 101.0),
+    ))
+    frame = profile_dataframe(pd.DataFrame({
+        "x": x,
+        "y": 2.0 * x,
+    }), proportional=True)
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name=f"proportional_neutral_subsample_{subsample}",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=1e-9,
+            hold_rate_threshold=0.62,
+            band_mode="adaptive",
+            seed=0,
+            subsample=subsample,
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+    ))
+
+    assert result.accepted
+    assert result.n_points == 9
+    assert result.support == pytest.approx(0.01)
+    assert result.parameters["coefficient"] == 2.0
+
+
+def test_proportional_subsampling_is_neutral_aware_per_group():
+    group = np.repeat(["a", "b"], 5000)
+    x = np.zeros(10000)
+    x[4950:5000] = np.arange(1.0, 51.0)
+    x[9950:10000] = np.arange(1.0, 51.0)
+    y = np.where(group == "a", 2.0 * x, 3.0 * x)
+    frame = profile_dataframe(
+        pd.DataFrame({"group_id": group, "x": x, "y": y}),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="proportional_grouped_neutral_subsample",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=1e-9,
+            hold_rate_threshold=0.75,
+            band_mode="global",
+            seed=0,
+            subsample=100,
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+    ))
+
+    assert result.accepted
+    assert result.n_points == 30
+    assert result.support == pytest.approx(0.01)
+    assert result.parameters["coefficients"] == {
+        "a": 2.0,
+        "b": 3.0,
+    }
+
+
+def test_proportional_subsampling_keeps_zero_predictor_violations():
+    x = np.concatenate((
+        np.zeros(9900),
+        np.arange(1.0, 81.0),
+        np.zeros(20),
+    ))
+    y = np.concatenate((
+        np.zeros(9900),
+        2.0 * np.arange(1.0, 81.0),
+        np.ones(20),
+    ))
+    frame = profile_dataframe(pd.DataFrame({"x": x, "y": y}))
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="proportional_subsample_zero_violations",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=2.0,
+            hold_rate_threshold=0.8,
+            band_mode="global",
+            seed=0,
+            subsample=100,
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+    ))
+
+    assert not result.accepted
+    assert result.n_points == 44
+    assert result.support == pytest.approx(0.01)
+    assert result.hold_rate == pytest.approx(24 / 44)
 
 
 def test_proportional_fit_is_invariant_to_common_tiny_scaling():
@@ -348,15 +567,15 @@ def test_proportional_fit_is_invariant_to_common_tiny_scaling():
     )
 
 
-def test_proportional_evaluator_keeps_all_zero_predictor_groups():
-    group = np.repeat(["valid", "violating"], [240, 120])
+def test_proportional_rejects_zero_only_declared_group_as_unfittable():
+    group = np.repeat(["valid", "zero_only"], [240, 120])
     x = np.concatenate([
         np.linspace(1.0, 240.0, 240),
         np.zeros(120),
     ])
     y = np.concatenate([
         2.0 * x[:240],
-        np.full(120, 7.0),
+        np.zeros(120),
     ])
     frame = profile_dataframe(
         pd.DataFrame({"group_id": group, "x": x, "y": y}),
@@ -381,8 +600,7 @@ def test_proportional_evaluator_keeps_all_zero_predictor_groups():
     )
 
     assert not result.accepted
-    assert result.hold_rate < 0.5
-    assert result.n_points >= 120
+    assert "coefficient could not be fit" in result.reason
 
 
 def test_proportional_evaluator_requires_every_group_to_hold():
@@ -419,6 +637,61 @@ def test_proportional_evaluator_requires_every_group_to_hold():
 
     assert not result.accepted
     assert result.parameters["group_hold_rates"]["small"] < 0.9
+
+
+@pytest.mark.parametrize(
+    ("band_mode", "expected_n_points"),
+    (("global", 170), ("adaptive", 65)),
+)
+def test_proportional_group_gate_ignores_neutral_rows_but_keeps_zero_violations(
+    band_mode,
+    expected_n_points,
+):
+    good_x = np.arange(1.0, 401.0)
+    bad_x = np.arange(1.0, 101.0)
+    group = np.repeat(
+        ["good", "bad"],
+        [good_x.size, bad_x.size + 300 + 20],
+    )
+    x = np.concatenate((
+        good_x,
+        bad_x,
+        np.zeros(300),
+        np.zeros(20),
+    ))
+    y = np.concatenate((
+        2.0 * good_x,
+        2.0 * bad_x,
+        np.zeros(300),
+        np.ones(20),
+    ))
+    frame = profile_dataframe(
+        pd.DataFrame({"group_id": group, "x": x, "y": y}),
+        group_keys=("group_id",),
+    )
+    dataset, _grammar_obj = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name=f"proportional_neutral_group_{band_mode}",
+    )
+
+    result = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=2.0,
+            hold_rate_threshold=0.8,
+            band_mode=band_mode,
+            seed=0,
+        ),
+    ).evaluate(A.Rule(
+        "record",
+        A.Compare(A.Ref("y"), "~∝", A.Ref("x")),
+    ))
+
+    assert not result.accepted
+    assert result.n_points == expected_n_points
+    assert result.support == pytest.approx(520 / 820)
+    assert result.parameters["group_hold_rates"]["bad"] < 0.8
 
 
 def test_adaptive_proportional_band_keeps_every_fitted_group():
