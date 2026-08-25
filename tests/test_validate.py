@@ -13,10 +13,12 @@ from autogram.cli import build_parser
 from autogram.discovery import synth
 from autogram.discovery import regime as R
 from autogram.discovery import validate as V
-from autogram.discovery.loop import discover
+from autogram.discovery.evaluate import DataOnlyEvaluator
+from autogram.discovery.loop import build_dataframe_grammar, discover
 from autogram.dsl import ast as A
 from autogram.dsl.evaluate import ground, typed_group_key
 from autogram.dsl.grammar import Grammar
+from autogram.loader.gtib import profile_dataframe
 from autogram.loader.loader import build_dataset
 from autogram.schema.compiler import compile_spec
 from autogram.schema.spec import (
@@ -93,7 +95,8 @@ def test_definition_null_independently_permutes_categorical_target():
         np.array([False, True, True, False]),
         400,
     )
-    label = np.where(flag, "alert", "normal")
+    label = np.where(flag, "alert", "normal").astype(object)
+    label[[17, 119]] = pd.NA
     adapter = SimpleNamespace(condition_columns={
         "flag": (False, True),
         "label": ("normal", "alert"),
@@ -112,8 +115,148 @@ def test_definition_null_independently_permutes_categorical_target():
     )
 
     assert np.array_equal(context["flag"], flag)
-    assert sorted(context["label"].tolist()) == sorted(label.tolist())
-    assert not np.array_equal(context["label"], label)
+    present = ~pd.isna(label)
+    assert np.array_equal(pd.isna(context["label"]), ~present)
+    assert sorted(context["label"][present].tolist()) == sorted(label[present].tolist())
+    assert not np.array_equal(context["label"][present], label[present])
+
+
+def _sparse_nullable_category():
+    missing = np.array([3, 15])
+    first = np.full(20, False, dtype=object)
+    second = np.full(20, False, dtype=object)
+    first[[0, 1, 2, 4, 5, 6, 7, 8]] = True
+    second[[0, 1, 9, 10, 11, 12, 13, 14]] = True
+    first[missing] = pd.NA
+    second[missing] = pd.NA
+
+    first_active = np.array([
+        False if pd.isna(value) else bool(value)
+        for value in first
+    ])
+    second_active = np.array([
+        False if pd.isna(value) else bool(value)
+        for value in second
+    ])
+    label = np.full(20, "normal", dtype=object)
+    label[second_active] = "benign"
+    label[first_active] = "loss"
+    label[missing] = pd.NA
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "is_loss": pd.Series(first, dtype="boolean"),
+            "is_benign": pd.Series(second, dtype="boolean"),
+            "label": pd.Series(label, dtype="string"),
+        }),
+        condition_columns=("is_loss", "is_benign", "label"),
+        advanced=True,
+    )
+    spec = GrammarSpec(
+        name="sparse-category-null",
+        patterns=(
+            ColumnPattern(
+                name="placeholder",
+                matcher="regex",
+                kind="unused",
+                direction="unused",
+                regex=r"^does_not_match$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("network",),
+            ref_roles={"network": ()},
+            fam_roles={"network": ()},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={"network": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    dataset, grammar = build_dataframe_grammar(
+        frame,
+        spec,
+        name="sparse_category_null",
+    )
+    rule = A.Rule(
+        "network",
+        A.CategoryDefinition(
+            "label",
+            (
+                ("is_loss", "loss"),
+                ("is_benign", "benign"),
+            ),
+            "normal",
+        ),
+    )
+    return dataset, grammar, rule
+
+
+def test_runtime_definition_null_preserves_sparse_categorical_gradeability():
+    dataset, grammar, rule = _sparse_nullable_category()
+    config = DiscoveryConfig(
+        hold_rate_threshold=0.5,
+        definition_min_lift=0.0,
+        band_mode="global",
+    )
+
+    real = DataOnlyEvaluator(dataset, config).evaluate(rule)
+    controls = V.prepare_runtime_null_controls(
+        dataset,
+        grammar,
+        SearchConfig(seed=0),
+        seed=0,
+        rules=[rule],
+    )
+    null = DataOnlyEvaluator(
+        controls.definition_null.ds,
+        config,
+    ).evaluate(rule)
+
+    assert real.n_points == 18
+    assert np.array_equal(
+        pd.isna(
+            controls.definition_null.ds.observed.row_context["label"]
+        ),
+        pd.isna(dataset.observed.row_context["label"]),
+    )
+    # The old whole-column permutation moved both target NAs onto the only priority-overlap rows,
+    # so this exact fixture produced n_points=0 and a vacuous zero null acceptance count.
+    assert null.n_points == 18
+    assert not null.accepted
+    assert V.null_definitions_at(
+        controls.definition_null,
+        config,
+        seed=0,
+    ) == 0
+
+
+def test_runtime_definition_null_fails_loudly_if_category_becomes_ungradeable():
+    dataset, grammar, rule = _sparse_nullable_category()
+    controls = V.prepare_runtime_null_controls(
+        dataset,
+        grammar,
+        SearchConfig(seed=0),
+        seed=0,
+        rules=[rule],
+    )
+    target = controls.definition_null.ds.observed.row_context["label"].copy()
+    target[[3, 15]] = "normal"
+    target[[0, 1]] = pd.NA
+    controls.definition_null.ds.observed.row_context["label"] = target
+
+    with pytest.raises(
+        RuntimeError,
+        match="expected 18 gradeable rows, found 0",
+    ):
+        V.null_definitions_at(
+            controls.definition_null,
+            DiscoveryConfig(
+                hold_rate_threshold=0.5,
+                definition_min_lift=0.0,
+                band_mode="global",
+            ),
+            seed=0,
+        )
 
 
 def test_runtime_null_envelope_accounts_for_wide_family_products():

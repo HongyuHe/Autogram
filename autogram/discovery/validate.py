@@ -1159,6 +1159,7 @@ class PreparedProxy:
     planted: dict
     proposer: object = None
     search_cfg: Optional[SearchConfig] = None
+    definition_gradeable_points: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -1857,6 +1858,203 @@ def _runtime_relation_null(
     return output
 
 
+def _permute_present_categories(
+    values,
+    rng,
+    *,
+    required_supports=(),
+    column: str = "",
+) -> np.ndarray:
+    """Permute labels while preserving their missingness mask."""
+    source = _typed_object_array(values)
+    required_supports = tuple(required_supports)
+    output = source.copy()
+    present = ~pd.isna(source)
+    positions = np.flatnonzero(present)
+    if positions.size < 2:
+        if required_supports:
+            raise RuntimeError(
+                "runtime definition null cannot independently randomize "
+                f"categorical target {column!r}"
+            )
+        return output
+
+    supports = [
+        np.asarray(mask, dtype=bool)
+        for mask in required_supports
+        if np.any(np.asarray(mask, dtype=bool) & present)
+    ]
+    if not supports:
+        supports = [present]
+    source_values = source[positions]
+
+    def changed_on_every_support(candidate) -> bool:
+        changed = np.zeros(source.size, dtype=bool)
+        changed[positions] = np.fromiter(
+            (
+                typed_group_key(left) != typed_group_key(right)
+                for left, right in zip(source_values, candidate)
+            ),
+            dtype=bool,
+            count=positions.size,
+        )
+        return all(np.any(changed & support) for support in supports)
+
+    for _attempt in range(64):
+        candidate = rng.permutation(source_values)
+        if changed_on_every_support(candidate):
+            output[positions] = candidate
+            return output
+
+    representatives = {}
+    for index, value in enumerate(source_values):
+        representatives.setdefault(typed_group_key(value), index)
+    required_positions = np.flatnonzero(
+        np.logical_or.reduce(supports) & present
+    )
+    position_to_local = {
+        int(position): local
+        for local, position in enumerate(positions)
+    }
+    for position in required_positions:
+        left = position_to_local[int(position)]
+        left_key = typed_group_key(source_values[left])
+        for key, right in representatives.items():
+            if key == left_key:
+                continue
+            candidate = source_values.copy()
+            candidate[left], candidate[right] = (
+                candidate[right],
+                candidate[left],
+            )
+            if changed_on_every_support(candidate):
+                output[positions] = candidate
+                return output
+    raise RuntimeError(
+        "runtime definition null cannot independently randomize "
+        f"categorical target {column!r} on every gradeable candidate support"
+    )
+
+
+def _categorical_definition_population(rule: A.Rule, frame):
+    """Return target, prediction, and gradeable rows for an identifiable category rule."""
+    from .evaluate import _condition_mask
+
+    if not isinstance(rule.atom, A.CategoryDefinition):
+        return None
+    atom = rule.atom
+    if atom.target_column not in frame.row_context:
+        return None
+    target = np.asarray(
+        frame.row_context[atom.target_column],
+        dtype=object,
+    )
+    valid = ~pd.isna(target)
+    if rule.condition is not None:
+        condition = _condition_mask(rule.condition, frame)
+        if condition is None:
+            return None
+        valid &= condition
+
+    case_masks = []
+    for column, value in atom.cases:
+        if column not in frame.row_context:
+            return None
+        raw = np.asarray(frame.row_context[column], dtype=object)
+        present = ~pd.isna(raw)
+        active = np.zeros(target.size, dtype=bool)
+        active[present] = raw[present].astype(bool)
+        valid &= present
+        case_masks.append((active, value))
+
+    for left_index, (left_mask, left_value) in enumerate(case_masks):
+        higher_active = np.zeros(target.size, dtype=bool)
+        for higher_mask, _higher_value in case_masks[:left_index]:
+            higher_active |= higher_mask
+        for right_mask, right_value in case_masks[left_index + 1:]:
+            if (
+                typed_group_key(left_value) != typed_group_key(right_value)
+                and not np.any(
+                    left_mask
+                    & right_mask
+                    & ~higher_active
+                    & valid
+                )
+            ):
+                return None
+
+    predicted = np.full(target.size, atom.default, dtype=object)
+    for active, value in reversed(case_masks):
+        predicted[active] = value
+    return target, predicted, valid
+
+
+def _runtime_categorical_requirements(dataset, rules):
+    from .evaluate import _typed_equal_array
+
+    requirements = {}
+    change_supports = {}
+    for rule in rules:
+        population = _categorical_definition_population(
+            rule,
+            dataset.observed,
+        )
+        if population is None:
+            continue
+        target, predicted, valid = population
+        if not np.any(valid):
+            continue
+        exact = bool(np.all(_typed_equal_array(
+            target[valid],
+            predicted[valid],
+        )))
+        requirements[rule.signature()] = (rule, valid.copy(), exact)
+        if exact:
+            change_supports.setdefault(
+                rule.atom.target_column,
+                [],
+            ).append(valid.copy())
+    return requirements, change_supports
+
+
+def _validate_runtime_categorical_null(
+    dataset,
+    requirements,
+) -> dict[str, int]:
+    from .evaluate import _typed_equal_array
+
+    gradeable_points = {}
+    for signature, (rule, expected_mask, exact) in requirements.items():
+        population = _categorical_definition_population(
+            rule,
+            dataset.observed,
+        )
+        actual_mask = (
+            population[2]
+            if population is not None
+            else np.zeros(dataset.observed.n_rows, dtype=bool)
+        )
+        expected = int(np.count_nonzero(expected_mask))
+        actual = int(np.count_nonzero(actual_mask))
+        if not np.array_equal(actual_mask, expected_mask):
+            raise RuntimeError(
+                "runtime definition null cannot test categorical candidate "
+                f"{rule.unparse()}: expected {expected} gradeable rows, "
+                f"found {actual}"
+            )
+        gradeable_points[signature] = expected
+        target, predicted, valid = population
+        if exact and np.all(_typed_equal_array(
+            target[valid],
+            predicted[valid],
+        )):
+            raise RuntimeError(
+                "runtime definition null did not break categorical candidate "
+                f"{rule.unparse()} on its gradeable rows"
+            )
+    return gradeable_points
+
+
 def _runtime_condition_context(
     adapter,
     n_rows: int,
@@ -1866,6 +2064,7 @@ def _runtime_condition_context(
     group_identities=None,
     source_context=None,
     independent_columns=(),
+    independent_supports=None,
 ) -> dict[str, np.ndarray]:
     domains = {
         name: tuple(values)
@@ -1881,11 +2080,17 @@ def _runtime_condition_context(
         and all(name in source_context for name in domains)
     ):
         independent = set(independent_columns)
+        supports = dict(independent_supports or {})
         context = {}
         for name in domains:
             source = _typed_object_array(source_context[name])
             context[name] = (
-                rng.permutation(source)
+                _permute_present_categories(
+                    source,
+                    rng,
+                    required_supports=supports.get(name, ()),
+                    column=name,
+                )
                 if name in independent
                 else source.copy()
             )
@@ -1956,6 +2161,7 @@ def _runtime_null_dataset(
     magnitude_ceiling: float = _NULL_MAGNITUDE_CEILING,
     presence_masks: bool = False,
     independent_condition_columns=(),
+    independent_condition_supports=None,
 ):
     rng = np.random.default_rng(int(seed))
     matrix = np.empty_like(dataset.observed.matrix, dtype=float)
@@ -2071,6 +2277,7 @@ def _runtime_null_dataset(
         group_identities=group_identities,
         source_context=dataset.observed.row_context,
         independent_columns=independent_condition_columns,
+        independent_supports=independent_condition_supports,
     )
     templates = tuple(
         getattr(adapter, "related_templates", {}).values()
@@ -2246,6 +2453,13 @@ def prepare_runtime_null_controls(
         for rule in definition_rules
         if isinstance(rule.atom, A.CategoryDefinition)
     }
+    (
+        categorical_requirements,
+        categorical_change_supports,
+    ) = _runtime_categorical_requirements(
+        dataset,
+        definition_rules,
+    )
     magnitude_ceiling = _runtime_null_magnitude_ceiling(
         dataset,
         grammar,
@@ -2285,9 +2499,18 @@ def prepare_runtime_null_controls(
             definition_targets=True,
             magnitude_ceiling=magnitude_ceiling,
             independent_condition_columns=categorical_targets,
+            independent_condition_supports=categorical_change_supports,
         )
         if definition_rules
         else None
+    )
+    definition_gradeable_points = (
+        _validate_runtime_categorical_null(
+            definition_dataset,
+            categorical_requirements,
+        )
+        if definition_dataset is not None
+        else {}
     )
     return ProxySuite(
         positives=[],
@@ -2331,6 +2554,7 @@ def prepare_runtime_null_controls(
                 {},
                 _PreparedRuleProposer(grammar, definition_rules),
                 search_cfg,
+                definition_gradeable_points,
             )
             if definition_dataset is not None
             else None
@@ -2634,6 +2858,36 @@ def null_definitions_at(prepared_null: PreparedProxy | None, dcfg: DiscoveryConf
                         seed: int = 0) -> int:
     if prepared_null is None:
         return 0
+    requirements = prepared_null.definition_gradeable_points
+    if requirements:
+        rules = {
+            rule.signature(): rule
+            for rule in prepared_null.proposer.propose()
+            if isinstance(rule.atom, A.CategoryDefinition)
+        }
+        missing = set(requirements) - set(rules)
+        if missing:
+            raise RuntimeError(
+                "runtime definition null lost categorical candidates "
+                "required for its gradeability check"
+            )
+        for signature, expected in requirements.items():
+            rule = rules[signature]
+            population = _categorical_definition_population(
+                rule,
+                prepared_null.ds.observed,
+            )
+            actual = (
+                int(np.count_nonzero(population[2]))
+                if population is not None
+                else 0
+            )
+            if actual != expected:
+                raise RuntimeError(
+                    "runtime definition null cannot test categorical candidate "
+                    f"{rule.unparse()}: expected {expected} gradeable rows, "
+                    f"found {actual}"
+                )
     res = run_prepared(
         prepared_null.ds,
         prepared_null.G,
