@@ -12,6 +12,12 @@ import numpy as np
 import pandas as pd
 
 from ..config import DiscoveryConfig
+from ..counter_state import (
+    counter_boundary_deltas,
+    is_reset_marker,
+    scan_counter_state,
+    trustworthy_boundaries,
+)
 
 
 AUTOGRAM_PROFILE_ATTR = "autogram_profile"
@@ -750,12 +756,9 @@ def _materialize_raw(
         consumer: np.asarray(sorted(indices), dtype=int)
         for consumer, indices in _own.items()
     }
-    # The streaming join accepts a parent row only when every partition is covered AND at least one
-    # partition contributed a usable value (`complete & any_valid` in `dsl/evaluate.py`). Coverage
-    # is expressible per shard column; "at least one usable contributor" is not, so it is collected
-    # here and applied in a second pass. Without it a consumer whose only shard resets would read as
-    # a total of 0 in the fast path while the join calls the row ungradeable.
-    consumer_covered: dict[tuple, set] = {}
+    # Invalid shard deltas contribute zero to the consumer sum, exactly as the
+    # generator's nan-aware shard reduction does. Rows where no shard has a
+    # valid delta are restored to NaN in a second pass.
     consumer_any_valid: dict[tuple, set] = {}
     minute_ns = (
         int(rate_window_seconds)
@@ -793,6 +796,7 @@ def _materialize_raw(
         )
 
     materialized: dict[str, np.ndarray] = {}
+    consumer_increment_names: dict[tuple, list[str]] = {}
     reserved_columns = {str(column) for column in derived.columns}
     allocated_columns = set()
 
@@ -875,92 +879,125 @@ def _materialize_raw(
             dtype=np.int64,
         )
 
-        boundaries = group.groupby("_minute_index", sort=True, observed=True).tail(1)
+        group["_state_position"] = np.arange(len(group), dtype=np.int64)
+        boundaries = group.groupby(
+            "_minute_index",
+            sort=True,
+            observed=True,
+        ).tail(1)
         minute_ids = boundaries["_minute_index"].to_numpy(dtype=int)
-        reset_by_minute = (
-            group.groupby("_minute_index", sort=True, observed=True)["reset_flag"]
-            .any()
-            .reindex(minute_ids, fill_value=False)
-            .to_numpy(dtype=bool)
+        reset_flags = np.fromiter(
+            (
+                is_reset_marker(value)
+                for value in group["reset_flag"].to_numpy(dtype=object)
+            ),
+            dtype=bool,
+            count=len(group),
         )
+        counter_columns = tuple(_COUNTERS)
+        raw_counters = np.column_stack([
+            pd.to_numeric(
+                group[counter],
+                errors="coerce",
+            ).to_numpy(dtype=float, na_value=np.nan)
+            for counter in counter_columns
+        ])
+        effective, observed = scan_counter_state(
+            raw_counters,
+            reset_flags,
+        )
+        boundary_positions = boundaries[
+            "_state_position"
+        ].to_numpy(dtype=int)
+        counter_boundaries = effective[boundary_positions]
+        observed_in_minute = np.zeros(
+            (minute_ids.size, len(counter_columns)),
+            dtype=bool,
+        )
+        reset_by_minute = np.zeros(minute_ids.size, dtype=bool)
+        bucket_positions = {
+            int(minute): position
+            for position, minute in enumerate(minute_ids)
+        }
+        for row, minute in enumerate(
+            group["_minute_index"].to_numpy(dtype=int)
+        ):
+            bucket = bucket_positions[int(minute)]
+            observed_in_minute[bucket] |= observed[row]
+            reset_by_minute[bucket] |= reset_flags[row]
 
-        counter_boundaries: dict[str, np.ndarray] = {}
-        for counter in _COUNTERS:
-            # Non-finite readings are missing data; forward fill only carries ``NaN``, so leaving an
-            # infinity in place would treat it as a real reading. The streaming path applies the
-            # same rule, and the two implementations of one cross-grain law must agree.
-            numeric = pd.to_numeric(group[counter], errors="coerce")
-            filled = numeric.mask(
-                ~np.isfinite(numeric.to_numpy(dtype=float))
-            ).ffill()
-            counter_boundaries[counter] = (
-                filled.groupby(group["_minute_index"], sort=True)
-                .last()
-                .reindex(minute_ids)
-                .to_numpy(dtype=float)
-            )
-        adjacent = np.zeros(minute_ids.size, dtype=bool)
+        trustworthy = trustworthy_boundaries(
+            observed_in_minute,
+            reset_by_minute[:, None],
+        )
+        previous_boundaries = np.concatenate(
+            (
+                counter_boundaries[:1],
+                counter_boundaries[:-1],
+            ),
+            axis=0,
+        )
+        previous_trustworthy = np.zeros_like(trustworthy)
         if minute_ids.size > 1:
-            adjacent[1:] = np.diff(minute_ids) == 1
-        eligible = adjacent & ~reset_by_minute
-        increments = {}
-        for counter, values in counter_boundaries.items():
-            previous = np.concatenate((values[:1], values[:-1]))
-            delta = np.full(values.shape, np.nan, dtype=float)
-            rows = np.flatnonzero(eligible)
-            with np.errstate(over="ignore", invalid="ignore"):
-                delta[rows] = values[rows] - previous[rows]
-            overflow = (
-                ~np.isfinite(delta)
-                & np.isfinite(values)
-                & np.isfinite(previous)
-                & eligible
+            adjacent = np.diff(minute_ids) == 1
+            previous_trustworthy[1:] = (
+                trustworthy[:-1] & adjacent[:, None]
             )
-            if np.any(overflow):
-                raw_consumer = raw_consumer_by_key[consumer_key]
-                raw_shard = raw_shard_by_key[shard_key]
-                minute = int(minute_ids[int(np.flatnonzero(overflow)[0])])
-                raise ValueError(
-                    "GTIB counter subtraction overflowed float64 for "
-                    f"consumer {raw_consumer!r}, shard {raw_shard!r}, "
-                    f"counter {counter!r}, minute {minute}"
-                )
-            increments[counter] = delta
-        valid = eligible.copy()
-        for values in increments.values():
-            valid &= np.isfinite(values) & (values >= 0.0)
-        # The streaming join separates *coverage* from *validity*: a minute with no adjacent prior
-        # boundary has no measurable increment at all (`coverage` in `dsl/evaluate.py`), whereas a
-        # covered minute whose increment is unusable (a reset, a negative step) still counts as a
-        # deliberate zero contribution. The materialised path has to draw the same line, or the two
-        # implementations of one law disagree on exactly the awkward rows.
-        covered = adjacent.copy()
+        delta_matrix, valid_matrix, overflow = (
+            counter_boundary_deltas(
+                counter_boundaries,
+                previous_boundaries,
+                trustworthy,
+                previous_trustworthy,
+                reset_by_minute[:, None],
+            )
+        )
+        if np.any(overflow):
+            minute_position, counter_position = np.argwhere(
+                overflow
+            )[0]
+            raw_consumer = raw_consumer_by_key[consumer_key]
+            raw_shard = raw_shard_by_key[shard_key]
+            raise ValueError(
+                "GTIB counter subtraction overflowed float64 for "
+                f"consumer {raw_consumer!r}, shard {raw_shard!r}, "
+                f"counter {counter_columns[counter_position]!r}, "
+                f"minute {int(minute_ids[minute_position])}"
+            )
+        increments = {
+            counter: delta_matrix[:, position]
+            for position, counter in enumerate(counter_columns)
+        }
+        valid = np.all(valid_matrix, axis=1)
 
         safe_shard = safe_group_names[(consumer_key, shard_key)]
         for counter, suffix in _COUNTERS.items():
             name = allocate_column_name(f"{safe_shard}_{suffix}")
-            # Three-way, mirroring the streaming join. Other consumers' rows stay 0 (this shard
-            # contributes nothing there). This consumer's minutes start NaN -- no coverage -- so a
-            # minute the shard never reported, or one with no adjacent prior boundary, leaves the
-            # cross-grain total ungradeable rather than silently counting as zero. A covered minute
-            # whose increment is unusable is a deliberate 0, because the emitted per-minute value
-            # excludes that shard too.
+            # Invalid shard deltas are zero contributions, including resets,
+            # fully missing buckets, and the first bucket after a missing
+            # boundary. The second pass below restores NaN when every shard is
+            # invalid, matching the generator's nan-aware reduction.
             values = np.zeros(len(derived), dtype=float)
-            own = own_rows.get(consumer_key)
-            if own is not None and own.size:
-                values[own] = np.nan
-            for minute, value, is_valid, is_covered in zip(
-                minute_ids, increments[counter], valid, covered
+            for minute, value, is_valid in zip(
+                minute_ids,
+                increments[counter],
+                valid,
             ):
                 index = parent_lookup.get((consumer_key, int(minute)))
-                if index is None or not is_covered:
+                if index is None:
                     continue
                 values[index] = float(value) if is_valid else 0.0
                 if is_valid:
-                    consumer_any_valid.setdefault(consumer_key, set()).add(index)
-                consumer_covered.setdefault(consumer_key, set()).add(index)
+                    consumer_any_valid.setdefault(
+                        consumer_key,
+                        set(),
+                    ).add(index)
             materialized[name] = values
             families[f"shard_{suffix}"].append(name)
+            consumer_increment_names.setdefault(
+                consumer_key,
+                [],
+            ).append(name)
 
         for boundary_col in _BOUNDARY_COLUMNS:
             if boundary_col not in boundaries.columns:
@@ -989,9 +1026,9 @@ def _materialize_raw(
             materialized[name] = values
             families[f"shard_{boundary_col}"].append(name)
 
-    # Second pass for the join's "at least one usable contributor" rule: a minute every shard
-    # covered but none could contribute carries no information, so the increment columns report it
-    # as ungradeable instead of as a total of zero.
+    # A total with no valid shard carries no information. Blank every increment
+    # member on those rows so the family SUM and streaming aggregate both
+    # remain ungradeable instead of fabricating zero.
     increment_names = [
         name
         for family, columns in families.items()
@@ -999,17 +1036,17 @@ def _materialize_raw(
         for name in columns
     ]
     if increment_names:
-        for consumer, covered_rows in consumer_covered.items():
-            barren = covered_rows - consumer_any_valid.get(consumer, set())
+        for consumer, own in own_rows.items():
+            barren = set(own.tolist()) - consumer_any_valid.get(
+                consumer,
+                set(),
+            )
             if not barren:
                 continue
             rows = np.asarray(sorted(barren), dtype=int)
-            for name in increment_names:
+            for name in consumer_increment_names.get(consumer, ()):
                 column = materialized.get(name)
                 if column is None:
-                    continue
-                own = own_rows.get(consumer)
-                if own is None:
                     continue
                 # Only blank the rows that belong to this consumer; other consumers' structural
                 # zeros must stay untouched.

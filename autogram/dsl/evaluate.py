@@ -21,6 +21,12 @@ from decimal import Decimal, InvalidOperation
 import numpy as np
 import pandas as pd
 
+from ..counter_state import (
+    counter_boundary_deltas,
+    is_reset_marker,
+    scan_counter_state,
+    trustworthy_boundaries,
+)
 from ..loader.loader import Frame
 from ..loader.names import NameModel
 from . import ast as A
@@ -1137,6 +1143,24 @@ def _saturating_add_ns(times: np.ndarray, delta_ns: int) -> np.ndarray:
     return np.where(saturated, limit, shifted), saturated
 
 
+def _saturating_sub_ns(
+    times: np.ndarray,
+    delta_ns: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``times - delta_ns`` in nanoseconds, saturating instead of wrapping."""
+
+    times = np.asarray(times, dtype=np.int64)
+    limit = np.iinfo(np.int64).min
+    delta = int(delta_ns)
+    if delta <= 0:
+        return times - delta, np.zeros(times.shape, dtype=bool)
+    threshold = limit + delta
+    saturated = times < threshold
+    with np.errstate(over="ignore"):
+        shifted = times - delta
+    return np.where(saturated, limit, shifted), saturated
+
+
 def _related_key_part(value):
     return _RELATED_MISSING_KEY if bool(pd.isna(value)) else value
 
@@ -1224,6 +1248,9 @@ def _child_partition_index(template, frame: Frame, child):
             "times": times[order],
             "values": {},
             "reset_prefix": {},
+            "reset_flags": {},
+            "counter_values": {},
+            "counter_observed_prefix": {},
             "sum_index": sum_index,
         })
         sum_index += 1
@@ -1232,14 +1259,11 @@ def _child_partition_index(template, frame: Frame, child):
 
 
 def _partition_values(partition: dict, child, column: str, forward_fill: bool = True) -> np.ndarray:
-    """Child values for one partition, optionally carrying the last reading forward.
+    """Child values for a non-counter partition aggregate.
 
-    Forward filling is correct for monotone counters, where a skipped report genuinely means "the
-    counter has not moved since the last reading", and it is what the materialised fast path does
-    for those columns. It is NOT correct for a boundary *level* column: carrying a stale level
-    forward invents a reading the child never emitted, and the materialised path does not do it
-    there. The two implementations of the same cross-grain law must agree on missing data, so the
-    caller states which convention this column follows.
+    Reset-aware counters use :func:`_partition_counter_state`; this helper is
+    retained for boundary-level modes, where callers normally disable forward
+    fill so a stale level cannot masquerade as an emitted reading.
     """
     key = (column, bool(forward_fill))
     if key not in partition["values"]:
@@ -1267,16 +1291,14 @@ def _is_reset(value) -> bool:
     monotone across genuine resets. Treat any finite non-zero numeric, ``True``, or an explicit
     truthy string as a reset; ``NaN``/missing is not a reset.
     """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float, np.integer, np.floating)):
-        numeric = float(value)
-        return math.isfinite(numeric) and abs(numeric) > 1e-9
-    text = str(value).strip().lower()
-    return text in ("true", "1", "1.0", "yes", "t")
+    return is_reset_marker(value)
 
 
-def _partition_reset_prefix(partition: dict, child, column: str) -> np.ndarray:
+def _partition_reset_data(
+    partition: dict,
+    child,
+    column: str,
+) -> tuple[np.ndarray, np.ndarray]:
     if column not in partition["reset_prefix"]:
         resets = np.fromiter(
             (
@@ -1286,11 +1308,52 @@ def _partition_reset_prefix(partition: dict, child, column: str) -> np.ndarray:
             dtype=bool,
             count=len(partition["positions"]),
         )
+        partition["reset_flags"][column] = resets
         partition["reset_prefix"][column] = np.concatenate((
             np.zeros(1, dtype=np.int64),
             np.cumsum(resets, dtype=np.int64),
         ))
-    return partition["reset_prefix"][column]
+    return (
+        partition["reset_flags"][column],
+        partition["reset_prefix"][column],
+    )
+
+
+def _partition_counter_state(
+    partition: dict,
+    child,
+    column: str,
+    reset_column: str | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reset-aware effective values and finite-observation prefix counts."""
+
+    key = (column, reset_column or "")
+    if key not in partition["counter_values"]:
+        numeric = pd.to_numeric(
+            child.iloc[partition["positions"]][column],
+            errors="coerce",
+        ).to_numpy(dtype=float, na_value=np.nan)
+        if reset_column:
+            resets, _prefix = _partition_reset_data(
+                partition,
+                child,
+                reset_column,
+            )
+        else:
+            resets = np.zeros(len(numeric), dtype=bool)
+        effective, observed = scan_counter_state(
+            numeric[:, None],
+            resets,
+        )
+        partition["counter_values"][key] = effective[:, 0]
+        partition["counter_observed_prefix"][key] = np.concatenate((
+            np.zeros(1, dtype=np.int64),
+            np.cumsum(observed[:, 0], dtype=np.int64),
+        ))
+    return (
+        partition["counter_values"][key],
+        partition["counter_observed_prefix"][key],
+    )
 
 
 def _related_aggregate(template, frame: Frame):
@@ -1376,18 +1439,19 @@ def _related_aggregate(template, frame: Frame):
             )
             has_interval = interval_starts < interval_ends
             boundaries = interval_ends - 1
-            # A boundary *level* is read as emitted; a counter is carried forward. See
-            # `_partition_values`.
-            forward_fill = template.mode != "sum_last"
-            values = {
-                column: _partition_values(partition, child, column, forward_fill)
-                for column in fill_columns
-            }
             partition_valid = np.zeros(len(ordered_parent), dtype=bool)
             contribution = np.zeros(len(ordered_parent), dtype=float)
             if template.mode == "sum_last":
+                # Boundary levels are read exactly as emitted; stale levels are
+                # never carried into a later window.
+                current_values = _partition_values(
+                    partition,
+                    child,
+                    template.column,
+                    forward_fill=False,
+                )
                 active = np.flatnonzero(has_interval)
-                current = values[template.column][boundaries[active]]
+                current = current_values[boundaries[active]]
                 valid = np.isfinite(current)
                 rows = active[valid]
                 partition_valid[rows] = True
@@ -1403,69 +1467,112 @@ def _related_aggregate(template, frame: Frame):
                     local_index,
                 ] = contribution
                 continue
-            prior_boundaries = (
-                np.searchsorted(times, starts, side="left") - 1
-            )
-            has_prior = prior_boundaries >= 0
-            prior_is_adjacent = np.zeros(len(ordered_parent), dtype=bool)
-            prior_rows = np.flatnonzero(has_prior)
-            prior_deadlines, _prior_saturated = _saturating_add_ns(
-                times[prior_boundaries[prior_rows]],
+
+            prior_starts, _prior_saturated = _saturating_sub_ns(
+                starts,
                 window_ns,
             )
-            prior_is_adjacent[prior_rows] = (
-                prior_deadlines >= starts[prior_rows]
+            prior_interval_starts = np.searchsorted(
+                times,
+                prior_starts,
+                side="left",
             )
-            coverage = has_interval & has_prior & prior_is_adjacent
-            eligible = coverage.copy()
+            prior_interval_ends = interval_starts
+            prior_boundaries = prior_interval_ends - 1
+            reset_current = np.zeros(
+                len(ordered_parent),
+                dtype=bool,
+            )
+            reset_previous = np.zeros(
+                len(ordered_parent),
+                dtype=bool,
+            )
             if template.reset_column:
-                prefix = _partition_reset_prefix(
+                _reset_flags, reset_prefix = _partition_reset_data(
                     partition,
                     child,
                     template.reset_column,
                 )
-                covered_rows = np.flatnonzero(coverage)
-                eligible[covered_rows] = (
-                    prefix[interval_ends[covered_rows]]
-                    - prefix[interval_starts[covered_rows]]
-                ) == 0
-            active = np.flatnonzero(eligible)
-            valid = np.ones(len(active), dtype=bool)
-            active_blown = np.zeros(len(active), dtype=bool)
-            for column in template.validity_columns:
-                end_values = values[column][boundaries[active]]
-                start_values = values[column][prior_boundaries[active]]
-                with np.errstate(over="ignore", invalid="ignore"):
-                    delta = end_values - start_values
-                active_blown |= (
-                    np.isinf(delta)
-                    & np.isfinite(end_values)
-                    & np.isfinite(start_values)
-                )
-                valid &= np.isfinite(delta) & (delta >= 0.0)
-            end_values = values[template.column][boundaries[active]]
-            start_values = values[template.column][prior_boundaries[active]]
-            with np.errstate(over="ignore", invalid="ignore"):
-                delta = end_values - start_values
-            # An infinite difference of two FINITE readings is this aggregation's own arithmetic
-            # blowing up, not a missing reading. Marking the shard invalid would let it contribute
-            # zero to a total that then looks complete.
-            active_blown |= (
-                np.isinf(delta) & np.isfinite(end_values) & np.isfinite(start_values)
+                reset_current = (
+                    reset_prefix[interval_ends]
+                    - reset_prefix[interval_starts]
+                ) > 0
+                reset_previous = (
+                    reset_prefix[prior_interval_ends]
+                    - reset_prefix[prior_interval_starts]
+                ) > 0
+
+            current_boundaries = np.full(
+                (len(ordered_parent), len(fill_columns)),
+                np.nan,
+                dtype=float,
             )
-            blown[active[active_blown]] = True
-            valid &= np.isfinite(delta) & (delta >= 0.0)
-            rows = active[valid]
-            partition_valid[rows] = True
-            contribution[rows] = delta[valid]
-            # Deliberately `coverage`, not `partition_valid`, and deliberately different from the
-            # `sum_last` branch above. This mode sums *increments*: a shard that reset inside the
-            # interval has no measurable increment, and the emitted per-minute value likewise
-            # excludes it, so skipping that shard is what matches the data (see
-            # test_related_delta_sums_valid_shards_across_reset). A *level* sum has no such escape
-            # -- every shard's backlog exists whether or not it was reported -- which is why that
-            # branch is all-or-nothing.
-            complete &= coverage
+            previous_boundaries = np.full_like(
+                current_boundaries,
+                np.nan,
+            )
+            observed_current = np.zeros(
+                current_boundaries.shape,
+                dtype=bool,
+            )
+            observed_previous = np.zeros(
+                current_boundaries.shape,
+                dtype=bool,
+            )
+            current_rows = np.flatnonzero(has_interval)
+            previous_rows = np.flatnonzero(
+                prior_interval_starts < prior_interval_ends
+            )
+            for column_index, column in enumerate(fill_columns):
+                effective, observed_prefix = _partition_counter_state(
+                    partition,
+                    child,
+                    column,
+                    template.reset_column,
+                )
+                current_boundaries[
+                    current_rows,
+                    column_index,
+                ] = effective[boundaries[current_rows]]
+                previous_boundaries[
+                    previous_rows,
+                    column_index,
+                ] = effective[prior_boundaries[previous_rows]]
+                observed_current[:, column_index] = (
+                    observed_prefix[interval_ends]
+                    - observed_prefix[interval_starts]
+                ) > 0
+                observed_previous[:, column_index] = (
+                    observed_prefix[prior_interval_ends]
+                    - observed_prefix[prior_interval_starts]
+                ) > 0
+
+            current_trustworthy = trustworthy_boundaries(
+                observed_current,
+                reset_current[:, None],
+            )
+            previous_trustworthy = trustworthy_boundaries(
+                observed_previous,
+                reset_previous[:, None],
+            )
+            delta, valid, delta_overflow = counter_boundary_deltas(
+                current_boundaries,
+                previous_boundaries,
+                current_trustworthy,
+                previous_trustworthy,
+                reset_current[:, None],
+            )
+            partition_valid = np.all(valid, axis=1)
+            target_index = fill_columns.index(template.column)
+            contribution[partition_valid] = delta[
+                partition_valid,
+                target_index,
+            ]
+            blown |= np.any(delta_overflow, axis=1)
+            # Invalid shard deltas contribute zero; a row is ungradeable only
+            # when every shard is invalid. This is the generator's nan-aware
+            # shard reduction and differs intentionally from all-or-nothing
+            # boundary-level sums.
             any_valid |= partition_valid
             contribution_matrix[
                 :,
@@ -1479,8 +1586,11 @@ def _related_aggregate(template, frame: Frame):
                 blown |= reduction_overflow
         else:
             totals = np.zeros(len(ordered_parent), dtype=float)
-        accepted = complete & any_valid
-        blown &= complete
+        if template.mode == "sum_last":
+            accepted = complete & any_valid
+            blown &= complete
+        else:
+            accepted = any_valid
         output[ordered_parent[accepted]] = totals[accepted]
         overflow[ordered_parent[blown]] = True
 

@@ -18,7 +18,15 @@ import pandas as pd
 import pytest
 
 from gtib_emulator import cli
+from gtib_emulator import deriver as deriver_module
+from gtib_emulator import invariants as invariants_module
 from gtib_emulator.config import load_config
+from gtib_emulator.deriver import (
+    _minute_counters,
+    _sustained_below,
+    derive_consumer,
+    trajectory_alert,
+)
 from gtib_emulator.generate import run
 from gtib_emulator.invariants import check_all
 
@@ -137,6 +145,81 @@ def test_hard_checks_reject_malformed_derived_identity_grid(
 
     assert not grid.passed
     assert detail in grid.detail
+
+
+def test_hard_checks_require_derived_archetype_column(result):
+    records = [
+        {
+            **record,
+            "frame": record["frame"].copy(),
+        }
+        for record in result.records
+    ]
+    records[0]["frame"] = records[0]["frame"].drop(
+        columns=["archetype"]
+    )
+
+    checks = check_all(result.config, records, result.events)
+    grid = next(
+        check
+        for check in checks
+        if check.name == "derived_identity_grid"
+    )
+
+    assert not grid.passed
+    assert "missing required archetype column" in grid.detail
+
+
+@pytest.mark.parametrize("corruption", ("wrong", None, pd.NA))
+def test_hard_checks_reject_corrupted_derived_archetype(
+    result,
+    corruption,
+):
+    records = [
+        {
+            **record,
+            "frame": record["frame"].copy(),
+        }
+        for record in result.records
+    ]
+    frame = records[0]["frame"]
+    frame["archetype"] = frame["archetype"].astype(object)
+    frame.at[frame.index[0], "archetype"] = corruption
+
+    checks = check_all(result.config, records, result.events)
+    grid = next(
+        check
+        for check in checks
+        if check.name == "derived_identity_grid"
+    )
+
+    assert not grid.passed
+    assert "archetype rows that do not match" in grid.detail
+
+
+def test_derived_archetype_validation_is_typed_and_length_safe(result):
+    records = copy.deepcopy(result.records)
+    frame = records[0]["frame"].iloc[:-1].copy()
+    expected = True
+    frame["archetype"] = pd.Series(
+        [expected] * len(frame),
+        index=frame.index,
+        dtype=object,
+    )
+    frame.at[frame.index[0], "archetype"] = 1
+    records[0]["consumer"].archetype = expected
+    records[0]["frame"] = frame
+
+    checks = check_all(result.config, records, result.events)
+    grid = next(
+        check
+        for check in checks
+        if check.name == "derived_identity_grid"
+    )
+
+    assert not grid.passed
+    assert "rows=" in grid.detail
+    assert "archetype rows that do not match" in grid.detail
 
 
 def test_hard_checks_reject_duplicate_generated_consumer(result):
@@ -440,6 +523,87 @@ def test_malformed_raw_tables_fail_hard_without_raising(
     assert detail in grid.detail
 
 
+@pytest.mark.parametrize(
+    "column",
+    (
+        "collector_input_counted",
+        "presenter_output_counted",
+        "missing_flag",
+        "reset_flag",
+        "backlog_bytes",
+        "cum_lost_bytes",
+    ),
+)
+def test_raw_schema_requires_every_emitted_payload_column(
+    result,
+    column,
+):
+    raw = result.raw.drop(columns=[column])
+
+    checks = check_all(
+        result.config,
+        result.records,
+        result.events,
+        raw,
+    )
+    grid = next(
+        check
+        for check in checks
+        if check.name == "raw_identity_grid"
+    )
+
+    assert not grid.passed
+    assert "missing payload columns" in grid.detail
+    assert column in grid.detail
+
+
+@pytest.mark.parametrize(
+    ("column", "corruption"),
+    (
+        ("collector_input_counted", "increment"),
+        ("presenter_output_counted", "unexpected_nan"),
+        ("collector_input_counted", "nan_as_none"),
+        ("missing_flag", "toggle"),
+        ("reset_flag", "toggle"),
+        ("backlog_bytes", "increment"),
+        ("cum_lost_bytes", "increment"),
+    ),
+)
+def test_raw_payload_must_exactly_match_generator_records(
+    result,
+    column,
+    corruption,
+):
+    raw = result.raw.copy()
+    if corruption == "nan_as_none":
+        index = raw.index[raw[column].isna()][0]
+        raw[column] = raw[column].astype(object)
+        raw.at[index, column] = None
+    else:
+        index = raw.index[raw[column].notna()][0]
+        if corruption == "increment":
+            raw.at[index, column] += 1.0
+        elif corruption == "unexpected_nan":
+            raw.at[index, column] = np.nan
+        else:
+            raw.at[index, column] = not bool(raw.at[index, column])
+
+    checks = check_all(
+        result.config,
+        result.records,
+        result.events,
+        raw,
+    )
+    grid = next(
+        check
+        for check in checks
+        if check.name == "raw_identity_grid"
+    )
+
+    assert not grid.passed
+    assert f"raw payload column {column!r}" in grid.detail
+
+
 def test_hard_checks_detect_corrupted_static_alert(result):
     records = [
         {
@@ -706,6 +870,251 @@ def test_generator_rejects_incompatible_minute_cadence(
 ):
     with pytest.raises(ValueError, match=message):
         load_config(overrides={"time": time_overrides})
+
+
+@pytest.mark.parametrize(
+    "duration",
+    (0, -1, 1.5, True, "10"),
+)
+def test_generator_rejects_invalid_alert_duration(duration):
+    with pytest.raises(
+        ValueError,
+        match="alerting.alert_duration_minutes must be a positive integer",
+    ):
+        load_config(overrides={
+            "alerting": {"alert_duration_minutes": duration},
+        })
+
+
+@pytest.mark.parametrize("duration", (0, -1, 1.5, True))
+def test_sustained_below_defensively_rejects_invalid_duration(
+    duration,
+):
+    with pytest.raises(
+        ValueError,
+        match="duration_minutes must be a positive integer",
+    ):
+        _sustained_below(
+            np.array([np.nan, 0.5, 0.5]),
+            threshold=0.99,
+            duration_minutes=duration,
+        )
+
+
+def test_missing_reset_scrape_clears_prior_counter_state():
+    increments, valid = _minute_counters(
+        np.array([[100.0, np.nan, 5.0]]),
+        np.array([[False, True, False]]),
+        spm=1,
+    )
+
+    assert not valid[0, 1]
+    assert valid[0, 2]
+    assert increments[0, 2] == 5.0
+
+
+def test_missing_minute_requires_adjacent_trustworthy_boundaries():
+    increments, valid = _minute_counters(
+        np.array([[
+            5.0,
+            10.0,
+            np.nan,
+            np.nan,
+            15.0,
+            20.0,
+            25.0,
+            30.0,
+        ]]),
+        np.zeros((1, 8), dtype=bool),
+        spm=2,
+    )
+    rates = np.where(valid, increments, np.nan)
+
+    assert not valid[0, 1]
+    assert np.isnan(rates[0, 1])
+    assert not valid[0, 2]
+    assert np.isnan(rates[0, 2])
+    assert valid[0, 3]
+    assert rates[0, 3] == 10.0
+
+
+def test_derived_identity_oracle_rejects_legacy_gap_rates(
+    result,
+    monkeypatch,
+):
+    records = copy.deepcopy(result.records)
+    record = records[0]
+    obs = record["obs"]
+    cfg = result.config
+    spm = cfg.raw_steps_per_minute
+    end = 4 * spm
+    counter_pattern = np.concatenate((
+        np.linspace(10.0, 60.0, spm),
+        np.full(spm, np.nan),
+        np.linspace(70.0, 120.0, spm),
+        np.linspace(130.0, 180.0, spm),
+    ))
+    for counter in (obs.input_counted, obs.output_counted):
+        counter[:, :end] = counter_pattern
+    obs.missing_flag[:, :end] = False
+    obs.missing_flag[:, spm:2 * spm] = True
+    obs.reset_flag[:, :end] = False
+    obs.active_flag[:, :end] = True
+
+    def legacy_minute_counters(counter, reset_flag, steps_per_minute):
+        n_shards, n_steps = counter.shape
+        n_minutes = n_steps // steps_per_minute
+        counter = counter[:, :n_minutes * steps_per_minute]
+        reset_flag = reset_flag[:, :n_minutes * steps_per_minute]
+        filled = counter.copy()
+        for shard in range(n_shards):
+            last = np.nan
+            for step in range(filled.shape[1]):
+                if reset_flag[shard, step]:
+                    last = 0.0
+                if np.isnan(filled[shard, step]):
+                    filled[shard, step] = last
+                else:
+                    last = filled[shard, step]
+        boundary = filled.reshape(
+            n_shards,
+            n_minutes,
+            steps_per_minute,
+        )[:, :, -1]
+        increments = np.diff(
+            boundary,
+            axis=1,
+            prepend=boundary[:, :1],
+        )
+        reset_in_minute = reset_flag.reshape(
+            n_shards,
+            n_minutes,
+            steps_per_minute,
+        ).any(axis=2)
+        valid = (
+            np.isfinite(increments)
+            & (increments >= 0.0)
+            & ~reset_in_minute
+        )
+        valid[:, 0] = False
+        return increments, valid
+
+    monkeypatch.setattr(
+        deriver_module,
+        "_minute_counters",
+        legacy_minute_counters,
+    )
+    monkeypatch.setattr(
+        invariants_module,
+        "_minute_counters",
+        legacy_minute_counters,
+        raising=False,
+    )
+    labels = record["frame"][[
+        "is_true_loss",
+        "is_benign_burst",
+        "is_artifact",
+        "label",
+        "oracle_alert",
+    ]].reset_index(drop=True)
+    frame = derive_consumer(
+        cfg,
+        record["consumer"],
+        obs,
+        record["phys"],
+    )
+    frame = pd.concat([frame, labels], axis=1)
+    frame["traj_alert"] = trajectory_alert(cfg, frame)
+    record["frame"] = frame
+
+    assert frame.loc[1, "input_rate_bytes_per_min"] == 0.0
+    assert np.isfinite(frame.loc[2, "input_rate_bytes_per_min"])
+    checks = check_all(cfg, records, result.events)
+    identities = next(
+        check
+        for check in checks
+        if check.name == "derived_signal_identities"
+    )
+
+    assert not identities.passed
+
+
+def test_derived_signal_identities_share_missing_reset_semantics(result):
+    records = copy.deepcopy(result.records)
+    record = records[0]
+    obs = record["obs"]
+    cfg = result.config
+    spm = cfg.raw_steps_per_minute
+    reset_index = 2 * spm - 1
+    end = 3 * spm
+
+    old_lifetime = np.linspace(100.0 / spm, 100.0, spm)
+    reset_minute = np.linspace(110.0, 100.0 + 10.0 * spm, spm)
+    reset_minute[-1] = np.nan
+    new_lifetime = np.linspace(0.0, 5.0, spm)
+    counter_pattern = np.concatenate((
+        old_lifetime,
+        reset_minute,
+        new_lifetime,
+    ))
+    for counter in (obs.input_counted, obs.output_counted):
+        counter[0, :end] = counter_pattern
+    obs.missing_flag[0, :end] = False
+    obs.missing_flag[0, reset_index] = True
+    obs.reset_flag[0, :end] = False
+    obs.reset_flag[0, reset_index] = True
+    obs.active_flag[0, :end] = True
+
+    labels = record["frame"][[
+        "is_true_loss",
+        "is_benign_burst",
+        "is_artifact",
+        "label",
+        "oracle_alert",
+    ]].reset_index(drop=True)
+    frame = derive_consumer(
+        cfg,
+        record["consumer"],
+        obs,
+        record["phys"],
+    )
+    frame = pd.concat([frame, labels], axis=1)
+    frame["traj_alert"] = trajectory_alert(cfg, frame)
+    record["frame"] = frame
+
+    checks = check_all(cfg, records, result.events)
+    identities = next(
+        check
+        for check in checks
+        if check.name == "derived_signal_identities"
+    )
+    assert identities.passed, identities.detail
+
+    record["frame"].loc[
+        2,
+        "input_rate_bytes_per_min",
+    ] += 1.0
+    corrupted_checks = check_all(cfg, records, result.events)
+    corrupted_identities = next(
+        check
+        for check in corrupted_checks
+        if check.name == "derived_signal_identities"
+    )
+    assert not corrupted_identities.passed
+
+
+def test_seed_zero_missing_reset_does_not_report_false_decrease():
+    cfg = load_config(overrides={"seed": 0})
+    generated = run(cfg)
+
+    checks = check_all(cfg, generated.records, generated.events)
+    monotone = next(
+        check
+        for check in checks
+        if check.name == "observed_counters_monotone_between_resets"
+    )
+
+    assert monotone.passed, monotone.detail
 
 
 def test_derived_schema(result):

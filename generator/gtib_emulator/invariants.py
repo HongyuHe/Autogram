@@ -108,6 +108,107 @@ def _identity_mask(values: np.ndarray, expected: Any) -> np.ndarray:
     )
 
 
+def _exact_nan(value: Any) -> bool:
+    """Whether ``value`` is specifically a floating-point NaN."""
+
+    return (
+        isinstance(value, (float, np.floating))
+        and bool(np.isnan(value))
+    )
+
+
+def _raw_payload_equal(
+    actual: Any,
+    expected: Any,
+    *,
+    boolean: bool,
+) -> bool:
+    """Compare emitted raw payload values without coercing flags or missingness."""
+
+    if boolean:
+        return (
+            isinstance(actual, (bool, np.bool_))
+            and isinstance(expected, (bool, np.bool_))
+            and bool(actual) == bool(expected)
+        )
+
+    actual_nan = _exact_nan(actual)
+    expected_nan = _exact_nan(expected)
+    if actual_nan or expected_nan:
+        return actual_nan and expected_nan
+    if (
+        actual is None
+        or actual is pd.NA
+        or expected is None
+        or expected is pd.NA
+        or isinstance(actual, (bool, np.bool_))
+        or isinstance(expected, (bool, np.bool_))
+    ):
+        return False
+    try:
+        equal = actual == expected
+    except (TypeError, ValueError):
+        return False
+    return isinstance(equal, (bool, np.bool_)) and bool(equal)
+
+
+def _independent_minute_counters(
+    counter: np.ndarray,
+    reset_flag: np.ndarray,
+    spm: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Independently audit the shared trustworthy-boundary contract."""
+
+    values = np.asarray(counter)
+    resets = np.asarray(reset_flag, dtype=bool)
+    n_shards, n_steps = values.shape
+    n_minutes = n_steps // spm
+    deltas = np.full((n_shards, n_minutes), np.nan, dtype=float)
+    valid = np.zeros((n_shards, n_minutes), dtype=bool)
+
+    for shard in range(n_shards):
+        lifetime_value = np.nan
+        previous_boundary = np.nan
+        previous_trustworthy = False
+        for minute in range(n_minutes):
+            start = minute * spm
+            stop = start + spm
+            reset_in_minute = False
+            boundary_trustworthy = False
+
+            for step in range(start, stop):
+                if resets[shard, step]:
+                    lifetime_value = 0.0
+                    reset_in_minute = True
+                    boundary_trustworthy = True
+                value = values[shard, step]
+                if not np.isnan(value):
+                    lifetime_value = value
+                    if np.isfinite(value):
+                        boundary_trustworthy = True
+
+            comparison_boundary = (
+                lifetime_value
+                if minute == 0
+                else previous_boundary
+            )
+            with np.errstate(invalid="ignore"):
+                delta = lifetime_value - comparison_boundary
+            deltas[shard, minute] = delta
+            valid[shard, minute] = (
+                minute > 0
+                and previous_trustworthy
+                and boundary_trustworthy
+                and not reset_in_minute
+                and np.isfinite(delta)
+                and delta >= 0.0
+            )
+            previous_boundary = lifetime_value
+            previous_trustworthy = boundary_trustworthy
+
+    return deltas, valid
+
+
 def _generated_derived_grid(
     cfg: EmulatorConfig,
     records: list[dict[str, Any]],
@@ -151,6 +252,7 @@ def _generated_derived_grid(
         frame = rec.get("frame") if isinstance(rec, dict) else None
         consumer = rec.get("consumer") if isinstance(rec, dict) else None
         consumer_id = getattr(consumer, "consumer_id", None)
+        archetype = getattr(consumer, "archetype", None)
         consumer_key = _typed_identity_key(consumer_id)
         record_ok = True
         if consumer_key is None:
@@ -191,6 +293,11 @@ def _generated_derived_grid(
             issues.append(
                 f"record {record_index} missing identity columns "
                 f"{missing_columns}"
+            )
+            record_ok = False
+        if "archetype" not in frame.columns:
+            issues.append(
+                f"record {record_index} missing required archetype column"
             )
             record_ok = False
 
@@ -280,6 +387,19 @@ def _generated_derived_grid(
                 )
                 record_ok = False
 
+        if "archetype" in frame.columns:
+            archetype_mismatches = sum(
+                not _identity_equal(value, archetype)
+                for value in frame["archetype"].to_numpy(dtype=object)
+            )
+            if archetype_mismatches:
+                issues.append(
+                    f"record {record_index} has {archetype_mismatches} "
+                    "archetype rows that do not match "
+                    f"{archetype!r}"
+                )
+                record_ok = False
+
         if record_ok:
             valid_records.append(rec)
 
@@ -321,7 +441,8 @@ def _generated_derived_grid(
         True,
         f"{expected_consumers} typed consumer identities each emit "
         f"{expected_rows} ordered rows on the configured cadence, with "
-        "globally unique (consumer_id, minute_index) identities.",
+        "globally unique (consumer_id, minute_index) identities and the "
+        "record archetype on every row.",
     )
 
 
@@ -351,6 +472,38 @@ def _generated_raw_grid_impl(
     expected_steps = int(cfg.n_raw_steps)
     start_ns = int(pd.Timestamp(cfg.time.start_timestamp).value)
     cadence_ns = int(cfg.time.raw_scrape_seconds) * 1_000_000_000
+    payload_specs = [
+        (
+            "collector_input_counted",
+            "obs",
+            "input_counted",
+            False,
+        ),
+        (
+            "presenter_output_counted",
+            "obs",
+            "output_counted",
+            False,
+        ),
+        ("missing_flag", "obs", "missing_flag", True),
+        ("reset_flag", "obs", "reset_flag", True),
+    ]
+    if cfg.output.include_hidden_state:
+        payload_specs.extend([
+            ("backlog_bytes", "phys", "backlog", False),
+            (
+                "cum_lost_bytes",
+                "phys",
+                "cum_true_loss",
+                False,
+            ),
+        ])
+    expected_columns = (
+        "timestamp",
+        "consumer_id",
+        "shard_id",
+        *(spec[0] for spec in payload_specs),
+    )
     issues: list[str] = []
     expected_pairs: list[
         tuple[
@@ -362,6 +515,11 @@ def _generated_raw_grid_impl(
     ] = []
     expected_consumer_keys: set[tuple[Any, Any]] = set()
     seen_consumers: dict[tuple[Any, Any], int] = {}
+    expected_payload_blocks: dict[str, list[np.ndarray]] = {
+        column: []
+        for column, _, _, _ in payload_specs
+    }
+    payload_sources_ok = True
 
     if len(records) != expected_consumers:
         issues.append(
@@ -415,13 +573,24 @@ def _generated_raw_grid_impl(
                 f"{cfg.scale.shards_max})"
             )
 
-        obs = rec.get("obs") if isinstance(rec, dict) else None
-        input_counted = getattr(obs, "input_counted", None)
-        if np.shape(input_counted) != (len(shards), expected_steps):
-            issues.append(
-                f"record {record_index} observed shard grid shape="
-                f"{np.shape(input_counted)} (expected "
-                f"({len(shards)}, {expected_steps}))"
+        expected_shape = (len(shards), expected_steps)
+        for column, owner_name, attribute, _ in payload_specs:
+            owner = (
+                rec.get(owner_name)
+                if isinstance(rec, dict)
+                else None
+            )
+            values = getattr(owner, attribute, None)
+            if np.shape(values) != expected_shape:
+                issues.append(
+                    f"record {record_index} source {owner_name}."
+                    f"{attribute} shape={np.shape(values)} (expected "
+                    f"{expected_shape})"
+                )
+                payload_sources_ok = False
+                continue
+            expected_payload_blocks[column].append(
+                np.asarray(values).reshape(-1)
             )
 
         seen_shards: dict[tuple[Any, Any], int] = {}
@@ -494,13 +663,38 @@ def _generated_raw_grid_impl(
             f"raw rows={len(raw)} (expected {expected_total_rows})"
         )
 
-    missing_columns = [
+    missing_identity_columns = [
         column
         for column in ("timestamp", "consumer_id", "shard_id")
         if column not in raw.columns
     ]
-    if missing_columns:
-        issues.append(f"raw table missing identity columns {missing_columns}")
+    missing_payload_columns = [
+        column
+        for column, _, _, _ in payload_specs
+        if column not in raw.columns
+    ]
+    if missing_identity_columns:
+        issues.append(
+            "raw table missing identity columns "
+            f"{missing_identity_columns}"
+        )
+    if missing_payload_columns:
+        issues.append(
+            "raw table missing payload columns "
+            f"{missing_payload_columns}"
+        )
+    if tuple(raw.columns) != expected_columns:
+        issues.append(
+            f"raw schema columns={list(raw.columns)!r} "
+            f"(expected {list(expected_columns)!r})"
+        )
+    if not raw.columns.is_unique:
+        issues.append("raw schema contains duplicate column names")
+    if (
+        missing_identity_columns
+        or missing_payload_columns
+        or not raw.columns.is_unique
+    ):
         return False, _raw_grid_detail(issues)
 
     timestamp_values = raw["timestamp"].to_numpy(dtype=object)
@@ -646,6 +840,50 @@ def _generated_raw_grid_impl(
             f"({expected_consumer!r}, {expected_shard!r})"
         )
 
+    if (
+        payload_sources_ok
+        and len(raw) == expected_total_rows
+    ):
+        boolean_columns = {
+            column
+            for column, _, _, boolean in payload_specs
+            if boolean
+        }
+        for column, _, _, _ in payload_specs:
+            blocks = expected_payload_blocks[column]
+            if not blocks:
+                expected_values = np.array([], dtype=object)
+            else:
+                expected_values = np.concatenate(blocks).astype(
+                    object,
+                    copy=False,
+                )
+            actual_values = raw[column].to_numpy(dtype=object)
+            equal = np.fromiter(
+                (
+                    _raw_payload_equal(
+                        actual,
+                        expected,
+                        boolean=column in boolean_columns,
+                    )
+                    for actual, expected in zip(
+                        actual_values,
+                        expected_values,
+                    )
+                ),
+                dtype=bool,
+                count=len(actual_values),
+            )
+            mismatch_positions = np.flatnonzero(~equal)
+            if mismatch_positions.size:
+                first = int(mismatch_positions[0])
+                issues.append(
+                    f"raw payload column {column!r} differs from generator "
+                    f"records at {mismatch_positions.size} rows; first at "
+                    f"row {first}: got {actual_values[first]!r}, expected "
+                    f"{expected_values[first]!r}"
+                )
+
     if issues:
         return False, _raw_grid_detail(issues)
     return (
@@ -653,7 +891,8 @@ def _generated_raw_grid_impl(
         f"{len(expected_consumer_keys)} typed consumers and "
         f"{len(expected_pairs)} unique typed consumer/shard identities emit "
         f"{expected_total_rows} globally unique rows in exact shard-major "
-        "order on the configured scrape cadence.",
+        "order on the configured scrape cadence, with the complete raw schema "
+        "and payload exactly matching generator records.",
     )
 
 
@@ -906,23 +1145,17 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
         phys = rec["phys"]
         spm = cfg.raw_steps_per_minute
         win = cfg.minutes_per_smoothing_window
-        minute_values = []
-        for counter in (obs.input_counted, obs.output_counted):
-            filled = pd.DataFrame(counter.T).ffill().to_numpy().T
-            boundary = filled.reshape(
-                filled.shape[0], -1, spm,
-            )[:, :, -1]
-            delta = np.diff(
-                boundary,
-                axis=1,
-                prepend=boundary[:, :1],
+        minute_values = [
+            _independent_minute_counters(
+                counter,
+                obs.reset_flag,
+                spm,
             )
-            reset = obs.reset_flag.reshape(
-                obs.reset_flag.shape[0], -1, spm,
-            ).any(axis=2)
-            valid = np.isfinite(delta) & (delta >= 0.0) & ~reset
-            valid[:, 0] = False
-            minute_values.append((delta, valid))
+            for counter in (
+                obs.input_counted,
+                obs.output_counted,
+            )
+        ]
         common_valid = minute_values[0][1] & minute_values[1][1]
         rates = []
         for delta, _valid in minute_values:
@@ -1078,7 +1311,8 @@ def check_all(cfg: EmulatorConfig, records: list[dict[str, Any]],
         _hard(
             "derived_signal_identities",
             derived_bad == 0,
-            f"{derived_bad} emitted derived columns disagree with re-derivation.",
+            f"{derived_bad} emitted derived columns disagree with independent "
+            "re-derivation.",
         ),
         _hard(
             "static_alert_definition",
@@ -1156,9 +1390,11 @@ def _counter_monotone_violations(records: list[dict[str, Any]]) -> int:
                 prev = np.nan
                 for t in range(n):
                     v = row[t]
+                    if reset[t]:
+                        prev = np.nan
                     if np.isnan(v):
                         continue
-                    if not np.isnan(prev) and not reset[t] and v < prev - 1.0:
+                    if not np.isnan(prev) and v < prev - 1.0:
                         bad += 1
                     prev = v
     return bad

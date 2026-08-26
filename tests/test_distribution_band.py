@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from autogram.config import DiscoveryConfig, SearchConfig
 from autogram.discovery.evaluate import DataOnlyEvaluator
@@ -73,6 +74,40 @@ def _condition():
             A.Condition("archetype", "==", ("steady",)),
             A.Condition("label", "==", ("normal",)),
         ),
+    )
+
+
+def _comparison_result(
+    residual: float,
+    *,
+    tolerance: float,
+    band_mode: str,
+    legacy_compat: bool,
+    threshold_policy: str = "global",
+):
+    n_rows = 400
+    dataset, _grammar = build_dataframe_grammar(
+        profile_dataframe(pd.DataFrame({
+            "x": np.ones(n_rows),
+            "y": np.full(n_rows, 1.0 + residual),
+        })),
+        _base_spec(),
+        name="adaptive_band_cap",
+    )
+    evaluator = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            tolerance=tolerance,
+            hold_rate_threshold=0.9,
+            band_mode=band_mode,
+            threshold_policy=threshold_policy,
+            thr_min_bindings=0,
+            seed=0,
+        ),
+    )
+    evaluator.legacy_compat = legacy_compat
+    return evaluator.evaluate(
+        A.Rule("record", A.Compare(A.Ref("x"), "~=", A.Ref("y")))
     )
 
 
@@ -268,3 +303,66 @@ def test_known_band_matching_checks_center():
         ],
     )
     assert recover_known(unconditional, [correct])["recall"] == 0.0
+
+
+@pytest.mark.parametrize("legacy_compat", (False, True))
+def test_adaptive_band_never_exceeds_tiny_global_cap(legacy_compat):
+    tolerance = 1e-12
+    global_result = _comparison_result(
+        5e-10,
+        tolerance=tolerance,
+        band_mode="global",
+        legacy_compat=legacy_compat,
+    )
+    adaptive_result = _comparison_result(
+        5e-10,
+        tolerance=tolerance,
+        band_mode="adaptive",
+        legacy_compat=legacy_compat,
+    )
+
+    assert not global_result.accepted
+    assert not adaptive_result.accepted
+    assert adaptive_result.hold_rate == global_result.hold_rate == 0.0
+    assert adaptive_result.eps <= tolerance
+
+
+@pytest.mark.parametrize("legacy_compat", (False, True))
+@pytest.mark.parametrize("tolerance", (0.0, 1e-12))
+def test_adaptive_exact_residual_floor_stays_inside_cap(
+    legacy_compat,
+    tolerance,
+):
+    result = _comparison_result(
+        0.0,
+        tolerance=tolerance,
+        band_mode="adaptive",
+        legacy_compat=legacy_compat,
+    )
+
+    assert result.accepted
+    assert result.hold_rate == 1.0
+    assert 0.0 <= result.eps <= tolerance
+    assert np.isfinite(result.mdl_gain)
+
+
+@pytest.mark.parametrize("legacy_compat", (False, True))
+@pytest.mark.parametrize(
+    ("tolerance", "expected_threshold"),
+    ((1e-12, 0.95), (0.0, 0.9)),
+)
+def test_per_rule_band_penalty_handles_tiny_and_zero_adaptive_caps(
+    legacy_compat,
+    tolerance,
+    expected_threshold,
+):
+    result = _comparison_result(
+        0.0,
+        tolerance=tolerance,
+        band_mode="adaptive",
+        legacy_compat=legacy_compat,
+        threshold_policy="per_rule",
+    )
+
+    assert result.eps == tolerance
+    assert result.threshold == pytest.approx(expected_threshold)

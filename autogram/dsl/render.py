@@ -1,9 +1,9 @@
 """Explicit (schema-aware) rendering of DSL rules for human-facing output.
 
-:meth:`autogram.dsl.ast.Rule.unparse` is the *canonical, context-free* surface form used for
-signatures, dedup and serialization -- it deliberately hides the binder's bound variable and
-prints roles by name (``measurement_origination``, ``SUM(demand_col)``).  That is compact but
-opaque: the reader cannot see that every role is silently a function of the quantified entity.
+:meth:`autogram.dsl.ast.Rule.unparse` is the canonical, context-free persisted surface form. It is
+structurally round-trippable, deliberately hides the binder's bound variable, and prints roles by
+name (``measurement_origination``, ``SUM(demand_col)``). That is compact but opaque: the reader
+cannot see that every role is silently a function of the quantified entity.
 
 :func:`render_rule` produces the *explicit* form instead, using the compiled
 :class:`~autogram.schema.adapter.SchemaAdapter` to expand every hidden variable:
@@ -26,6 +26,9 @@ import math
 import re
 from typing import List, Optional, Tuple
 
+from . import ast as A
+from .scalar_codec import scalar_from_text
+
 
 def _finite_number(text: str, label: str) -> float:
     try:
@@ -36,7 +39,6 @@ def _finite_number(text: str, label: str) -> float:
         raise ValueError(f"{label} must be a finite number")
     return value
 
-from . import ast as A
 
 # Bound-variable name(s) each enumerate strategy introduces (mirrors
 # ``SchemaAdapter.enumerate_bindings``: per_node -> {X}, per_directed_link -> {X, Y}, ...).
@@ -133,15 +135,40 @@ def _render_term(term: A.Term, binder: str, adapter, facts) -> str:
     if isinstance(term, A.Agg):
         return _render_family(term, binder, adapter, facts)
     if isinstance(term, A.Scale):
-        return f"{A.Const(term.coeff).unparse()}*{_render_term(term.term, binder, adapter, facts)}"
+        child = _render_term(term.term, binder, adapter, facts)
+        if isinstance(term.term, A.Add):
+            child = f"({child})"
+        return f"{A.Const(term.coeff).unparse()}*{child}"
     if isinstance(term, A.Add):
-        return " + ".join(_render_term(t, binder, adapter, facts) for t in term.terms)
+        if len(term.terms) <= 1:
+            children = ", ".join(
+                _render_term(child, binder, adapter, facts)
+                for child in term.terms
+            )
+            return f"ADD({children})"
+        children = []
+        for child in term.terms:
+            rendered = _render_term(child, binder, adapter, facts)
+            if isinstance(child, A.Add):
+                rendered = f"({rendered})"
+            children.append(rendered)
+        return " + ".join(children)
     if isinstance(term, A.Mul):
-        return (f"({_render_term(term.left, binder, adapter, facts)} * "
-                f"{_render_term(term.right, binder, adapter, facts)})")
+        left = _render_term(term.left, binder, adapter, facts)
+        right = _render_term(term.right, binder, adapter, facts)
+        if isinstance(term.left, A.Add):
+            left = f"({left})"
+        if isinstance(term.right, A.Add):
+            right = f"({right})"
+        return f"({left} * {right})"
     if isinstance(term, A.Div):
-        return (f"({_render_term(term.num, binder, adapter, facts)} / "
-                f"{_render_term(term.den, binder, adapter, facts)})")
+        num = _render_term(term.num, binder, adapter, facts)
+        den = _render_term(term.den, binder, adapter, facts)
+        if isinstance(term.num, A.Add):
+            num = f"({num})"
+        if isinstance(term.den, A.Add):
+            den = f"({den})"
+        return f"({num} / {den})"
     if isinstance(term, A.Lag):
         return f"B^{term.steps}({_render_term(term.term, binder, adapter, facts)})"
     if isinstance(term, A.Diff):
@@ -201,6 +228,7 @@ _NONFINITE_SCALE_RE = re.compile(
 )
 _NUM_RE = re.compile(rf"^{_FINITE_TOKEN}$")
 _NONFINITE_RE = re.compile(rf"^{_NONFINITE_TOKEN}$", re.IGNORECASE)
+_ADD_RE = re.compile(r"^ADD\((.*)\)$")
 _LAG_RE = re.compile(r"^LAG_(\d+)\((.*)\)$")
 _DIFF_RE = re.compile(r"^DELTA_(\d+)\((.*)\)$")
 _ROLL_RE = re.compile(r"^ROLL_(SUM|MIN|MAX|AVG)_(\d+)\((.*)\)$")
@@ -250,6 +278,15 @@ def _parse_primary(s: str) -> A.Term:
                 left, right = _parse_primary(parts[0]), _parse_primary(parts[1])
                 return A.Mul(left, right) if ctor == "mul" else A.Div(left, right)
         return _parse_term(inner)
+    m = _ADD_RE.match(s)
+    if m:
+        inner = m.group(1)
+        if not inner:
+            return A.Add(())
+        return A.Add(tuple(
+            _parse_term(part)
+            for part in _split_top(inner, ", ")
+        ))
     m = _AGG_RE.match(s)
     if m:
         return A.Agg(m.group(1), m.group(2))
@@ -351,22 +388,45 @@ def _parse_condition(text: str) -> A.Condition:
                 if part.strip()
             ),
         )
-    match = re.fullmatch(r"(\w+)\s+in\s+\((.*)\)", text)
+    try:
+        column, remainder = _parse_condition_identifier(text)
+    except ValueError as error:
+        raise ValueError(f"invalid condition: {text!r}") from error
+    match = re.fullmatch(r"\s+in\s+\((.*)\)", remainder)
     if match:
         values = tuple(
             _parse_scalar(part.strip())
-            for part in _split_top(match.group(2), ", ")
+            for part in _split_top(match.group(1), ", ")
             if part.strip()
         )
-        return A.Condition(match.group(1), "in", values)
-    match = re.fullmatch(r"(\w+)\s+(==|!=)\s+(.+)", text)
+        return A.Condition(column, "in", values)
+    match = re.fullmatch(r"\s+(==|!=)\s+(.+)", remainder)
     if not match:
         raise ValueError(f"invalid condition: {text!r}")
     return A.Condition(
+        column,
         match.group(1),
-        match.group(2),
-        (_parse_scalar(match.group(3).strip()),),
+        (_parse_scalar(match.group(2).strip()),),
     )
+
+
+def _parse_identifier(text: str, label: str) -> Tuple[str, str]:
+    if text.startswith('"'):
+        try:
+            identifier, end = json.JSONDecoder().raw_decode(text)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid quoted {label}") from error
+        if not isinstance(identifier, str):
+            raise ValueError(f"{label} must be a string")
+        return identifier, text[end:]
+    match = re.match(r"\w+", text)
+    if match is None:
+        raise ValueError(f"invalid {label}")
+    return match.group(0), text[match.end():]
+
+
+def _parse_condition_identifier(text: str) -> Tuple[str, str]:
+    return _parse_identifier(text, "condition identifier")
 
 
 def _parse_predicate(text: str) -> A.Predicate:
@@ -404,44 +464,42 @@ def _parse_category_definition(target: str, text: str) -> A.CategoryDefinition:
     parts = _split_top(text[len("PRIORITY("):-1], "; default=")
     if len(parts) != 2:
         raise ValueError(f"invalid categorical definition: {text!r}")
+    target_column, target_remainder = _parse_identifier(
+        target.strip(),
+        "categorical target identifier",
+    )
+    if target_remainder.strip():
+        raise ValueError(
+            f"invalid categorical target identifier: {target!r}"
+        )
     cases = []
     case_text = parts[0].strip()
     if case_text:
         for item in _split_top(case_text, ", "):
-            if "->" not in item:
+            column, remainder = _parse_identifier(
+                item.strip(),
+                "categorical case identifier",
+            )
+            remainder = remainder.lstrip()
+            if not remainder.startswith("->"):
                 raise ValueError(
                     f"invalid categorical case: {item!r}"
                 )
-            column, value = item.split("->", 1)
-            cases.append((column.strip(), _parse_scalar(value.strip())))
+            value = remainder[2:].strip()
+            if not value:
+                raise ValueError(
+                    f"invalid categorical case: {item!r}"
+                )
+            cases.append((column, _parse_scalar(value)))
     return A.CategoryDefinition(
-        target,
+        target_column,
         tuple(cases),
         _parse_scalar(parts[1].strip()),
     )
 
 
 def _parse_scalar(text: str):
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        value = None
-    else:
-        if value is None or isinstance(
-            value,
-            (str, bool, int, float),
-        ):
-            return value
-    if text == "True":
-        return True
-    if text == "False":
-        return False
-    if text == "None":
-        return None
-    if _NUM_RE.match(text):
-        value = _finite_number(text, "categorical scalar")
-        return int(value) if value.is_integer() else value
-    return text
+    return scalar_from_text(text, "condition/category scalar")
 
 
 def _balanced_outer(text: str) -> bool:

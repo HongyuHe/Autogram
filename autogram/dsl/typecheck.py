@@ -150,11 +150,11 @@ def _leaf_set(term: A.Term) -> set:
     if isinstance(term, A.Div):
         return _leaf_set(term.num) | _leaf_set(term.den)
     if isinstance(term, A.Lag):
-        return {("t", "lag", term.steps, term.term.unparse())}
+        return {("t", A.term_identity(term))}
     if isinstance(term, A.Diff):
-        return {("t", "diff", term.steps, term.term.unparse())}
+        return {("t", A.term_identity(term))}
     if isinstance(term, A.Rolling):
-        return {("t", "rolling", term.kind, term.window, term.term.unparse())}
+        return {("t", A.term_identity(term))}
     if isinstance(term, A.RelatedAgg):
         return {("related", term.role)}
     return set()
@@ -217,11 +217,11 @@ def _leaf_list(term: A.Term) -> list:
     if isinstance(term, A.Div):
         return _leaf_list(term.num) + _leaf_list(term.den)
     if isinstance(term, A.Lag):
-        return [("t", "lag", term.steps, term.term.unparse())]
+        return [("t", A.term_identity(term))]
     if isinstance(term, A.Diff):
-        return [("t", "diff", term.steps, term.term.unparse())]
+        return [("t", A.term_identity(term))]
     if isinstance(term, A.Rolling):
-        return [("t", "rolling", term.kind, term.window, term.term.unparse())]
+        return [("t", A.term_identity(term))]
     if isinstance(term, A.RelatedAgg):
         return [("related", term.role)]
     return []

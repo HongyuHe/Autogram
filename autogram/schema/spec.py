@@ -1,11 +1,12 @@
 """Declarative, JSON-serialisable schema description (the data an LLM/heuristic emits).
 
-A :class:`GrammarSpec` is **data, not code**.  Every field is a primitive, a tuple of
-primitives, or a tuple of small frozen dataclasses, so a spec can be serialised to/from JSON
-and validated statically before it is ever used (``schema/validate.py``).  The compiler
-(:func:`autogram.schema.compiler.compile_spec`) interprets these declarations with a fixed,
-trusted, bounded vocabulary -- there is no ``eval`` and no arbitrary code path -- which is
-what lets an *untrusted* proposer widen the schema without widening the trusted base.
+A :class:`GrammarSpec` is **data, not code**.  Its fields are primitives, supported typed
+temporal scalars, tuples of those values, or tuples of small frozen dataclasses.  The schema
+codec serialises temporal values to tagged JSON before the compiler validates the result.
+The compiler (:func:`autogram.schema.compiler.compile_spec`) interprets these declarations
+with a fixed, trusted, bounded vocabulary -- there is no ``eval`` and no arbitrary code path
+-- which is what lets an *untrusted* proposer widen the schema without widening the trusted
+base.
 
 The structure mirrors the four CrossCheck seams it generalises:
 
@@ -168,7 +169,8 @@ class GrammarSpec:
     CrossCheck); those columns are the ones the noise model treats as noisy and the clean codec
     reads from.  ``demand_kind`` names the demand-matrix layer (``high_*``).  ``link_marker_direction``
     is the direction string the ``per_directed_link`` strategy keys on to discover directed
-    links (CrossCheck: ``"egress"``).
+    links (CrossCheck: ``"egress"``).  ``condition_columns`` values may be finite JSON scalars
+    or temporal scalars supported by :mod:`autogram.dsl.scalar_codec`.
     """
     name: str
     patterns: Tuple[ColumnPattern, ...]

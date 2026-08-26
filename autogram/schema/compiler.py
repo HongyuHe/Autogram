@@ -15,7 +15,6 @@ re-parametrise the four seams the adapter interprets.
 
 from __future__ import annotations
 
-import math
 import numbers
 import re
 import string
@@ -108,26 +107,23 @@ def _validate_unique(label: str, values) -> None:
         seen.add(value)
 
 
-def _validate_typed_unique(label: str, values) -> None:
-    """Finite JSON-scalar uniqueness, where ``True`` and ``1`` are distinct."""
-    from ..dsl.evaluate import canonical_typed_value, typed_group_key
+def _validate_typed_unique(
+    label: str,
+    values,
+    *,
+    allow_temporal: bool = False,
+) -> None:
+    """Typed scalar uniqueness, where ``True`` and ``1`` are distinct."""
+    from ..dsl.evaluate import typed_group_key
+    from ..dsl.scalar_codec import scalar_to_json
 
     seen = set()
     for value in values:
-        value = canonical_typed_value(value)
-        if not (
-            value is None
-            or isinstance(value, (str, bool))
-            or (
-                isinstance(value, numbers.Integral)
-                and not isinstance(value, bool)
-            )
-            or (
-                isinstance(value, numbers.Real)
-                and not isinstance(value, numbers.Integral)
-                and math.isfinite(float(value))
-            )
-        ):
+        try:
+            encoded = scalar_to_json(value, label)
+        except ValueError as error:
+            raise CompileError(str(error)) from error
+        if isinstance(encoded, dict) and not allow_temporal:
             raise TypeError(f"{label} must be a finite JSON scalar")
         key = typed_group_key(value)
         if key in seen:
@@ -377,6 +373,7 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
             _validate_typed_unique(
                 f"condition value for {name!r}",
                 values,
+                allow_temporal=True,
             )
         except TypeError as error:
             raise CompileError(
@@ -438,6 +435,7 @@ def compile_spec(spec: GrammarSpec) -> SchemaAdapter:
                 _validate_typed_unique(
                     f"span filter value for {template.role!r}",
                     template.filter_values,
+                    allow_temporal=True,
                 )
             except TypeError as error:
                 raise CompileError(

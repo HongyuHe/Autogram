@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Dict, Tuple
 
+import numpy as np
+import pandas as pd
 import z3
 
 from ..dsl import ast as A
@@ -12,48 +14,96 @@ from ..dsl.evaluate import typed_group_key
 
 def _leaf_key(term: A.Term) -> Tuple:
     if isinstance(term, A.Ref):
-        return ("ref", term.role)
+        return A.term_identity(term)
     if isinstance(term, A.Agg):
-        return ("agg", term.kind, term.family_role)
+        return A.term_identity(term)
     raise TypeError(f"not a measured leaf: {term!r}")
+
+
+def _encode_key(value) -> bytes:
+    if isinstance(value, tuple):
+        return b"t" + len(value).to_bytes(8, "big") + b"".join(
+            _encode_key(component)
+            for component in value
+        )
+    if isinstance(value, str):
+        payload = value.encode("utf-8")
+        return b"s" + len(payload).to_bytes(8, "big") + payload
+    if isinstance(value, bytes):
+        return b"y" + len(value).to_bytes(8, "big") + value
+    if value is pd.NaT:
+        return b"N"
+    if isinstance(value, pd.Timestamp):
+        scalar = value.asm8
+        unit, multiplier = np.datetime_data(scalar.dtype)
+        return b"D" + _encode_key((
+            value.tzinfo is not None,
+            unit,
+            int(multiplier),
+            int(scalar.view("i8")),
+        ))
+    if isinstance(value, pd.Timedelta):
+        scalar = value.asm8
+        unit, multiplier = np.datetime_data(scalar.dtype)
+        return b"E" + _encode_key((
+            unit,
+            int(multiplier),
+            int(scalar.view("i8")),
+        ))
+    if isinstance(value, np.datetime64):
+        if np.isnat(value):
+            return b"Jn"
+        unit, multiplier = np.datetime_data(value.dtype)
+        return b"J" + _encode_key((
+            unit,
+            int(multiplier),
+            int(value.view("i8")),
+        ))
+    if isinstance(value, np.timedelta64):
+        if np.isnat(value):
+            return b"Kn"
+        unit, multiplier = np.datetime_data(value.dtype)
+        return b"K" + _encode_key((
+            unit,
+            int(multiplier),
+            int(value.view("i8")),
+        ))
+    if value is None:
+        return b"n"
+    if isinstance(value, bool):
+        return b"b1" if value else b"b0"
+    if isinstance(value, int):
+        payload = str(value).encode("ascii")
+        return b"i" + len(payload).to_bytes(8, "big") + payload
+    if isinstance(value, float):
+        payload = value.hex().encode("ascii")
+        return b"f" + len(payload).to_bytes(8, "big") + payload
+    raise TypeError(
+        "solver structural keys require typed primitive or temporal "
+        f"tuples, got {value!r}"
+    )
 
 
 def _var_name(key: Tuple) -> str:
     """Injectively encode a structural leaf key as a Z3 symbol name.
 
     Distinct keys must map to distinct symbol names, otherwise Z3 conflates two different measured
-    leaves into one variable and reports unrelated rules as equivalent/subsuming. Each tuple
-    component is encoded as the hex of its UTF-8 bytes and joined with ``_``; hex digits never
-    include ``_``, so the join is unambiguous and the whole encoding is a total injection over
-    arbitrary component strings (including control characters), not merely over a restricted
-    alphabet.
+    leaves into one variable and reports unrelated rules as equivalent/subsuming. The recursive
+    encoding tags every primitive type and length-prefixes variable-width payloads, so nested
+    structural tuples and strings containing arbitrary separators remain unambiguous.
     """
-    return "x_" + "_".join(
-        str(component).encode("utf-8").hex()
-        for component in key
-    )
+    return "x_" + _encode_key(key).hex()
+
+
+def _opaque_term_key(term: A.Term) -> Tuple:
+    return ("opaque_term", A.term_identity(term))
 
 
 def _category_definition_key(atom: A.CategoryDefinition) -> Tuple:
-    key = [
-        "category_definition",
-        "target",
-        atom.target_column,
-        "case_count",
-        len(atom.cases),
-    ]
-    for index, (column, value) in enumerate(atom.cases):
-        key.extend((
-            "case",
-            index,
-            column,
-            typed_group_key(value),
-        ))
-    key.extend((
-        "default",
-        typed_group_key(atom.default),
-    ))
-    return tuple(key)
+    return A.category_definition_semantic_key(
+        atom,
+        typed_group_key,
+    )
 
 
 def _term_expr(term: A.Term, env: Dict[Tuple, z3.ArithRef]) -> z3.ArithRef:
@@ -74,17 +124,17 @@ def _term_expr(term: A.Term, env: Dict[Tuple, z3.ArithRef]) -> z3.ArithRef:
         return _term_expr(term.left, env) * _term_expr(term.right, env)
     if isinstance(term, A.Div):
         # ratios are opaque fresh reals for the (sound but incomplete) screening
-        key = ("div", term.unparse())
+        key = _opaque_term_key(term)
         if key not in env:
             env[key] = z3.Real(_var_name(key))
         return env[key]
     if isinstance(term, (A.Lag, A.Diff, A.Rolling)):
-        key = ("temporal", term.unparse())
+        key = _opaque_term_key(term)
         if key not in env:
             env[key] = z3.Real(_var_name(key))
         return env[key]
     if isinstance(term, A.RelatedAgg):
-        key = ("related", term.role)
+        key = A.term_identity(term)
         if key not in env:
             env[key] = z3.Real(_var_name(key))
         return env[key]
@@ -102,7 +152,15 @@ def atom_expr(atom, env: Dict[Tuple, z3.ArithRef] | None = None) -> z3.BoolRef:
             env[key] = z3.Bool(_var_name(key))
         return env[key]
     if isinstance(atom, A.BandDefinition):
-        key = ("band_definition", atom.unparse())
+        key = (
+            "band_definition",
+            A.term_identity(atom.term),
+            (
+                None
+                if atom.center is None
+                else A.term_identity(A.Const(atom.center))
+            ),
+        )
         if key not in env:
             env[key] = z3.Bool(_var_name(key))
         return env[key]
@@ -113,13 +171,12 @@ def atom_expr(atom, env: Dict[Tuple, z3.ArithRef] | None = None) -> z3.BoolRef:
     if atom.op == "==":
         return left == right
     if atom.op == "~=":
-        if atom.left == atom.right:
+        left_key = A.term_identity(atom.left)
+        right_key = A.term_identity(atom.right)
+        if left_key == right_key:
             return z3.BoolVal(True)
-        operands = tuple(sorted((
-            atom.left.unparse(),
-            atom.right.unparse(),
-        )))
-        key = ("approximate_equality", *operands)
+        operands = tuple(sorted((left_key, right_key)))
+        key = ("approximate_equality", operands)
         if key not in env:
             env[key] = z3.Bool(_var_name(key))
         return env[key]
@@ -136,7 +193,11 @@ def atom_expr(atom, env: Dict[Tuple, z3.ArithRef] | None = None) -> z3.BoolRef:
     if atom.op == "<|>":
         return (left != 0) == (right != 0)
     if atom.op == "~∝":
-        key = ("proportional_coefficient", atom.left.unparse(), atom.right.unparse())
+        key = (
+            "proportional_coefficient",
+            A.term_identity(atom.left),
+            A.term_identity(atom.right),
+        )
         if key not in env:
             env[key] = z3.Real(_var_name(key))
         return left == env[key] * right
@@ -147,7 +208,10 @@ def _predicate_expr(predicate: A.Predicate, env) -> z3.BoolRef:
     if isinstance(predicate, A.Bound):
         term = _term_expr(predicate.term, env)
         if predicate.threshold is None:
-            key = ("learned_threshold", predicate.unparse())
+            key = (
+                "learned_threshold",
+                A.predicate_identity(predicate),
+            )
             if key not in env:
                 env[key] = z3.Real(_var_name(key))
             threshold = env[key]
@@ -162,7 +226,7 @@ def _predicate_expr(predicate: A.Predicate, env) -> z3.BoolRef:
         if predicate.op == ">=":
             return term >= threshold
     if isinstance(predicate, A.Sustained):
-        key = ("sustained", predicate.unparse())
+        key = ("sustained", A.predicate_identity(predicate))
         if key not in env:
             env[key] = z3.Bool(_var_name(key))
         return env[key]
@@ -188,9 +252,9 @@ def _leaves(term: A.Term) -> set[Tuple]:
             _leaves(term.num) | _leaves(term.den)
         )
     if isinstance(term, (A.Lag, A.Diff, A.Rolling)):
-        return {("temporal", term.unparse())}
+        return {_opaque_term_key(term)}
     if isinstance(term, A.RelatedAgg):
-        return {("related", term.role)}
+        return {A.term_identity(term)}
     return set()
 
 
@@ -220,7 +284,11 @@ def is_tautology(rule: A.Rule) -> bool:
     """True when the rule is valid for all assignments of its measured leaves."""
     if not isinstance(rule.atom, A.Compare):
         return _valid(_rule_expr(rule, {}))
-    if rule.atom.left == rule.atom.right and rule.atom.op in ("~=", "==", "<=", ">="):
+    if (
+        A.term_identity(rule.atom.left)
+        == A.term_identity(rule.atom.right)
+        and rule.atom.op in ("~=", "==", "<=", ">=")
+    ):
         return True
     if _leaves(rule.atom.left).isdisjoint(_leaves(rule.atom.right)):
         return False
@@ -233,7 +301,11 @@ def is_contradiction(rule: A.Rule) -> bool:
         return False
     if not isinstance(rule.atom, A.Compare):
         return _valid(z3.Not(_rule_expr(rule, {})))
-    if rule.atom.left == rule.atom.right and rule.atom.op == "!=":
+    if (
+        A.term_identity(rule.atom.left)
+        == A.term_identity(rule.atom.right)
+        and rule.atom.op == "!="
+    ):
         return True
     if _leaves(rule.atom.left).isdisjoint(_leaves(rule.atom.right)):
         return False

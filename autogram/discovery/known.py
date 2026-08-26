@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import math
 import numbers
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -36,17 +37,34 @@ from ..dsl.evaluate import (
     canonical_typed_value,
     eval_term,
     is_missing_scalar,
+    typed_condition_key,
     typed_group_key,
     typed_signature_value,
-    typed_sort_key,
+    typed_unique,
 )
+from ..dsl.scalar_codec import scalar_from_json
 from .loop import DiscoveryResult
+from .propose import (
+    canonical_executable_condition,
+    EXECUTABLE_CONDITION_GRAMMAR,
+    condition_family_is_enumerable,
+    condition_conjunction_arity_error,
+)
 from .validate import (
     _equality_relation,
     relation_signature_matches,
     _unwrap_equality_relation,
     portfolio_relations,
 )
+
+_KNOWN_COMPARISON_OPERATORS = ("<", "<=", ">", ">=")
+_KNOWN_DEFINITION_FORMS = ("sustained", "and", "priority")
+_KNOWN_INVARIANT_REQUIRED_KEYS = ("name", "op", "lhs", "rhs")
+_KNOWN_INVARIANT_OPTIONAL_KEYS = ("where",)
+_KNOWN_LHS_FORMS = ("sum", "lag", "delta")
+_KNOWN_RELATION_RHS_FORMS = ("center", "sum", "ratio", "related")
+_KNOWN_TERM_FORMS = ("delta", "lag", "roll_sum", "difference")
+_KNOWN_MAX_DEFINITION_CONJUNCTION = 16
 
 
 @dataclass
@@ -87,13 +105,201 @@ def _known_is_zero(value) -> bool:
     )
 
 
+def _known_column_name(value, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a column name")
+    return value
+
+
+def _known_role_name(value, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a role name")
+    return value
+
+
+def _known_comparison_operator(value, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or value not in _KNOWN_COMPARISON_OPERATORS
+    ):
+        supported = ", ".join(
+            repr(operator)
+            for operator in _KNOWN_COMPARISON_OPERATORS
+        )
+        raise ValueError(
+            f"{label} must be a string in the supported comparison "
+            f"set {supported}"
+        )
+    return value
+
+
+def _known_typed_scalar(value, label: str):
+    try:
+        return canonical_typed_value(
+            scalar_from_json(value, label)
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"{label} must be a JSON scalar "
+            "(finite number, string, boolean, null, or supported "
+            "temporal scalar)"
+        ) from error
+
+
+def _known_category_scalar(value, label: str):
+    value = _known_typed_scalar(value, label)
+    if value is None:
+        return None
+    if not is_missing_scalar(value):
+        return value
+    raise ValueError(
+        f"{label} must be a JSON scalar "
+        "(finite number, string, boolean, null, or supported "
+        "non-missing temporal scalar)"
+    )
+
+
 def _known_sum_columns(value, label: str) -> frozenset[str]:
     if not isinstance(value, (list, tuple)) or not value:
         raise ValueError(f"{label} must be a non-empty list of columns")
-    columns = tuple(str(column) for column in value)
+    columns = tuple(
+        _known_column_name(column, f"{label} member")
+        for column in value
+    )
     if len(columns) != len(set(columns)):
         raise ValueError(f"{label} contains duplicate columns")
     return frozenset(columns)
+
+
+def _known_sequence(value, label: str, *, arity: int | None = None):
+    if not isinstance(value, (list, tuple)):
+        requirement = (
+            f"exactly {arity} items"
+            if arity is not None
+            else "one or more items"
+        )
+        raise ValueError(
+            f"{label} must be a list or tuple with {requirement}"
+        )
+    if arity is not None and len(value) != arity:
+        raise ValueError(
+            f"{label} must be a list or tuple with exactly "
+            f"{arity} items"
+        )
+    if arity is None and not value:
+        raise ValueError(
+            f"{label} must be a list or tuple with one or more items"
+        )
+    return tuple(value)
+
+
+def _known_structured_form(
+    value,
+    label: str,
+    discriminators: tuple[str, ...],
+) -> str:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a mapping")
+    forms = tuple(
+        discriminator
+        for discriminator in discriminators
+        if discriminator in value
+    )
+    if len(forms) != 1:
+        supported = ", ".join(repr(form) for form in discriminators)
+        raise ValueError(
+            f"{label} must contain exactly one discriminator from "
+            f"{supported}"
+        )
+    form = forms[0]
+    extra_keys = tuple(
+        sorted(
+            (key for key in value if key != form),
+            key=repr,
+        )
+    )
+    if extra_keys:
+        rendered = ", ".join(repr(key) for key in extra_keys)
+        raise ValueError(
+            f"{label} has unexpected key(s): {rendered}"
+        )
+    return form
+
+
+def _known_exact_mapping_keys(
+    value,
+    label: str,
+    required_keys: tuple[str, ...],
+    optional_keys: tuple[str, ...] = (),
+):
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a mapping")
+    missing_keys = tuple(
+        key
+        for key in required_keys
+        if key not in value
+    )
+    if missing_keys:
+        rendered = ", ".join(repr(key) for key in missing_keys)
+        raise ValueError(
+            f"{label} is missing required key(s): {rendered}"
+        )
+    extra_keys = tuple(
+        sorted(
+            (
+                key
+                for key in value
+                if key not in required_keys
+                and key not in optional_keys
+            ),
+            key=repr,
+        )
+    )
+    if extra_keys:
+        rendered = ", ".join(repr(key) for key in extra_keys)
+        raise ValueError(
+            f"{label} has unexpected key(s): {rendered}"
+        )
+    return value
+
+
+def _known_definition_form(rhs) -> str:
+    if not isinstance(rhs, dict):
+        raise ValueError("definition rhs must be a mapping")
+    forms = tuple(
+        form
+        for form in _KNOWN_DEFINITION_FORMS
+        if form in rhs
+    )
+    if len(forms) != 1:
+        raise ValueError(
+            "definition rhs must contain exactly one of "
+            "'sustained', 'and', or 'priority'"
+        )
+    form = forms[0]
+    if form == "priority" and "default" not in rhs:
+        raise ValueError(
+            "priority definition rhs must contain an explicit "
+            "'default' key"
+        )
+    allowed_keys = (
+        {form, "default"}
+        if form == "priority"
+        else {form}
+    )
+    extra_keys = tuple(
+        sorted(
+            (key for key in rhs if key not in allowed_keys),
+            key=repr,
+        )
+    )
+    if extra_keys:
+        rendered = ", ".join(repr(key) for key in extra_keys)
+        raise ValueError(
+            f"{form} definition rhs has unexpected top-level "
+            f"key(s): {rendered}"
+        )
+    return form
 
 
 def load_known(path: str) -> List[KnownInvariant]:
@@ -110,20 +316,29 @@ def load_known(path: str) -> List[KnownInvariant]:
         doc = json.loads(text)
     out: List[KnownInvariant] = []
     for i, e in enumerate(doc.get("invariants", [])):
-        invariant = KnownInvariant(
-            name=str(e.get("name", f"inv{i}")),
-            op=str(e["op"]),
-            lhs=e["lhs"],
-            rhs=e.get("rhs"),
-            where=e.get("where"),
+        _known_exact_mapping_keys(
+            e,
+            f"known invariant entry {i}",
+            _KNOWN_INVARIANT_REQUIRED_KEYS,
+            _KNOWN_INVARIANT_OPTIONAL_KEYS,
         )
-        if (
-            invariant.where is not None
-            and _known_condition_signature(invariant.where) is None
-        ):
-            raise ValueError(
-                f"known invariant {invariant.name!r} has an invalid condition"
-            )
+        name = str(e["name"])
+        where = e.get("where")
+        if "where" in e:
+            try:
+                where = _canonical_known_condition(where)
+            except ValueError as error:
+                raise ValueError(
+                    f"known invariant {name!r} has an invalid condition: "
+                    f"{error}"
+                ) from error
+        invariant = KnownInvariant(
+            name=name,
+            op=e["op"],
+            lhs=e["lhs"],
+            rhs=e["rhs"],
+            where=where,
+        )
         try:
             signature = _signature(invariant)
         except ValueError as error:
@@ -142,18 +357,64 @@ def _signature(inv: KnownInvariant):
     base = _base_signature(inv)
     if base is None or inv.where is None:
         return base
+    family = _known_condition_family(base)
+    if not condition_family_is_enumerable(family):
+        rendered = (
+            family.replace("_", " ")
+            if isinstance(family, str)
+            else "this relation"
+        )
+        raise ValueError(
+            f"conditions are not enumerable for {rendered} relations"
+        )
     condition = _known_condition_signature(inv.where)
     return None if condition is None else ("conditional", (condition, base))
+
+
+def _known_condition_family(base) -> str | None:
+    _strength, relation = _unwrap_equality_relation(base)
+    if not isinstance(relation, tuple) or not relation:
+        return None
+    kind = relation[0]
+    if kind == "pair" and (
+        len(relation) != 2
+        or len(relation[1]) != 2
+    ):
+        return None
+    if kind == "proportional" and (
+        len(relation) != 2
+        or len(relation[1]) != 2
+        or relation[1][0] == relation[1][1]
+    ):
+        return None
+    return kind
 
 
 def _base_signature(inv: KnownInvariant):
     op, lhs, rhs = inv.op, inv.lhs, inv.rhs
     is_zero = _known_is_zero(rhs)
+    lhs_form = (
+        _known_structured_form(
+            lhs,
+            "structured lhs",
+            _KNOWN_LHS_FORMS,
+        )
+        if isinstance(lhs, dict)
+        else None
+    )
+    rhs_form = (
+        _known_structured_form(
+            rhs,
+            "structured rhs",
+            _KNOWN_RELATION_RHS_FORMS,
+        )
+        if op != ":=" and isinstance(rhs, dict)
+        else None
+    )
     if (
         op == "~band"
         and isinstance(lhs, str)
-        and isinstance(rhs, dict)
-        and "center" in rhs
+        and rhs_form == "center"
     ):
         return (
             "healthy_band",
@@ -167,10 +428,8 @@ def _base_signature(inv: KnownInvariant):
         )
     if (
         op in ("~=", "==")
-        and isinstance(lhs, dict)
-        and "sum" in lhs
-        and isinstance(rhs, dict)
-        and "sum" in rhs
+        and lhs_form == "sum"
+        and rhs_form == "sum"
     ):
         left_columns = _known_sum_columns(lhs["sum"], "left sum")
         right_columns = _known_sum_columns(rhs["sum"], "right sum")
@@ -184,73 +443,141 @@ def _base_signature(inv: KnownInvariant):
                 }),
             ),
         )
-    if op in ("~=", "==") and isinstance(lhs, str) and isinstance(rhs, dict) and "related" in rhs:
+    if (
+        op in ("~=", "==")
+        and rhs_form == "related"
+    ):
         return _equality_relation(
             op,
-            ("related_aggregate", (lhs, str(rhs["related"]))),
+            (
+                "related_aggregate",
+                (
+                    _known_column_name(lhs, "related aggregate lhs"),
+                    _known_role_name(
+                        rhs["related"],
+                        "related aggregate operand",
+                    ),
+                ),
+            ),
         )
-    if op == ":=" and isinstance(lhs, str) and isinstance(rhs, dict):
-        if "sustained" in rhs:
+    if op == ":=":
+        form = _known_definition_form(rhs)
+        if not isinstance(lhs, str):
+            return None
+        if form == "sustained":
             predicate = _known_sustained_signature(rhs["sustained"])
             return None if predicate is None else (
                 "sustained_definition",
                 (lhs, predicate),
             )
-        if "and" in rhs:
+        if form == "and":
+            if not isinstance(rhs["and"], (list, tuple)):
+                raise ValueError(
+                    "conjunction definition must be a list or tuple"
+                )
+            items = tuple(rhs["and"])
             predicates = tuple(sorted(
-                (_known_bound_signature(item) for item in rhs["and"]),
+                (_known_bound_signature(item) for item in items),
                 key=str,
             ))
-            if predicates and all(predicate is not None for predicate in predicates):
+            if not (
+                2
+                <= len(predicates)
+                <= _KNOWN_MAX_DEFINITION_CONJUNCTION
+            ):
+                raise ValueError(
+                    "conjunction definition must contain between 2 and "
+                    f"{_KNOWN_MAX_DEFINITION_CONJUNCTION} bound predicates"
+                )
+            if all(predicate is not None for predicate in predicates):
                 return ("conjunction_definition", (lhs, predicates))
-        if "priority" in rhs:
+        if form == "priority":
+            items = _known_sequence(
+                rhs["priority"],
+                "priority cases",
+            )
+            if any(
+                not isinstance(item, dict)
+                or "when" not in item
+                or "value" not in item
+                for item in items
+            ):
+                raise ValueError(
+                    "each priority case must be a mapping with "
+                    "'when' and 'value'"
+                )
+            for item in items:
+                _known_exact_mapping_keys(
+                    item,
+                    "priority case",
+                    ("when", "value"),
+                )
             cases = tuple(
                 (
-                    str(item["when"]),
-                    typed_signature_value(item["value"]),
+                    _known_role_name(
+                        item["when"],
+                        "priority case 'when'",
+                    ),
+                    _known_category_scalar(
+                        item["value"],
+                        "priority case 'value'",
+                    ),
                 )
-                for item in rhs["priority"]
+                for item in items
             )
-            return (
-                "categorical_definition",
-                (lhs, cases, typed_signature_value(rhs.get("default"))),
+            return A.category_definition_semantic_signature(
+                lhs,
+                cases,
+                _known_category_scalar(
+                    rhs["default"],
+                    "priority default",
+                ),
+                typed_signature_value,
             )
     if (
         op in (">=", "<=", ">", "<")
         and is_zero
-        and isinstance(lhs, dict)
-        and "lag" in lhs
+        and lhs_form == "lag"
     ):
-        value = lhs["lag"]
-        if not isinstance(value, (list, tuple)) or len(value) != 2:
-            return None
-        column, steps = value
+        column, steps = _known_sequence(
+            lhs["lag"],
+            "lag",
+            arity=2,
+        )
         return (
             "lag_bound",
             (
-                str(column),
+                _known_column_name(column, "lag operand"),
                 _known_positive_int(steps, "lag steps"),
                 op,
             ),
         )
-    if op in (">=", "<=", ">", "<") and is_zero and isinstance(lhs, dict) and "delta" in lhs:
+    if op in (">=", "<=", ">", "<") and is_zero and lhs_form == "delta":
         value = lhs["delta"]
         if isinstance(value, (list, tuple)):
-            column, steps = value
+            column, steps = _known_sequence(
+                value,
+                "delta",
+                arity=2,
+            )
         else:
             column, steps = value, 1
         return (
             "delta_bound",
             (
-                str(column),
+                _known_column_name(column, "delta operand"),
                 _known_positive_int(steps, "delta steps"),
                 op,
             ),
         )
-    if op in ("~=", "==") and is_zero and isinstance(lhs, dict) and "delta" in lhs:
+    if op in ("~=", "==") and is_zero and lhs_form == "delta":
         value = lhs["delta"]
         if isinstance(value, (list, tuple)):
-            column, steps = value
+            column, steps = _known_sequence(
+                value,
+                "delta",
+                arity=2,
+            )
         else:
             column, steps = value, 1
         return _equality_relation(
@@ -258,106 +585,300 @@ def _base_signature(inv: KnownInvariant):
             (
                 "delta_zero",
                 (
-                    str(column),
+                    _known_column_name(column, "delta operand"),
                     _known_positive_int(steps, "delta steps"),
                 ),
             ),
         )
-    if op in ("~=", "==") and isinstance(lhs, str) and isinstance(rhs, dict) and "ratio" in rhs:
-        values = list(rhs["ratio"])
-        if len(values) == 2:
-            num = _known_temporal_ref(values[0], "roll_sum")
-            den = _known_temporal_ref(values[1], "roll_sum")
-            if num is not None and den is not None and num[1] == den[1]:
-                return _equality_relation(
-                    op,
-                    ("windowed_ratio", (lhs, num[0], den[0], num[1])),
-                )
+    if op in ("~=", "==") and isinstance(lhs, str) and rhs_form == "ratio":
+        values = _known_sequence(
+            rhs["ratio"],
+            "ratio",
+            arity=2,
+        )
+        num = _known_temporal_ref(values[0], "roll_sum")
+        den = _known_temporal_ref(values[1], "roll_sum")
+        if num is not None and den is not None and num[1] == den[1]:
+            return _equality_relation(
+                op,
+                ("windowed_ratio", (lhs, num[0], den[0], num[1])),
+            )
     if op in ("~=", "==") and is_zero:
-        return _equality_relation(op, ("zero", lhs))
-    if op in ("~=", "==") and isinstance(rhs, dict) and "sum" in rhs:
+        return _equality_relation(
+            op,
+            ("zero", _known_column_name(lhs, "zero lhs")),
+        )
+    if op in ("~=", "==") and rhs_form == "sum":
         return _equality_relation(
             op,
             (
                 "ref_sum",
-                (lhs, _known_sum_columns(rhs["sum"], "right sum")),
+                (
+                    _known_column_name(lhs, "sum lhs"),
+                    _known_sum_columns(rhs["sum"], "right sum"),
+                ),
             ),
         )
-    if op in ("~=", "==") and isinstance(rhs, dict) and "ratio" in rhs:
-        values = list(rhs["ratio"])
-        if len(values) == 2:
-            return _equality_relation(
-                op,
-                ("ratio", (lhs, str(values[0]), str(values[1]))),
+    if op in ("~=", "==") and rhs_form == "ratio":
+        result_column = _known_column_name(lhs, "ratio lhs")
+        values = _known_sequence(
+            rhs["ratio"],
+            "ratio",
+            arity=2,
+        )
+        if any(not isinstance(value, str) for value in values):
+            raise ValueError(
+                "ratio operands must be column names"
             )
-    if op in ("~=", "==") and isinstance(rhs, str):
         return _equality_relation(
             op,
-            ("pair", frozenset({lhs, rhs})),
+            ("ratio", (result_column, values[0], values[1])),
+        )
+    if op in ("~=", "==") and isinstance(rhs, str):
+        left_column = _known_column_name(lhs, "equality lhs")
+        return _equality_relation(
+            op,
+            ("pair", frozenset({left_column, rhs})),
         )
     if op == "~∝" and isinstance(rhs, str):
-        return ("proportional", (lhs, rhs))
+        return (
+            "proportional",
+            (_known_column_name(lhs, "proportional lhs"), rhs),
+        )
     if op == "!=" and isinstance(lhs, str) and isinstance(rhs, str):
         return ("separation_pair", frozenset({lhs, rhs}))
     if op == "<|>" and isinstance(rhs, str):
-        return ("presence_pair", frozenset({lhs, rhs}))
+        return (
+            "presence_pair",
+            frozenset({
+                _known_column_name(lhs, "presence lhs"),
+                rhs,
+            }),
+        )
     if op in (">=", "<=") and is_zero:
-        return ("one_sided", lhs, op)
+        return (
+            "one_sided",
+            _known_column_name(lhs, "one-sided lhs"),
+            op,
+        )
     return None
+
+
+def _parse_known_condition(where, *, allow_composite: bool = True):
+    if not isinstance(where, dict) or len(where) != 1:
+        raise ValueError(
+            "condition must be a mapping with exactly one key"
+        )
+    key, value = next(iter(where.items()))
+    if not isinstance(key, str) or not key:
+        raise ValueError(
+            "condition column must be a non-empty string"
+        )
+    if key == "all":
+        if not allow_composite:
+            raise ValueError("condition conjunctions may not nest")
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(
+                "condition conjunction must be a list or tuple"
+            )
+        if len(value) not in (
+            EXECUTABLE_CONDITION_GRAMMAR.conjunction_arities
+        ):
+            raise ValueError(condition_conjunction_arity_error())
+        return A.Condition(
+            "",
+            "all",
+            tuple(
+                _parse_known_condition(
+                    item,
+                    allow_composite=False,
+                )
+                for item in value
+            ),
+        )
+    if key.endswith("_in"):
+        column = key[:-3]
+        if not column:
+            raise ValueError(
+                "membership condition column must be a non-empty string"
+            )
+        if not isinstance(value, (list, tuple)) or not value:
+            raise ValueError(
+                "membership condition requires at least one value"
+            )
+        canonical = []
+        for item in value:
+            scalar = _known_condition_scalar(item)
+            if scalar is None:
+                raise ValueError(
+                    "membership condition values must be non-missing "
+                    "JSON scalars"
+                )
+            canonical.append(scalar)
+        return A.Condition(column, "in", tuple(canonical))
+    canonical = _known_condition_scalar(value)
+    if canonical is None:
+        raise ValueError(
+            "condition value must be a non-missing JSON scalar"
+        )
+    return A.Condition(key, "==", (canonical,))
+
+
+def _known_condition_ast(where) -> A.Condition:
+    condition = _parse_known_condition(where)
+    if condition.op != "all":
+        return canonical_executable_condition(condition)
+    children = tuple(
+        canonical_executable_condition(child)
+        for child in condition.values
+    )
+    if any(
+        child.op
+        not in EXECUTABLE_CONDITION_GRAMMAR.conjunction_child_ops
+        for child in children
+    ):
+        raise ValueError(
+            "condition conjunction children must use equality conditions"
+        )
+    columns = tuple(
+        typed_group_key(child.column)
+        for child in children
+    )
+    if len(columns) != len(set(columns)):
+        raise ValueError(
+            "condition conjunction must use distinct columns"
+        )
+    return A.Condition(
+        "",
+        "all",
+        tuple(sorted(
+            children,
+            key=lambda child: repr(typed_condition_key(child)),
+        )),
+    )
+
+
+def _known_condition_mapping(condition: A.Condition):
+    if condition.op == "all":
+        return {
+            "all": [
+                _known_condition_mapping(child)
+                for child in condition.values
+                if isinstance(child, A.Condition)
+            ],
+        }
+    if condition.op == "in":
+        return {
+            f"{condition.column}_in": list(condition.values),
+        }
+    return {
+        condition.column: condition.values[0],
+    }
+
+
+def _canonical_known_condition(where):
+    return _known_condition_mapping(_known_condition_ast(where))
+
+
+def validate_known_conditions(
+    known: Sequence[KnownInvariant],
+    condition_columns: Mapping[object, Sequence[object]],
+    max_condition_values: int,
+) -> None:
+    """Validate known conditions against the exact runtime condition grammar."""
+    if (
+        not isinstance(max_condition_values, int)
+        or isinstance(max_condition_values, bool)
+        or max_condition_values <= 0
+    ):
+        raise ValueError(
+            "max_condition_values must be a positive integer"
+        )
+    domains = {
+        column: typed_unique(values, drop_missing=True)
+        for column, values in condition_columns.items()
+    }
+    for invariant in known:
+        if invariant.where is None:
+            continue
+        try:
+            condition = canonical_executable_condition(
+                _known_condition_ast(invariant.where),
+                condition_columns=domains,
+                max_condition_values=max_condition_values,
+            )
+            simple_conditions = (
+                condition.values
+                if condition.op == "all"
+                else (condition,)
+            )
+            for simple in simple_conditions:
+                domain = domains[simple.column]
+                if len(domain) <= 1:
+                    raise ValueError(
+                        f"condition column {simple.column!r} does not "
+                        "have an enumerable multi-value domain"
+                    )
+        except ValueError as error:
+            raise ValueError(
+                f"known invariant {invariant.name!r} has an "
+                f"infeasible runtime condition: {error}"
+            ) from error
 
 
 def _known_condition_signature(where):
-    if not isinstance(where, dict) or len(where) != 1:
+    try:
+        condition = _known_condition_ast(where)
+    except ValueError:
         return None
-    key, value = next(iter(where.items()))
-    if key == "all" and isinstance(value, list):
+    if condition.op == "all":
         children = tuple(sorted(
-            (_known_condition_signature(item) for item in value),
+            (
+                _known_condition_signature(
+                    _known_condition_mapping(child)
+                )
+                for child in condition.values
+                if isinstance(child, A.Condition)
+            ),
             key=str,
         ))
-        return None if any(child is None for child in children) else ("all", children)
-    if key.endswith("_in"):
-        column = key[:-3]
-        if not isinstance(value, (list, tuple)) or not value:
-            return None
-        canonical = [
-            _known_condition_scalar(item)
-            for item in value
-        ]
-        if any(item is None for item in canonical):
-            return None
-        values = tuple(sorted(
-            (typed_signature_value(item) for item in canonical),
-            key=lambda item: typed_sort_key(item[1]),
-        ))
-        return (column, "in", values)
-    canonical = _known_condition_scalar(value)
-    if canonical is None:
-        return None
-    return (str(key), "==", (typed_signature_value(canonical),))
+        return ("all", children)
+    values = tuple(
+        typed_signature_value(item)
+        for item in condition.values
+    )
+    return (condition.column, condition.op, values)
 
 
 def _known_condition_scalar(value):
-    value = canonical_typed_value(value)
+    try:
+        value = _known_typed_scalar(value, "condition value")
+    except ValueError:
+        return None
     if is_missing_scalar(value):
         return None
-    if isinstance(value, (str, bool)):
-        return value
-    if isinstance(value, numbers.Integral) and not isinstance(value, bool):
-        return int(value)
-    if isinstance(value, numbers.Real) and math.isfinite(float(value)):
-        return float(value)
-    return None
+    return value
 
 
 def _known_temporal_ref(value, form: str):
-    if not isinstance(value, dict) or form not in value:
+    if not isinstance(value, dict):
         return None
-    payload = value[form]
-    if not isinstance(payload, (list, tuple)) or len(payload) != 2:
-        return None
+    _known_structured_form(
+        value,
+        f"{form} reference",
+        (form,),
+    )
+    payload = _known_sequence(
+        value[form],
+        form,
+        arity=2,
+    )
+    if not isinstance(payload[0], str):
+        raise ValueError(
+            f"{form} operand must be a column name"
+        )
     return (
-        str(payload[0]),
+        payload[0],
         _known_positive_int(payload[1], f"{form} window"),
     )
 
@@ -372,58 +893,121 @@ def _known_term_signature(value):
         )
     if not isinstance(value, dict):
         return None
-    if "delta" in value:
+    form = _known_structured_form(
+        value,
+        "term",
+        _KNOWN_TERM_FORMS,
+    )
+    if form == "delta":
         payload = value["delta"]
         if isinstance(payload, (list, tuple)):
-            if len(payload) != 2:
-                return None
+            payload = _known_sequence(
+                payload,
+                "delta",
+                arity=2,
+            )
+            term = _known_term_signature(payload[0])
+            if term is None:
+                raise ValueError(
+                    "delta operand must be a supported term"
+                )
             return (
                 "delta",
-                _known_term_signature(payload[0]),
+                term,
                 _known_positive_int(payload[1], "delta steps"),
             )
-        return ("delta", _known_term_signature(payload), 1)
-    if "lag" in value:
-        payload = value["lag"]
-        if not isinstance(payload, (list, tuple)) or len(payload) != 2:
-            return None
+        term = _known_term_signature(payload)
+        if term is None:
+            raise ValueError(
+                "delta operand must be a supported term"
+            )
+        return ("delta", term, 1)
+    if form == "lag":
+        payload = _known_sequence(
+            value["lag"],
+            "lag",
+            arity=2,
+        )
+        term = _known_term_signature(payload[0])
+        if term is None:
+            raise ValueError(
+                "lag operand must be a supported term"
+            )
         return (
             "lag",
-            _known_term_signature(payload[0]),
+            term,
             _known_positive_int(payload[1], "lag steps"),
         )
-    if "roll_sum" in value:
-        payload = value["roll_sum"]
-        if not isinstance(payload, (list, tuple)) or len(payload) != 2:
-            return None
+    if form == "roll_sum":
+        payload = _known_sequence(
+            value["roll_sum"],
+            "roll_sum",
+            arity=2,
+        )
+        term = _known_term_signature(payload[0])
+        if term is None:
+            raise ValueError(
+                "roll_sum operand must be a supported term"
+            )
         return (
             "rolling",
             "SUM",
             _known_positive_int(payload[1], "rolling window"),
-            _known_term_signature(payload[0]),
+            term,
         )
-    if "difference" in value:
-        left, right = value["difference"]
-        return ("difference", _known_term_signature(left), _known_term_signature(right))
+    if form == "difference":
+        left, right = _known_sequence(
+            value["difference"],
+            "difference",
+            arity=2,
+        )
+        left_signature = _known_term_signature(left)
+        right_signature = _known_term_signature(right)
+        if left_signature is None or right_signature is None:
+            raise ValueError(
+                "difference operands must be supported terms"
+            )
+        return (
+            "difference",
+            left_signature,
+            right_signature,
+        )
     return None
 
 
 def _known_bound_signature(value):
-    if not isinstance(value, dict) or "bound" not in value:
+    if not isinstance(value, dict):
         return None
-    term, op, threshold = value["bound"]
+    _known_structured_form(
+        value,
+        "bound predicate",
+        ("bound",),
+    )
+    term, op, threshold = _known_sequence(
+        value["bound"],
+        "bound",
+        arity=3,
+    )
+    operator = _known_comparison_operator(op, "bound operator")
     term_signature = _known_term_signature(term)
     return None if term_signature is None else (
         "bound",
         term_signature,
-        str(op),
+        operator,
         _threshold_signature(threshold),
     )
 
 
 def _known_sustained_signature(value):
-    if not isinstance(value, dict):
-        return None
+    _known_exact_mapping_keys(
+        value,
+        "sustained predicate",
+        ("term", "op", "threshold", "window"),
+    )
+    operator = _known_comparison_operator(
+        value.get("op"),
+        "sustained operator",
+    )
     term_signature = _known_term_signature(value.get("term"))
     if term_signature is None:
         return None
@@ -433,7 +1017,7 @@ def _known_sustained_signature(value):
         (
             "bound",
             term_signature,
-            str(value["op"]),
+            operator,
             _threshold_signature(value.get("threshold")),
         ),
     )

@@ -8,6 +8,7 @@ import time
 import numpy as np
 import pandas as pd
 import pytest
+from dateutil import tz as dateutil_tz
 
 from autogram.discovery.loop import build_dataframe_grammar
 from autogram.discovery.known import KnownInvariant, _signature, shapes_for_invariant
@@ -429,7 +430,7 @@ def test_related_aggregate_evaluates_raw_delta_and_boundary_joins():
     assert np.allclose(loss, [220.0, 244.0, 268.0])
 
 
-def test_related_delta_requires_adjacent_complete_partitions():
+def test_related_delta_drops_untrustworthy_partitions():
     prepared = _prepared()
     profile = prepared.attrs[AUTOGRAM_PROFILE_ATTR]
     raw = profile["related_frames"]["raw"].copy()
@@ -454,7 +455,8 @@ def test_related_delta_requires_adjacent_complete_partitions():
         dataset.name_model,
     )
 
-    assert np.isnan(values).all()
+    assert np.isnan(values[0])
+    assert np.allclose(values[1:], [60.0, 60.0])
 
 
 def test_related_delta_recognizes_numeric_reset_flags():
@@ -614,6 +616,82 @@ def test_span_filters_and_cache_keys_preserve_typed_identity():
     assert true_values is not None and one_values is not None
     assert true_values.tolist() == [1.0, 0.0]
     assert one_values.tolist() == [0.0, 1.0]
+
+
+@pytest.mark.parametrize(
+    "filter_value",
+    [
+        np.datetime64("2026-02-01T00:00:00.123", "ms"),
+        pd.NaT,
+        pd.Timestamp(
+            "2026-01-15 12:00",
+            tz=dateutil_tz.gettz("America/New_York"),
+        ),
+        pd.Timestamp(
+            "2026-07-15 12:00",
+            tz=dateutil_tz.gettz("America/New_York"),
+        ),
+    ],
+)
+def test_temporal_span_filter_values_build_and_evaluate(filter_value):
+    parent = pd.DataFrame({
+        "timestamp": pd.to_datetime([
+            "2026-01-01 00:01:00",
+            "2026-01-01 00:03:00",
+        ]),
+        "value": [1.0, 2.0],
+    })
+    categories = np.empty(1, dtype=object)
+    categories[0] = filter_value
+    child = pd.DataFrame({
+        "kind": pd.Series(categories, dtype=object),
+        "span_start": [pd.Timestamp("2026-01-01 00:00:00")],
+        "span_end": [pd.Timestamp("2026-01-01 00:02:00")],
+    })
+    profiled = profile_dataframe(
+        parent,
+        time_index="timestamp",
+        related_frames={"events": child},
+        related_aggregates={
+            "temporal_event": {
+                "relation": "events",
+                "column": "kind",
+                "mode": "span_any",
+                "parent_keys": (),
+                "child_keys": (),
+                "partition_keys": (),
+                "parent_time": "timestamp",
+                "child_time": "span_start",
+                "window_seconds": 60,
+                "span_start": "span_start",
+                "span_end": "span_end",
+                "filter_column": "kind",
+                "filter_values": (filter_value,),
+            },
+        },
+        advanced=True,
+    )
+
+    dataset, _grammar = build_dataframe_grammar(
+        profiled,
+        _base_spec(),
+        name="temporal_span_filter",
+    )
+    compiled = dataset.name_model.adapter.related_templates[
+        ("record", "temporal_event")
+    ]
+    values = eval_term(
+        A.RelatedAgg("temporal_event"),
+        "record",
+        {},
+        dataset.observed,
+        dataset.name_model,
+    )
+
+    assert typed_group_key(compiled.filter_values[0]) == typed_group_key(
+        filter_value
+    )
+    assert values.tolist() == [1.0, 0.0]
 
 
 def test_span_join_leaves_missing_parent_time_ungradeable():
@@ -1419,7 +1497,7 @@ def test_materialized_and_streaming_use_identical_sum_order():
     assert np.array_equal(materialized, streaming, equal_nan=True)
 
 
-def test_incomplete_partition_cannot_create_streaming_only_overflow():
+def test_partial_partition_still_reports_real_reduction_overflow():
     parent_times = pd.date_range(
         "2026-01-01",
         periods=3,
@@ -1485,8 +1563,13 @@ def test_incomplete_partition_cannot_create_streaming_only_overflow():
 
     assert materialized is not None and streaming is not None
     assert np.array_equal(materialized, streaming, equal_nan=True)
-    assert materialized_overflow is None
-    assert streaming_overflow is None
+    assert materialized_overflow is not None
+    assert streaming_overflow is not None
+    assert np.array_equal(
+        materialized_overflow,
+        streaming_overflow,
+    )
+    assert bool(materialized_overflow[-1])
 
 
 def test_related_aggregates_scale_to_multi_day_child_history():
@@ -1659,16 +1742,11 @@ def test_related_level_sum_is_ungradeable_when_a_shard_reading_is_missing():
 
 
 def test_materialized_and_streaming_paths_agree_when_a_shard_minute_is_absent():
-    """Round-26: the two implementations of a cross-grain sum must agree on missing coverage.
+    """Invalid shard boundaries are omitted from both cross-grain sums.
 
-    A shard with no rows at all for one parent minute is a *coverage gap*, not a zero contribution.
-    The streaming join already refuses to grade such a row. The materialised fast path used to leave
-    a structural zero there, so the same law read as a family sum silently under-counted while
-    `RELATED(...)` reported nothing -- two answers to one question.
-
-    A minute the shard DID report but whose increment is unusable (a reset) stays a deliberate zero
-    in both paths, because the emitted per-minute value excludes that shard too. This test pins both
-    halves of that distinction.
+    A fully absent shard-minute and the first following delta are
+    untrustworthy for that shard. Other trustworthy shards still contribute,
+    exactly as the generator's nan-aware reduction does.
     """
     prepared = _prepared()
     raw = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["related_frames"]["raw"].copy()
@@ -1691,17 +1769,24 @@ def test_materialized_and_streaming_paths_agree_when_a_shard_minute_is_absent():
     assert int(gap.sum()) > 0
     gapped = prepare_gtib(derived, raw.loc[~gap].reset_index(drop=True))
 
-    # Fast path: the shard's own materialised columns report the gap rather than a zero.
+    # Invalid shard deltas are represented as zero contributions while another
+    # shard keeps the consumer total gradeable.
     for column in ("shard_000_1_input_increment", "shard_000_1_output_increment"):
         values = pd.to_numeric(gapped[column], errors="coerce").to_numpy(dtype=float)
-        assert np.isnan(values[1]), (column, values)
+        assert np.array_equal(
+            values,
+            np.array([np.nan, 0.0, 0.0]),
+            equal_nan=True,
+        ), (column, values)
 
-    # Streaming path: the same row is ungradeable.
+    # The surviving shard contributes in the gap minute and the first minute
+    # after it.
     dataset, _grammar = build_dataframe_grammar(gapped, _base_spec(), name="coverage_gap")
     joined = eval_term(
         A.RelatedAgg("raw_input_rate"), "record", {}, dataset.observed, dataset.name_model
     )
-    assert np.isnan(joined[1]), joined
+    assert np.isnan(joined[0])
+    assert np.allclose(joined[1:], [60.0, 60.0])
 
     # A reported-but-reset minute is the other case: both paths treat it as a deliberate zero
     # contribution, so the parent row is still graded.
@@ -1736,17 +1821,11 @@ def _family_sum(frame, columns):
 
 
 def test_materialized_and_streaming_increments_agree_on_every_awkward_minute():
-    """Round-27: the fast path must reproduce the join's coverage AND its any-valid rule.
+    """Both paths implement the generator's per-shard validity reduction.
 
-    Three distinct situations used to be collapsed into a structural zero by the materialised path
-    while the streaming join answered differently:
-
-    * a minute with no adjacent prior boundary (the first minute, and the minute after a gap) has no
-      measurable increment at all -- ungradeable;
-    * a minute where one shard reset is a deliberate zero contribution from that shard, because the
-      emitted per-minute value excludes it too -- the row is still graded;
-    * a minute where *every* shard reset has no usable contributor at all, so the total carries no
-      information -- ungradeable.
+    A reset or missing boundary invalidates only that shard's delta, while
+    trustworthy shards still contribute. If every shard is invalid, the
+    consumer total remains ungradeable.
     """
     derived = pd.DataFrame({
         "timestamp": pd.date_range("2026-01-01", periods=3, freq="1min"),
@@ -1794,16 +1873,15 @@ def test_materialized_and_streaming_increments_agree_on_every_awkward_minute():
     assert _same(joined, fast), (joined, fast)
     assert np.isnan(joined[1]), joined
 
-    # One shard loses a whole minute while the other keeps reporting. The surviving shard makes the
-    # row non-barren, so the "at least one usable contributor" pass does not rescue it -- only the
-    # per-shard coverage rule does. Both the gap minute and the minute *after* it (which now has no
-    # adjacent prior boundary for the affected shard) must be ungradeable in both paths.
+    # One shard loses a whole minute while the other keeps reporting. The
+    # affected shard is invalid both in the gap and immediately after it; the
+    # trustworthy shard still contributes to the consumer total.
     dropped = raw.loc[
         ~(minute_one & (raw["shard_id"] == "shard_000_0"))
     ].reset_index(drop=True)
     joined, fast = _both(dropped)
     assert _same(joined, fast), (joined, fast)
-    assert np.isnan(joined[1]) and np.isnan(joined[2]), joined
+    assert np.allclose(joined[1:], [120.0, 120.0]), joined
 
 
 

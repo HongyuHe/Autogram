@@ -34,6 +34,7 @@ from ..dsl.evaluate import (
 from ..loader.loader import Dataset, Frame
 from ..schema.spec import FamilySelector, RelatedTemplate
 from . import synth as S
+from .evaluate import _categorical_definition_population
 from .induce import SchemaInducer, make_inducer
 from .loop import DiscoveryResult, discover, prepare_columns, run_prepared
 from .propose import EnumerationProposer
@@ -96,16 +97,9 @@ def _operand_sig(rule, binder, binding, nm, parameters=None):
     if isinstance(rule.atom, A.CategoryDefinition):
         return _with_condition(
             rule,
-            (
-                "categorical_definition",
-                (
-                    rule.atom.target_column,
-                    tuple(
-                        (column, typed_signature_value(value))
-                        for column, value in rule.atom.cases
-                    ),
-                    typed_signature_value(rule.atom.default),
-                ),
+            A.category_definition_semantic_key(
+                rule.atom,
+                typed_signature_value,
             ),
         )
     if isinstance(rule.atom, A.BandDefinition):
@@ -707,45 +701,25 @@ def _definition_matches_planted_mask(evaluation, result) -> bool:
     """Whether one exact definition reproduces its full gradeable target mask."""
     from .evaluate import (
         _boolean_population,
-        _condition_mask,
         _learned_bounds,
         _typed_equal_array,
     )
 
     rule = evaluation.rule
     if isinstance(rule.atom, A.CategoryDefinition):
-        frame = result.dataset.observed
-        atom = rule.atom
-        if atom.target_column not in frame.row_context:
+        try:
+            population = _categorical_definition_population(
+                rule,
+                result.dataset.observed,
+            )
+        except (TypeError, ValueError):
             return False
-        target = np.asarray(
-            frame.row_context[atom.target_column],
-            dtype=object,
-        )
-        valid = ~pd.isna(target)
-        if rule.condition is not None:
-            condition = _condition_mask(rule.condition, frame)
-            if condition is None:
-                return False
-            valid &= condition
-        predicted = np.full(target.size, atom.default, dtype=object)
-        case_masks = []
-        for column, value in atom.cases:
-            if column not in frame.row_context:
-                return False
-            raw = np.asarray(frame.row_context[column], dtype=object)
-            present = ~pd.isna(raw)
-            active = np.zeros(target.size, dtype=bool)
-            active[present] = raw[present].astype(bool)
-            valid &= present
-            case_masks.append((active, value))
-        for active, value in reversed(case_masks):
-            predicted[active] = value
         return bool(
-            np.any(valid)
+            population.order_identifiable
+            and np.any(population.valid)
             and np.all(_typed_equal_array(
-                target[valid],
-                predicted[valid],
+                population.target[population.valid],
+                population.predicted[population.valid],
             ))
         )
     if (
@@ -1858,6 +1832,108 @@ def _runtime_relation_null(
     return output
 
 
+def _required_derangement_positions(
+    source,
+    positions,
+    supports,
+    rng,
+) -> np.ndarray | None:
+    """Find the smallest support-hitting subset whose typed labels can be deranged."""
+    cells = {}
+    for position in np.asarray(rng.permutation(positions), dtype=int):
+        membership = 0
+        for support_index, support in enumerate(supports):
+            if support[position]:
+                membership |= 1 << support_index
+        key = (typed_group_key(source[position]), membership)
+        cells.setdefault(key, []).append(int(position))
+
+    import z3
+
+    optimizer = z3.Optimize()
+    optimizer.set(
+        random_seed=int(rng.integers(0, np.iinfo(np.int32).max)),
+    )
+    counts = {
+        cell: z3.Int(f"category_derangement_{index}")
+        for index, cell in enumerate(cells)
+    }
+    for cell, count in counts.items():
+        optimizer.add(
+            count >= 0,
+            count <= len(cells[cell]),
+        )
+    total = z3.Sum(tuple(counts.values()))
+    optimizer.add(total >= 2)
+    for support_index in range(len(supports)):
+        covering = [
+            count
+            for (_key, membership), count in counts.items()
+            if membership & (1 << support_index)
+        ]
+        if not covering:
+            return None
+        optimizer.add(z3.Sum(covering) >= 1)
+    # The changed positions retain their original typed-label multiset. Such a multiset has a
+    # derangement exactly when no label occupies more than half of it.
+    label_keys = tuple(dict.fromkeys(
+        key
+        for key, _membership in cells
+    ))
+    for key in label_keys:
+        label_count = z3.Sum([
+            count
+            for (cell_key, _membership), count in counts.items()
+            if cell_key == key
+        ])
+        optimizer.add(2 * label_count <= total)
+
+    optimizer.minimize(total)
+    weights = rng.integers(
+        1,
+        np.iinfo(np.int64).max,
+        size=len(counts),
+        dtype=np.int64,
+    )
+    optimizer.maximize(z3.Sum([
+        int(weight) * count
+        for weight, count in zip(weights, counts.values())
+    ]))
+    if optimizer.check() != z3.sat:
+        return None
+
+    model = optimizer.model()
+    selected = []
+    for cell, count in counts.items():
+        take = model.eval(count).as_long()
+        selected.extend(cells[cell][:take])
+    return np.asarray(selected, dtype=int)
+
+
+def _typed_category_derangement(source, positions, rng) -> np.ndarray:
+    """Derange a typed-label multiset whose largest class is at most half."""
+    groups = {}
+    for position in positions:
+        groups.setdefault(
+            typed_group_key(source[position]),
+            [],
+        ).append(int(position))
+    group_values = tuple(groups.values())
+    ordered_groups = []
+    for index in rng.permutation(len(groups)):
+        group = group_values[int(index)]
+        ordered_groups.append(
+            np.asarray(rng.permutation(group), dtype=int)
+        )
+    ordered = np.concatenate(ordered_groups)
+    largest = max(group.size for group in ordered_groups)
+    direction = -1 if int(rng.integers(0, 2)) else 1
+    donors = np.roll(ordered, direction * largest)
+    output = source.copy()
+    output[ordered] = source[donors]
+    return output
+
+
 def _permute_present_categories(
     values,
     rng,
@@ -1865,10 +1941,9 @@ def _permute_present_categories(
     required_supports=(),
     column: str = "",
 ) -> np.ndarray:
-    """Permute labels while preserving their missingness mask."""
+    """Permute typed labels without moving missing values or relying on retry luck."""
     source = _typed_object_array(values)
     required_supports = tuple(required_supports)
-    output = source.copy()
     present = ~pd.isna(source)
     positions = np.flatnonzero(present)
     if positions.size < 2:
@@ -1877,143 +1952,94 @@ def _permute_present_categories(
                 "runtime definition null cannot independently randomize "
                 f"categorical target {column!r}"
             )
-        return output
+        return source.copy()
 
     supports = [
-        np.asarray(mask, dtype=bool)
+        np.asarray(mask, dtype=bool) & present
         for mask in required_supports
         if np.any(np.asarray(mask, dtype=bool) & present)
     ]
     if not supports:
         supports = [present]
+
     source_values = source[positions]
+    candidate = rng.permutation(source_values)
+    changed = np.zeros(source.size, dtype=bool)
+    changed[positions] = np.fromiter(
+        (
+            typed_group_key(left) != typed_group_key(right)
+            for left, right in zip(source_values, candidate)
+        ),
+        dtype=bool,
+        count=positions.size,
+    )
+    if all(np.any(changed & support) for support in supports):
+        output = source.copy()
+        output[positions] = candidate
+        return output
 
-    def changed_on_every_support(candidate) -> bool:
-        changed = np.zeros(source.size, dtype=bool)
-        changed[positions] = np.fromiter(
-            (
-                typed_group_key(left) != typed_group_key(right)
-                for left, right in zip(source_values, candidate)
-            ),
-            dtype=bool,
-            count=positions.size,
+    changed_positions = _required_derangement_positions(
+        source,
+        positions,
+        supports,
+        rng,
+    )
+    if changed_positions is None:
+        raise RuntimeError(
+            "runtime definition null cannot independently randomize "
+            f"categorical target {column!r} on every gradeable candidate support"
         )
-        return all(np.any(changed & support) for support in supports)
 
-    for _attempt in range(64):
-        candidate = rng.permutation(source_values)
-        if changed_on_every_support(candidate):
-            output[positions] = candidate
-            return output
-
-    representatives = {}
-    for index, value in enumerate(source_values):
-        representatives.setdefault(typed_group_key(value), index)
-    required_positions = np.flatnonzero(
-        np.logical_or.reduce(supports) & present
+    output = _typed_category_derangement(
+        source,
+        changed_positions,
+        rng,
     )
-    position_to_local = {
-        int(position): local
-        for local, position in enumerate(positions)
-    }
-    for position in required_positions:
-        left = position_to_local[int(position)]
-        left_key = typed_group_key(source_values[left])
-        for key, right in representatives.items():
-            if key == left_key:
-                continue
-            candidate = source_values.copy()
-            candidate[left], candidate[right] = (
-                candidate[right],
-                candidate[left],
-            )
-            if changed_on_every_support(candidate):
-                output[positions] = candidate
-                return output
-    raise RuntimeError(
-        "runtime definition null cannot independently randomize "
-        f"categorical target {column!r} on every gradeable candidate support"
-    )
-
-
-def _categorical_definition_population(rule: A.Rule, frame):
-    """Return target, prediction, and gradeable rows for an identifiable category rule."""
-    from .evaluate import _condition_mask
-
-    if not isinstance(rule.atom, A.CategoryDefinition):
-        return None
-    atom = rule.atom
-    if atom.target_column not in frame.row_context:
-        return None
-    target = np.asarray(
-        frame.row_context[atom.target_column],
-        dtype=object,
-    )
-    valid = ~pd.isna(target)
-    if rule.condition is not None:
-        condition = _condition_mask(rule.condition, frame)
-        if condition is None:
-            return None
-        valid &= condition
-
-    case_masks = []
-    for column, value in atom.cases:
-        if column not in frame.row_context:
-            return None
-        raw = np.asarray(frame.row_context[column], dtype=object)
-        present = ~pd.isna(raw)
-        active = np.zeros(target.size, dtype=bool)
-        active[present] = raw[present].astype(bool)
-        valid &= present
-        case_masks.append((active, value))
-
-    for left_index, (left_mask, left_value) in enumerate(case_masks):
-        higher_active = np.zeros(target.size, dtype=bool)
-        for higher_mask, _higher_value in case_masks[:left_index]:
-            higher_active |= higher_mask
-        for right_mask, right_value in case_masks[left_index + 1:]:
-            if (
-                typed_group_key(left_value) != typed_group_key(right_value)
-                and not np.any(
-                    left_mask
-                    & right_mask
-                    & ~higher_active
-                    & valid
-                )
-            ):
-                return None
-
-    predicted = np.full(target.size, atom.default, dtype=object)
-    for active, value in reversed(case_masks):
-        predicted[active] = value
-    return target, predicted, valid
+    # Lock only the minimum witness set; independently permute every remaining present label.
+    changed = {int(position) for position in changed_positions}
+    remainder = np.asarray([
+        int(position)
+        for position in positions
+        if int(position) not in changed
+    ], dtype=int)
+    if remainder.size > 1:
+        output[remainder] = source[rng.permutation(remainder)]
+    return output
 
 
 def _runtime_categorical_requirements(dataset, rules):
+    """Capture only candidates passing the evaluator's exact case-order analysis."""
     from .evaluate import _typed_equal_array
 
     requirements = {}
     change_supports = {}
     for rule in rules:
-        population = _categorical_definition_population(
-            rule,
-            dataset.observed,
-        )
-        if population is None:
+        try:
+            population = _categorical_definition_population(
+                rule,
+                dataset.observed,
+            )
+        except (TypeError, ValueError):
             continue
-        target, predicted, valid = population
-        if not np.any(valid):
+        if (
+            not population.order_identifiable
+            or not np.any(population.valid)
+        ):
             continue
         exact = bool(np.all(_typed_equal_array(
-            target[valid],
-            predicted[valid],
+            population.target[population.valid],
+            population.predicted[population.valid],
         )))
-        requirements[rule.signature()] = (rule, valid.copy(), exact)
+        requirements[rule.signature()] = (
+            rule,
+            population.valid.copy(),
+            exact,
+        )
         if exact:
             change_supports.setdefault(
                 rule.atom.target_column,
                 [],
-            ).append(valid.copy())
+            ).append(population.valid.copy())
     return requirements, change_supports
 
 
@@ -2021,17 +2047,24 @@ def _validate_runtime_categorical_null(
     dataset,
     requirements,
 ) -> dict[str, int]:
+    """Re-run the evaluator's case-order analysis before accepting null gradeability."""
     from .evaluate import _typed_equal_array
 
     gradeable_points = {}
     for signature, (rule, expected_mask, exact) in requirements.items():
-        population = _categorical_definition_population(
-            rule,
-            dataset.observed,
-        )
+        try:
+            population = _categorical_definition_population(
+                rule,
+                dataset.observed,
+            )
+        except (TypeError, ValueError):
+            population = None
         actual_mask = (
-            population[2]
-            if population is not None
+            population.valid
+            if (
+                population is not None
+                and population.order_identifiable
+            )
             else np.zeros(dataset.observed.n_rows, dtype=bool)
         )
         expected = int(np.count_nonzero(expected_mask))
@@ -2043,10 +2076,9 @@ def _validate_runtime_categorical_null(
                 f"found {actual}"
             )
         gradeable_points[signature] = expected
-        target, predicted, valid = population
         if exact and np.all(_typed_equal_array(
-            target[valid],
-            predicted[valid],
+            population.target[population.valid],
+            population.predicted[population.valid],
         )):
             raise RuntimeError(
                 "runtime definition null did not break categorical candidate "
@@ -2873,13 +2905,19 @@ def null_definitions_at(prepared_null: PreparedProxy | None, dcfg: DiscoveryConf
             )
         for signature, expected in requirements.items():
             rule = rules[signature]
-            population = _categorical_definition_population(
-                rule,
-                prepared_null.ds.observed,
-            )
+            try:
+                population = _categorical_definition_population(
+                    rule,
+                    prepared_null.ds.observed,
+                )
+            except (TypeError, ValueError):
+                population = None
             actual = (
-                int(np.count_nonzero(population[2]))
-                if population is not None
+                int(np.count_nonzero(population.valid))
+                if (
+                    population is not None
+                    and population.order_identifiable
+                )
                 else 0
             )
             if actual != expected:

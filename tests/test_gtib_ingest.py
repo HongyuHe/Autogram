@@ -95,6 +95,242 @@ def _increments(series):
     return [None if pd.isna(value) else float(value) for value in series.tolist()]
 
 
+def test_counter_state_helper_copies_have_explicit_behavioral_parity():
+    from autogram import counter_state as autogram_state
+    from generator.gtib_emulator import counter_state as generator_state
+
+    values = np.array([
+        [100.0, 200.0],
+        [np.nan, np.nan],
+        [5.0, 4.0],
+        [9.0, 8.0],
+    ])
+    resets = np.array([False, True, False, False])
+
+    def exercise(module):
+        effective, observed = module.scan_counter_state(values, resets)
+        trustworthy = module.trustworthy_boundaries(
+            observed,
+            resets[:, None],
+        )
+        previous = np.concatenate(
+            (effective[:1], effective[:-1]),
+            axis=0,
+        )
+        previous_trustworthy = np.concatenate(
+            (
+                np.zeros_like(trustworthy[:1]),
+                trustworthy[:-1],
+            ),
+            axis=0,
+        )
+        return (
+            effective,
+            observed,
+            *module.counter_boundary_deltas(
+                effective,
+                previous,
+                trustworthy,
+                previous_trustworthy,
+                resets[:, None],
+            ),
+        )
+
+    autogram_result = exercise(autogram_state)
+    generator_result = exercise(generator_state)
+    for actual, expected in zip(
+        autogram_result,
+        generator_result,
+    ):
+        assert np.array_equal(actual, expected, equal_nan=True)
+    assert np.array_equal(
+        autogram_result[2],
+        np.array([
+            [np.nan, np.nan],
+            [np.nan, np.nan],
+            [5.0, 4.0],
+            [4.0, 4.0],
+        ]),
+        equal_nan=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("counter", "resets", "drop_missing_rows"),
+    (
+        (
+            [100.0, np.nan, 5.0, 9.0],
+            [False, True, False, False],
+            False,
+        ),
+        (
+            [10.0, 20.0, np.nan, np.nan, 30.0, 40.0],
+            [False] * 6,
+            True,
+        ),
+    ),
+)
+def test_raw_rate_paths_match_generator_trustworthy_boundaries(
+    counter,
+    resets,
+    drop_missing_rows,
+):
+    from generator.gtib_emulator.deriver import _minute_counters
+
+    count = len(counter)
+    timestamps = pd.date_range(
+        "2026-01-01",
+        periods=count,
+        freq="1min",
+    )
+    derived = pd.DataFrame({
+        "timestamp": timestamps,
+        "consumer_id": ["consumer"] * count,
+        "minute_index": np.arange(count),
+        "input_rate_bytes_per_min": np.nan,
+    })
+    raw = pd.DataFrame({
+        "timestamp": timestamps,
+        "consumer_id": ["consumer"] * count,
+        "shard_id": ["shard"] * count,
+        "collector_input_counted": counter,
+        "presenter_output_counted": counter,
+        "reset_flag": resets,
+    })
+    if drop_missing_rows:
+        raw = raw.loc[
+            np.isfinite(raw["collector_input_counted"])
+        ].reset_index(drop=True)
+
+    prepared = prepare_gtib(derived, raw)
+    family = prepared.attrs[AUTOGRAM_PROFILE_ATTR]["families"][
+        "shard_input_increment"
+    ]
+    materialized_dataset, _grammar = build_dataframe_grammar(
+        prepared,
+        _base_spec(),
+        name="trustworthy_materialized",
+    )
+    materialized = eval_term(
+        A.Agg("SUM", "shard_input_increment"),
+        "record",
+        {},
+        materialized_dataset.observed,
+        materialized_dataset.name_model,
+    )
+    streaming_frame = prepared.drop(columns=family)
+    streaming_frame.attrs = prepared.attrs
+    streaming_dataset, _grammar = build_dataframe_grammar(
+        streaming_frame,
+        _base_spec(),
+        name="trustworthy_streaming",
+    )
+    streaming = eval_term(
+        A.RelatedAgg("raw_input_rate"),
+        "record",
+        {},
+        streaming_dataset.observed,
+        streaming_dataset.name_model,
+    )
+    increments, valid = _minute_counters(
+        np.asarray([counter], dtype=float),
+        np.asarray([resets], dtype=bool),
+        spm=1,
+    )
+    expected = np.where(valid[0], increments[0], np.nan)
+
+    assert np.array_equal(materialized, expected, equal_nan=True)
+    assert np.array_equal(streaming, expected, equal_nan=True)
+
+
+def test_raw_rate_paths_preserve_shared_counter_validity():
+    timestamps = pd.date_range(
+        "2026-01-01",
+        periods=4,
+        freq="1min",
+    )
+    derived = pd.DataFrame({
+        "timestamp": timestamps,
+        "consumer_id": ["consumer"] * 4,
+        "minute_index": np.arange(4),
+        "input_rate_bytes_per_min": np.nan,
+        "output_rate_bytes_per_min": np.nan,
+    })
+    rows = []
+    for shard, input_counter, output_counter in (
+        (
+            "bad",
+            [0.0, 10.0, 20.0, 30.0],
+            [0.0, np.nan, 20.0, 30.0],
+        ),
+        (
+            "good",
+            [0.0, 100.0, 200.0, 300.0],
+            [0.0, 100.0, 200.0, 300.0],
+        ),
+    ):
+        for timestamp, input_value, output_value in zip(
+            timestamps,
+            input_counter,
+            output_counter,
+        ):
+            rows.append({
+                "timestamp": timestamp,
+                "consumer_id": "consumer",
+                "shard_id": shard,
+                "collector_input_counted": input_value,
+                "presenter_output_counted": output_value,
+                "reset_flag": False,
+            })
+    prepared = prepare_gtib(derived, pd.DataFrame(rows))
+    expected = np.array([np.nan, 100.0, 100.0, 110.0])
+
+    for family_role, related_role in (
+        ("shard_input_increment", "raw_input_rate"),
+        ("shard_output_increment", "raw_output_rate"),
+    ):
+        family = prepared.attrs[AUTOGRAM_PROFILE_ATTR][
+            "families"
+        ][family_role]
+        materialized_dataset, _grammar = build_dataframe_grammar(
+            prepared,
+            _base_spec(),
+            name=f"validity_materialized_{family_role}",
+        )
+        materialized = eval_term(
+            A.Agg("SUM", family_role),
+            "record",
+            {},
+            materialized_dataset.observed,
+            materialized_dataset.name_model,
+        )
+        streaming_frame = prepared.drop(columns=family)
+        streaming_frame.attrs = prepared.attrs
+        streaming_dataset, _grammar = build_dataframe_grammar(
+            streaming_frame,
+            _base_spec(),
+            name=f"validity_streaming_{family_role}",
+        )
+        streaming = eval_term(
+            A.RelatedAgg(related_role),
+            "record",
+            {},
+            streaming_dataset.observed,
+            streaming_dataset.name_model,
+        )
+
+        assert np.array_equal(
+            materialized,
+            expected,
+            equal_nan=True,
+        )
+        assert np.array_equal(
+            streaming,
+            expected,
+            equal_nan=True,
+        )
+
+
 def test_string_backed_reset_flags_do_not_spuriously_reset():
     # A reset-free frame whose reset_flag arrives as strings ("false") must materialize identical
     # increments to a Boolean frame: a naive .any() would treat the non-empty "false" as truthy and
@@ -998,13 +1234,10 @@ def test_materialization_does_not_bridge_missing_raw_minute():
     frame = prepare_gtib(derived, raw.loc[~missing].copy())
 
     values = frame["shard_000_0_input_increment"].tolist()
-    # The gap must not be bridged: no increment may span the absent minute. Round-26 strengthened
-    # the answer from a structural zero to NaN, so the absent minute is *ungradeable* rather than a
-    # claim that the shard contributed nothing. Round-27 extended that to every minute with no
-    # adjacent prior boundary -- the first minute, and the minute right after the gap -- which is
-    # exactly what the streaming join reports. A zero on any of these would silently under-count a
-    # family sum while the join refuses to grade the same row.
-    assert _increments(pd.Series(values)) == [None, None, None]
+    # The absent minute and the first following delta are invalid for this
+    # shard, so neither may bridge the gap. The other shard remains valid,
+    # making these zero contributions rather than all-invalid rows.
+    assert _increments(pd.Series(values)) == [None, 0.0, 0.0]
 
 
 def test_materialized_boundary_treats_pdna_as_missing():

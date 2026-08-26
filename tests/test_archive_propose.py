@@ -111,6 +111,64 @@ def test_archive_fitted_semantics_distinguish_typed_categories():
     )
 
 
+def test_archive_collapses_only_equivalent_same_label_priority_blocks():
+    def evaluation(cases):
+        return Evaluation(
+            rule=A.Rule(
+                "record",
+                A.CategoryDefinition(
+                    "target",
+                    cases,
+                    "none",
+                ),
+            ),
+            accepted=True,
+            reason="test",
+            eps=0.0,
+            hold_rate=1.0,
+            hold_rate_lo=0.99,
+            hold_rate_hi=1.0,
+            statistic="hold_rate",
+            support=1.0,
+            n_points=100,
+            n_bindings=1,
+            mdl_gain=1.0,
+            strictness="definition",
+            descriptor=("record", 4),
+        )
+
+    grouped = evaluation((
+        ("is_a", "alert"),
+        ("is_b", "alert"),
+        ("is_c", "warning"),
+    ))
+    grouped_permutation = evaluation((
+        ("is_b", "alert"),
+        ("is_a", "alert"),
+        ("is_c", "warning"),
+    ))
+    precedence_sensitive = evaluation((
+        ("is_a", "alert"),
+        ("is_c", "warning"),
+        ("is_b", "alert"),
+    ))
+
+    assert _same_fitted_semantics(grouped, grouped_permutation)
+    assert not _same_fitted_semantics(grouped, precedence_sensitive)
+
+    archive = ParetoArchive()
+    assert archive.add(grouped)
+    assert not archive.add(grouped_permutation)
+    assert archive.add(precedence_sensitive)
+    assert {
+        evaluation.rule
+        for evaluation in archive.portfolio()
+    } == {
+        grouped.rule,
+        precedence_sensitive.rule,
+    }
+
+
 def test_archive_retains_lag_shadow_unless_exact_atomic_suppresses_it(dataset):
     # A lag one-sided sign bound is RETAINED as an independent temporal law unless an EXACT atomic
     # (hold-rate 1.0) proves it redundant: an exact ``x >= 0`` evicts ``LAG_k(x) >= 0`` (which keeps
@@ -431,6 +489,175 @@ def test_enumeration_includes_bounded_scale_and_add_forms(grammar):
     atoms = [r.atom for r in rules]
     assert any(isinstance(a.left, A.Scale) or isinstance(a.right, A.Scale) for a in atoms)
     assert any(isinstance(a.left, A.Add) or isinstance(a.right, A.Add) for a in atoms)
+
+
+def test_enumeration_keeps_close_scale_coefficients_distinct():
+    coefficients = (1.2345671, 1.2345672)
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=", "=="),
+        ref_roles={"record": ("x", "y")},
+        fam_roles={"record": ()},
+        scale_coeffs=coefficients,
+        max_complexity=8,
+    )
+
+    rules = EnumerationProposer(grammar).propose()
+    emitted = {
+        float(term.coeff)
+        for rule in rules
+        if isinstance(rule.atom, A.Compare)
+        for term in (rule.atom.left, rule.atom.right)
+        if isinstance(term, A.Scale)
+        and term.term == A.Ref("x")
+    }
+
+    assert emitted == set(coefficients)
+
+
+def test_normalization_keeps_legacy_symmetric_representatives():
+    zero_first = normalize_rule(A.Rule(
+        "network",
+        A.Compare(
+            A.Agg("MIN", "all_demand"),
+            "~=",
+            A.Const(0.0),
+        ),
+    ))
+    additive = normalize_rule(A.Rule(
+        "node",
+        A.Compare(
+            A.Add((
+                A.Ref("measurement_source"),
+                A.Agg("SUM", "demand_col"),
+            )),
+            "~=",
+            A.Add((
+                A.Ref("measurement_destination"),
+                A.Agg("SUM", "demand_row"),
+            )),
+        ),
+    ))
+
+    assert zero_first.unparse() == (
+        "[forall network] 0 ~= MIN(all_demand)"
+    )
+    assert additive.unparse() == (
+        "[forall node] measurement_destination + SUM(demand_row) "
+        "~= measurement_source + SUM(demand_col)"
+    )
+
+
+def test_archive_keeps_roundtrip_distinct_float_coefficients():
+    rules = (
+        A.Rule(
+            "record",
+            A.Compare(
+                A.Scale(1.2345671, A.Ref("x")),
+                "==",
+                A.Ref("y"),
+            ),
+        ),
+        A.Rule(
+            "record",
+            A.Compare(
+                A.Scale(1.2345672, A.Ref("x")),
+                "==",
+                A.Ref("y"),
+            ),
+        ),
+    )
+
+    def accepted(rule):
+        return Evaluation(
+            rule=rule,
+            accepted=True,
+            reason="test",
+            eps=0.0,
+            hold_rate=1.0,
+            hold_rate_lo=1.0,
+            hold_rate_hi=1.0,
+            statistic="hold_rate",
+            support=1.0,
+            n_points=100,
+            n_bindings=1,
+            mdl_gain=1.0,
+            strictness="exact",
+            descriptor=("record", 1),
+        )
+
+    archive = ParetoArchive()
+    assert all(archive.add(accepted(rule)) for rule in rules)
+    assert {
+        evaluation.rule
+        for evaluation in archive.portfolio()
+    } == set(rules)
+
+
+def test_archive_keeps_precedence_colliding_temporal_rules():
+    x = A.Ref("x")
+    y = A.Ref("y")
+    rules = (
+        A.Rule(
+            "record",
+            A.Compare(
+                A.Lag(A.Scale(2.0, A.Add((x, y))), 1),
+                "~=",
+                A.Ref("z"),
+            ),
+        ),
+        A.Rule(
+            "record",
+            A.Compare(
+                A.Lag(A.Add((A.Scale(2.0, x), y)), 1),
+                "~=",
+                A.Ref("z"),
+            ),
+        ),
+    )
+    assert rules[0].unparse() != rules[1].unparse()
+    grammar = Grammar(
+        binders=("record",),
+        ops=("==", "~="),
+        ref_roles={"record": ("x", "y", "z")},
+        fam_roles={"record": ()},
+        temporal_enabled=True,
+        max_lag=1,
+        max_complexity=16,
+    )
+    assert is_admissible(
+        A.Rule(
+            "record",
+            A.Compare(
+                rules[0].atom.left,
+                "==",
+                rules[1].atom.left,
+            ),
+        ),
+        grammar,
+    )[0]
+
+    def accepted(rule):
+        return Evaluation(
+            rule=rule,
+            accepted=True,
+            reason="test",
+            eps=0.0,
+            hold_rate=1.0,
+            hold_rate_lo=1.0,
+            hold_rate_hi=1.0,
+            statistic="test",
+            support=1.0,
+            n_points=100,
+            n_bindings=1,
+            mdl_gain=1.0,
+            strictness="approximate",
+            descriptor=("record", 1),
+        )
+
+    archive = ParetoArchive()
+    assert all(archive.add(accepted(rule)) for rule in rules)
+    assert {evaluation.rule for evaluation in archive.portfolio()} == set(rules)
 
 
 def test_enumeration_fails_loudly_when_rule_ceiling_would_truncate():
