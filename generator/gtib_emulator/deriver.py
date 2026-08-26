@@ -2,7 +2,7 @@
 
 Pipeline (mirrors the email's description of the production rule)::
 
-    raw counters @10s  --ffill missing-->  per-minute counter samples
+    raw counters @10s  --observed boundaries-->  per-minute counter samples
     per-minute increase (bytes/min)  ->  Input_Rate, Output_Rate  per shard
     SUM over shards                  ->  consumer Input_Rate, Output_Rate
     Completeness_Ratio = SUM(Output_Rate) / SUM(Input_Rate)        (1 min)
@@ -11,7 +11,9 @@ Pipeline (mirrors the email's description of the production rule)::
 
 Counter resets and missing scrapes are handled the way a real rate() function
 must handle them: a decrease is treated as a reset (that minute's rate is
-dropped), and a missing scrape is forward-filled.
+dropped), and isolated missing scrapes are forward-filled. A fully missing
+minute is not accepted as a synthetic zero-rate boundary, so rate calculation
+resumes only after two adjacent trustworthy minute boundaries exist.
 
 A second, *trajectory-aware* rule is also provided (``trajectory_alert``) to
 demonstrate the target behaviour the collaboration wants: fire only when the
@@ -23,10 +25,17 @@ better rule than the static threshold.
 
 from __future__ import annotations
 
+from numbers import Integral
+
 import numpy as np
 import pandas as pd
 
 from .config import EmulatorConfig
+from .counter_state import (
+    counter_boundary_deltas,
+    scan_counter_state,
+    trustworthy_boundaries,
+)
 from .measurement import ObservedResult
 from .pipeline import PhysicalResult
 from .workload import Consumer
@@ -37,32 +46,65 @@ def _minute_counters(counter: np.ndarray, reset_flag: np.ndarray, spm: int) -> t
 
     Returns ``(rate_per_min, valid_mask)`` of shape ``(n_shards, n_minutes)``.
     A minute is invalid where its increment cannot be trusted (reset inside the
-    minute, negative jump, or no valid scrape).
+    minute, negative jump, or either adjacent minute boundary lacks a valid
+    observation). A reset itself establishes a trustworthy zero baseline for
+    the next counter lifetime, including when the reset scrape is missing.
     """
 
     n_shards, n = counter.shape
     n_min = n // spm
-    counter = counter[:, : n_min * spm]
-    reset_flag = reset_flag[:, : n_min * spm]
+    counter = np.asarray(
+        counter[:, : n_min * spm],
+        dtype=float,
+    )
+    reset_flag = np.asarray(
+        reset_flag[:, : n_min * spm],
+        dtype=bool,
+    )
+    increments = np.full((n_shards, n_min), np.nan, dtype=float)
+    valid = np.zeros((n_shards, n_min), dtype=bool)
 
-    # Forward-fill missing (NaN) scrapes along time, per shard.
-    filled = counter.copy()
-    for sh in range(n_shards):
-        row = filled[sh]
-        last = np.nan
-        for t in range(n):
-            if np.isnan(row[t]):
-                row[t] = last
-            else:
-                last = row[t]
+    for shard in range(n_shards):
+        effective, observed = scan_counter_state(
+            counter[shard, :, None],
+            reset_flag[shard],
+        )
+        boundary = effective.reshape(n_min, spm, 1)[:, -1, :]
+        observed_in_minute = observed.reshape(
+            n_min,
+            spm,
+            1,
+        ).any(axis=1)
+        reset_in_minute = reset_flag[shard].reshape(
+            n_min,
+            spm,
+        ).any(axis=1)
+        trustworthy = trustworthy_boundaries(
+            observed_in_minute,
+            reset_in_minute[:, None],
+        )
+        previous = np.concatenate(
+            (boundary[:1], boundary[:-1]),
+            axis=0,
+        )
+        previous_trustworthy = np.concatenate(
+            (
+                np.zeros_like(trustworthy[:1]),
+                trustworthy[:-1],
+            ),
+            axis=0,
+        )
+        delta, usable, _overflow = counter_boundary_deltas(
+            boundary,
+            previous,
+            trustworthy,
+            previous_trustworthy,
+            reset_in_minute[:, None],
+        )
+        increments[shard] = delta[:, 0]
+        valid[shard] = usable[:, 0]
 
-    boundary = filled.reshape(n_shards, n_min, spm)[:, :, -1]        # value at end of minute
-    inc = np.diff(boundary, axis=1, prepend=boundary[:, :1])
-    reset_in_min = reset_flag.reshape(n_shards, n_min, spm).any(axis=2)
-
-    valid = np.isfinite(inc) & (inc >= 0) & ~reset_in_min
-    valid[:, 0] = False                                             # no prior minute to diff against
-    return inc, valid
+    return increments, valid
 
 
 def derive_consumer(cfg: EmulatorConfig, consumer: Consumer, obs: ObservedResult,
@@ -80,7 +122,8 @@ def derive_consumer(cfg: EmulatorConfig, consumer: Consumer, obs: ObservedResult
     in_inc = np.where(valid, in_inc, np.nan)
     out_inc = np.where(valid, out_inc, np.nan)
 
-    # SUM over shards (nan-aware): drop shards missing that minute from both sums.
+    # SUM over shards (nan-aware): drop invalid shard deltas from both sums and
+    # leave the consumer rate missing only when every shard is invalid.
     input_rate = np.nansum(in_inc, axis=0)
     output_rate = np.nansum(out_inc, axis=0)
     any_valid = valid.any(axis=0)
@@ -123,6 +166,13 @@ def derive_consumer(cfg: EmulatorConfig, consumer: Consumer, obs: ObservedResult
 
 def _sustained_below(series: np.ndarray, threshold: float, duration_minutes: int) -> np.ndarray:
     """True where ``series`` has been < threshold for >= ``duration_minutes`` in a row."""
+
+    if (
+        isinstance(duration_minutes, bool)
+        or not isinstance(duration_minutes, Integral)
+        or duration_minutes <= 0
+    ):
+        raise ValueError("duration_minutes must be a positive integer")
 
     below = np.where(np.isfinite(series), series < threshold, False)
     out = np.zeros_like(below, dtype=bool)

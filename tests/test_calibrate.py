@@ -11,9 +11,10 @@ import pandas as pd
 import pytest
 
 from autogram.config import DiscoveryConfig, SearchConfig
+from autogram.dsl.scalar_codec import scalar_to_json
 from autogram.calibrate import (
     CalibrationConfig, _capability_tiers, _derive_regime, _distinct_runtime_tiers,
-    _knob_schedule, _merge_specs,
+    _knob_schedule, _known_membership, _merge_specs,
     _reachable_capability_tiers, _runtime_tier_identity, _split_known,
     _make_calibration_inducer, _spec_summary, _widen_spec, calibrate,
 )
@@ -116,6 +117,7 @@ def test_calibration_defaults_global_while_discovery_stays_adaptive():
     assert DiscoveryConfig().band_mode == "adaptive"
     assert CalibrationConfig().band_mode == "global"
     assert CalibrationConfig().max_capability_tiers == 5
+    assert CalibrationConfig().max_condition_values == 4
     a = build_parser().parse_args(["calibrate", "--input", "x.pkl", "--known", "k.yaml"])
     assert a.band_mode == "global"
 
@@ -290,6 +292,41 @@ def test_profiled_conditions_apply_at_tier_zero(
     )
 
     assert specs[0].conditional_enabled
+
+
+def test_configured_condition_value_cap_is_pinned_across_runtime_tiers(
+    monkeypatch,
+):
+    import autogram.calibrate as calibration
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "label": ["normal", "alert", "idle"],
+            "value": [1.0, 2.0, 3.0],
+        }),
+        condition_columns=("label",),
+    )
+    induced = replace(
+        _mini_spec(),
+        max_condition_values=8,
+    )
+    monkeypatch.setattr(
+        calibration,
+        "induce_spec",
+        lambda _columns, _inducer: induced,
+    )
+
+    specs = calibration._prepare_runtime_tier_specs(
+        frame,
+        induced,
+        object(),
+        [{}, {"temporal": True}],
+        SearchConfig(max_rules=10_000),
+        frame.attrs["autogram_profile"],
+        max_condition_values=2,
+    )
+
+    assert [spec.max_condition_values for spec in specs] == [2, 2]
 
 
 def test_runtime_tier_identity_ignores_glyphs_without_changing_candidates():
@@ -839,6 +876,447 @@ def test_invalid_split_inputs_fail_before_external_induction(monkeypatch, tmp_pa
         )
 
 
+@pytest.mark.parametrize(
+    ("invalid", "message"),
+    [
+        (
+            {
+                "name": "invalid_bound",
+                "op": ":=",
+                "lhs": "alert",
+                "rhs": {
+                    "and": [{
+                        "bound": ["signal", "BOGUS", 0],
+                    }],
+                },
+            },
+            "bound operator",
+        ),
+        (
+            {
+                "name": "invalid_priority",
+                "op": ":=",
+                "lhs": "label",
+                "rhs": {
+                    "priority": [{
+                        "when": "alert",
+                        "value": ["invalid"],
+                    }],
+                    "default": "normal",
+                },
+            },
+            "priority case 'value'",
+        ),
+        (
+            {
+                "name": "invalid_condition_arity",
+                "op": "==",
+                "lhs": "x",
+                "rhs": "y",
+                "where": {
+                    "all": [{"kind": "active"}],
+                },
+            },
+            "exactly 2",
+        ),
+        (
+            {
+                "name": "nested_condition",
+                "op": "==",
+                "lhs": "x",
+                "rhs": "y",
+                "where": {
+                    "all": [
+                        {
+                            "all": [
+                                {"kind": "active"},
+                                {"label": "normal"},
+                            ],
+                        },
+                        {"state": "ready"},
+                    ],
+                },
+            },
+            "may not nest",
+        ),
+        (
+            {
+                "name": "invalid_conjunction_arity",
+                "op": ":=",
+                "lhs": "alert",
+                "rhs": {
+                    "and": [{
+                        "bound": ["signal", ">", 0],
+                    }],
+                },
+            },
+            "between 2 and 16",
+        ),
+        (
+            {
+                "name": "missing_priority_default",
+                "op": ":=",
+                "lhs": "label",
+                "rhs": {
+                    "priority": [{
+                        "when": "alert",
+                        "value": "alert",
+                    }],
+                },
+            },
+            "explicit 'default' key",
+        ),
+        (
+            {
+                "name": "mixed_definition_forms",
+                "op": ":=",
+                "lhs": "label",
+                "rhs": {
+                    "and": [{
+                        "bound": ["signal", ">", 0],
+                    }],
+                    "priority": [{
+                        "when": "alert",
+                        "value": "alert",
+                    }],
+                    "default": "normal",
+                },
+            },
+            "exactly one",
+        ),
+        (
+            {
+                "name": "extra_definition_key",
+                "op": ":=",
+                "lhs": "alert",
+                "rhs": {
+                    "and": [{
+                        "bound": ["signal", ">", 0],
+                    }],
+                    "default": None,
+                },
+            },
+            "unexpected top-level key",
+        ),
+        (
+            {
+                "name": "conditioned_definition",
+                "op": ":=",
+                "lhs": "alert",
+                "rhs": {
+                    "sustained": {
+                        "term": "signal",
+                        "op": ">",
+                        "threshold": 0,
+                        "window": 2,
+                    },
+                },
+                "where": {"regime": "active"},
+            },
+            "conditions are not enumerable for sustained definition",
+        ),
+    ],
+)
+def test_invalid_known_catalog_fails_before_external_induction(
+    monkeypatch,
+    tmp_path,
+    invalid,
+    message,
+):
+    import autogram.calibrate as calibration
+
+    known = _write_known(tmp_path, [
+        invalid,
+        {
+            "name": "other",
+            "op": "==",
+            "lhs": "x",
+            "rhs": "y",
+        },
+    ])
+
+    def should_not_construct_inducer(_cfg):
+        raise AssertionError(
+            "external inducer was constructed before catalog validation"
+        )
+
+    monkeypatch.setattr(
+        calibration,
+        "_make_calibration_inducer",
+        should_not_construct_inducer,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        calibrate(
+            pd.DataFrame({
+                "signal": [1.0, 2.0],
+                "x": [1.0, 2.0],
+                "y": [1.0, 2.0],
+            }),
+            known,
+            CalibrationConfig(
+                max_capability_tiers=1,
+                save_rules=False,
+            ),
+        )
+
+
+def test_runtime_membership_cap_fails_before_external_induction(
+    monkeypatch,
+    tmp_path,
+):
+    import autogram.calibrate as calibration
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "kind": ["a", "b", "c", "d"],
+            "x": np.arange(4, dtype=float),
+            "y": np.arange(4, dtype=float),
+            "a": np.arange(4, dtype=float),
+            "b": np.arange(4, dtype=float),
+        }),
+        condition_columns=("kind",),
+    )
+    known = _write_known(tmp_path, [
+        {
+            "name": "guarded",
+            "op": "==",
+            "lhs": "x",
+            "rhs": "y",
+            "where": {"kind_in": ["a", "b", "c"]},
+        },
+        {
+            "name": "other",
+            "op": "==",
+            "lhs": "a",
+            "rhs": "b",
+        },
+    ])
+    construction_calls = 0
+
+    def counted_constructor(_cfg):
+        nonlocal construction_calls
+        construction_calls += 1
+        return object()
+
+    monkeypatch.setattr(
+        calibration,
+        "_make_calibration_inducer",
+        counted_constructor,
+    )
+
+    with pytest.raises(ValueError, match="value cap"):
+        calibrate(
+            frame,
+            known,
+            CalibrationConfig(
+                max_capability_tiers=1,
+                max_condition_values=2,
+                save_rules=False,
+            ),
+        )
+
+    assert construction_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("condition_data", "condition_columns", "where", "message"),
+    [
+        (
+            {"kind": [1, 2, 3, 1]},
+            ("kind",),
+            {"kind": True},
+            "not observed",
+        ),
+        (
+            {
+                "flag": [False, True, False, True],
+                "ready": [True, False, True, False],
+            },
+            ("flag", "ready"),
+            {
+                "all": [
+                    {"flag": True},
+                    {"ready": False},
+                ],
+            },
+            "non-binary categorical columns",
+        ),
+    ],
+    ids=("typed-equality", "binary-conjunction"),
+)
+def test_runtime_condition_feasibility_fails_before_inducer_construction(
+    monkeypatch,
+    tmp_path,
+    condition_data,
+    condition_columns,
+    where,
+    message,
+):
+    import autogram.calibrate as calibration
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            **condition_data,
+            "x": np.arange(4, dtype=float),
+            "y": np.arange(4, dtype=float),
+            "a": np.arange(4, dtype=float),
+            "b": np.arange(4, dtype=float),
+        }),
+        condition_columns=condition_columns,
+    )
+    known = _write_known(tmp_path, [
+        {
+            "name": "guarded",
+            "op": "==",
+            "lhs": "x",
+            "rhs": "y",
+            "where": where,
+        },
+        {
+            "name": "other",
+            "op": "==",
+            "lhs": "a",
+            "rhs": "b",
+        },
+    ])
+    construction_calls = 0
+
+    def counted_constructor(_cfg):
+        nonlocal construction_calls
+        construction_calls += 1
+        return object()
+
+    monkeypatch.setattr(
+        calibration,
+        "_make_calibration_inducer",
+        counted_constructor,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        calibrate(
+            frame,
+            known,
+            CalibrationConfig(
+                max_capability_tiers=1,
+                save_rules=False,
+            ),
+        )
+
+    assert construction_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("condition_data", "condition_columns", "where"),
+    [
+        (
+            {
+                "observed_at": pd.date_range(
+                    "2026-08-26",
+                    periods=4,
+                    freq="1h",
+                ),
+            },
+            ("observed_at",),
+            {
+                "observed_at": scalar_to_json(
+                    pd.Timestamp("2026-08-26T01:00:00"),
+                    "known condition",
+                ),
+            },
+        ),
+        (
+            {
+                "first": [1, 2, 3, 1],
+                "second": [1, 3, 2, 1],
+            },
+            ("first", "second"),
+            {
+                "all": [
+                    {"first": 1},
+                    {"second": 1},
+                ],
+            },
+        ),
+    ],
+    ids=("timestamp-equality", "numeric-conjunction"),
+)
+def test_feasible_runtime_conditions_reach_external_induction_once(
+    monkeypatch,
+    tmp_path,
+    condition_data,
+    condition_columns,
+    where,
+):
+    import autogram.calibrate as calibration
+
+    frame = profile_dataframe(
+        pd.DataFrame({
+            **condition_data,
+            "x": np.arange(4, dtype=float),
+            "y": np.arange(4, dtype=float),
+            "a": np.arange(4, dtype=float),
+            "b": np.arange(4, dtype=float),
+        }),
+        condition_columns=condition_columns,
+    )
+    known = _write_known(tmp_path, [
+        {
+            "name": "guarded",
+            "op": "==",
+            "lhs": "x",
+            "rhs": "y",
+            "where": where,
+        },
+        {
+            "name": "other",
+            "op": "==",
+            "lhs": "a",
+            "rhs": "b",
+        },
+    ])
+    construction_calls = 0
+    induction_calls = 0
+
+    class ReachedExternalInduction(RuntimeError):
+        pass
+
+    def counted_constructor(_cfg):
+        nonlocal construction_calls
+        construction_calls += 1
+        return object()
+
+    def counted_induction(*_args, **_kwargs):
+        nonlocal induction_calls
+        induction_calls += 1
+        raise ReachedExternalInduction
+
+    monkeypatch.setattr(
+        calibration,
+        "_make_calibration_inducer",
+        counted_constructor,
+    )
+    monkeypatch.setattr(
+        calibration,
+        "induce_spec",
+        counted_induction,
+    )
+
+    with pytest.raises(ReachedExternalInduction):
+        calibrate(
+            frame,
+            known,
+            CalibrationConfig(
+                max_capability_tiers=1,
+                max_condition_values=2,
+                save_rules=False,
+            ),
+        )
+
+    assert construction_calls == 1
+    assert induction_calls == 1
+
+
 def test_calibrate_runs_real_tuning_nulls_discovery_and_report(
     monkeypatch,
     tmp_path,
@@ -954,15 +1432,24 @@ def test_calibrate_reports_selected_proxy_shapes_and_evidence(monkeypatch, tmp_p
     assert set(ev[0]) >= {"recovery", "accepted", "compact"}      # per-proxy tuning evidence
     assert report["proxies"]["selected_null_equalities"] == 0
     assert "null_equalities_accepted" in report["false_discovery"]
-    assert set(report["provenance"]) == {
+    assert {
         "engine_source_sha256",
         "input_sha256",
         "known_sha256",
         "calibration_config_sha256",
-    }
+        "split_sha256",
+        "split_grammar_specs",
+        "known_split",
+    } <= set(report["provenance"])
     assert all(
-        len(value) == 64
-        for value in report["provenance"].values()
+        len(report["provenance"][key]) == 64
+        for key in (
+            "engine_source_sha256",
+            "input_sha256",
+            "known_sha256",
+            "calibration_config_sha256",
+            "split_sha256",
+        )
     )
     assert report["induction"] == {
         "backend": "subagent",
@@ -971,6 +1458,173 @@ def test_calibrate_reports_selected_proxy_shapes_and_evidence(monkeypatch, tmp_p
     grammar_spec = report["grammar_specs"][0]
     assert len(grammar_spec["normalized_spec_sha256"]) == 64
     assert grammar_spec["normalized_spec"]["ontology"]["binders"]
+
+
+def test_split_provenance_records_unexecuted_grammars_and_membership(
+    monkeypatch,
+    tmp_path,
+):
+    import autogram.calibrate as calibration
+
+    _fake_calibrate_env(
+        monkeypatch,
+        recall_fn=lambda _config: 1.0,
+        null_fn=lambda _config: 0,
+    )
+    known = _write_known(
+        tmp_path,
+        [
+            {
+                "name": f"i{index}",
+                "op": "~=",
+                "lhs": f"x{index}",
+                "rhs": f"y{index}",
+            }
+            for index in range(4)
+        ],
+    )
+    frame = SimpleNamespace(
+        columns=["x0", "y0", "x1", "y1"]
+    )
+
+    def run(second_tier_degree):
+        proposals = iter((
+            _mini_spec(max_degree=1),
+            _mini_spec(max_degree=second_tier_degree),
+        ))
+        monkeypatch.setattr(
+            calibration,
+            "induce_spec",
+            lambda *_args, **_kwargs: next(proposals),
+        )
+        return calibrate(
+            frame,
+            known,
+            CalibrationConfig(
+                max_capability_tiers=2,
+                save_rules=False,
+            ),
+        )
+
+    first = run(1)
+    second = run(2)
+
+    assert len(first["grammar_specs"]) == 1
+    split_specs = first["provenance"]["split_grammar_specs"]
+    assert len(split_specs) == 2
+    from autogram.calibrate import _json_fingerprint
+    assert all(
+        _json_fingerprint(entry["normalized_spec"])
+        == entry["normalized_spec_sha256"]
+        for entry in split_specs
+    )
+    membership = first["provenance"]["known_split"]
+    calibration_indexes = {
+        entry["index"] for entry in membership["calibration"]
+    }
+    validation_indexes = {
+        entry["index"] for entry in membership["validation"]
+    }
+    assert calibration_indexes.isdisjoint(validation_indexes)
+    assert calibration_indexes | validation_indexes == set(range(4))
+    assert (
+        first["grammar_specs"][0]["normalized_spec_sha256"]
+        == second["grammar_specs"][0]["normalized_spec_sha256"]
+    )
+    assert (
+        first["provenance"]["split_sha256"]
+        != second["provenance"]["split_sha256"]
+    )
+
+
+def test_split_provenance_maps_typed_equal_conditions_by_identity():
+    known = [
+        KnownInvariant(
+            "same_name",
+            "==",
+            "x",
+            "y",
+            where={"kind": True},
+        ),
+        KnownInvariant(
+            "same_name",
+            "==",
+            "x",
+            "y",
+            where={"kind": 1},
+        ),
+    ]
+    assert known[0] == known[1]
+
+    calibration, validation = _split_known(
+        known,
+        0.5,
+        0,
+    )
+    membership = {
+        "calibration": _known_membership(
+            known,
+            calibration,
+        ),
+        "validation": _known_membership(
+            known,
+            validation,
+        ),
+    }
+
+    calibration_indexes = {
+        entry["index"]
+        for entry in membership["calibration"]
+    }
+    validation_indexes = {
+        entry["index"]
+        for entry in membership["validation"]
+    }
+    assert calibration_indexes.isdisjoint(
+        validation_indexes
+    )
+    assert calibration_indexes | validation_indexes == {0, 1}
+    assert sorted(
+        (
+            entry["index"],
+            entry["name"],
+            entry["where"],
+        )
+        for entries in membership.values()
+        for entry in entries
+    ) == [
+        (0, "same_name", {"kind": True}),
+        (1, "same_name", {"kind": 1}),
+    ]
+
+
+def test_split_provenance_serializes_timestamp_conditions_losslessly():
+    timestamp = pd.Timestamp("2026-08-26T03:55:17.072-05:00")
+    known = [
+        KnownInvariant(
+            "timestamp",
+            "==",
+            "x",
+            "y",
+            where={"observed_at": timestamp},
+        ),
+    ]
+
+    membership = _known_membership(known, known)
+
+    assert membership == [{
+        "index": 0,
+        "name": "timestamp",
+        "op": "==",
+        "lhs": "x",
+        "rhs": "y",
+        "where": {
+            "observed_at": scalar_to_json(
+                timestamp,
+                "known condition",
+            ),
+        },
+    }]
 
 
 def test_calibration_hashes_the_post_profile_runtime_spec(
@@ -1478,6 +2132,66 @@ def test_known_split_keeps_alias_relations_on_the_same_side():
         assert calib_sigs.isdisjoint(valid_sigs), seed
 
 
+def test_known_split_keeps_same_label_priority_permutations_together():
+    def priority(name, cases):
+        return KnownInvariant(
+            name,
+            ":=",
+            "label",
+            {
+                "priority": [
+                    {"when": column, "value": value}
+                    for column, value in cases
+                ],
+                "default": "none",
+            },
+        )
+
+    known = [
+        priority(
+            "grouped",
+            (
+                ("is_a", "alert"),
+                ("is_b", "alert"),
+                ("is_c", "warning"),
+            ),
+        ),
+        priority(
+            "grouped_permutation",
+            (
+                ("is_b", "alert"),
+                ("is_a", "alert"),
+                ("is_c", "warning"),
+            ),
+        ),
+        priority(
+            "different_precedence",
+            (
+                ("is_a", "alert"),
+                ("is_c", "warning"),
+                ("is_b", "alert"),
+            ),
+        ),
+        KnownInvariant("other", "==", "x", "y"),
+    ]
+
+    assert _known_signature(known[0]) == _known_signature(known[1])
+    assert _known_signature(known[0]) != _known_signature(known[2])
+    for seed in range(25):
+        calibration, validation = _split_known(
+            known,
+            frac=0.5,
+            seed=seed,
+        )
+        calibration_names = {item.name for item in calibration}
+        validation_names = {item.name for item in validation}
+        assert calibration_names.isdisjoint(validation_names)
+        assert (
+            ("grouped" in calibration_names)
+            == ("grouped_permutation" in calibration_names)
+        ), seed
+
+
 def test_known_split_rejects_a_catalog_of_only_aliases():
     # If every entry canonicalises to one relation there is nothing to hold out, and calibration
     # must fail loudly rather than report a recall figure against a split it did not really make.
@@ -1939,6 +2653,7 @@ def test_known_split_closes_over_fitted_definition_witness():
             A.Ref("alert"),
             A.Conjunction((
                 A.Bound(A.Ref("signal"), "<", None),
+                A.Bound(A.Ref("other"), ">", 0.0),
             )),
         ),
     )
@@ -1949,6 +2664,7 @@ def test_known_split_closes_over_fitted_definition_witness():
             "alert",
             {"and": [
                 {"bound": ["signal", "<", 100.0]},
+                {"bound": ["other", ">", 0.0]},
             ]},
         ),
         KnownInvariant(
@@ -1957,6 +2673,7 @@ def test_known_split_closes_over_fitted_definition_witness():
             "alert",
             {"and": [
                 {"bound": ["signal", "<", 101.9]},
+                {"bound": ["other", ">", 0.0]},
             ]},
         ),
         KnownInvariant("other", "==", "signal", "other"),
@@ -2061,6 +2778,7 @@ def test_known_split_skips_structurally_irrelevant_definition_witness(
             A.Ref("alert"),
             A.Conjunction((
                 A.Bound(A.Ref("other"), "<", None),
+                A.Bound(A.Ref("other"), ">", 0.0),
             )),
         ),
     )
@@ -2071,6 +2789,7 @@ def test_known_split_skips_structurally_irrelevant_definition_witness(
             "alert",
             {"and": [
                 {"bound": ["signal", "<", 10.0]},
+                {"bound": ["signal", ">", 0.0]},
             ]},
         ),
         KnownInvariant(
@@ -2079,6 +2798,7 @@ def test_known_split_skips_structurally_irrelevant_definition_witness(
             "alert",
             {"and": [
                 {"bound": ["signal", "<", 11.0]},
+                {"bound": ["signal", ">", 0.0]},
             ]},
         ),
         KnownInvariant("other", ">=", "signal", 0),
@@ -2135,6 +2855,7 @@ def test_known_split_reuses_fitted_witnesses_across_equivalent_tiers(
             A.Ref("alert"),
             A.Conjunction((
                 A.Bound(A.Ref("signal"), "<", None),
+                A.Bound(A.Ref("signal"), ">", 0.0),
             )),
         ),
     )
@@ -2145,6 +2866,7 @@ def test_known_split_reuses_fitted_witnesses_across_equivalent_tiers(
             "alert",
             {"and": [
                 {"bound": ["signal", "<", 100.0]},
+                {"bound": ["signal", ">", 0.0]},
             ]},
         ),
         KnownInvariant(
@@ -2153,6 +2875,7 @@ def test_known_split_reuses_fitted_witnesses_across_equivalent_tiers(
             "alert",
             {"and": [
                 {"bound": ["signal", "<", 101.9]},
+                {"bound": ["signal", ">", 0.0]},
             ]},
         ),
         KnownInvariant("other", ">=", "signal", 0),
@@ -2235,7 +2958,13 @@ def test_known_split_cache_keys_colliding_conditions_structurally(
             ),
         ),
     )
-    assert empty.unparse() == linking.unparse()
+    assert empty.unparse().endswith(
+        ' where ALL(a == 1, "b == 2, c" == 3)'
+    )
+    assert linking.unparse().endswith(
+        ' where ALL("a == 1, b" == 2, c == 3)'
+    )
+    assert empty.unparse() != linking.unparse()
     assert empty.signature() != linking.signature()
 
     known = [

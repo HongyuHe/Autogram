@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -109,6 +110,69 @@ def test_discover_payload_includes_canonical_rule_payloads():
     assert enriched["provenance"]["engine_source_sha256"] == "abc"
     assert "normalized_spec" in enriched and "normalized_spec_sha256" in enriched
     assert "effective_settings" in enriched
+
+
+def test_discover_payload_serializes_temporal_rule_scalars():
+    from autogram.dsl import ast as A
+    from autogram.dsl.parser import rule_from_dict
+
+    rules = (
+        A.Rule(
+            "record",
+            A.Compare(A.Ref("x"), "==", A.Ref("y")),
+            condition=A.Condition(
+                "when",
+                "==",
+                (pd.Timestamp("2026-01-01", tz="UTC"),),
+            ),
+        ),
+        A.Rule(
+            "record",
+            A.CategoryDefinition(
+                "target",
+                (("flag", np.timedelta64(1, "h")),),
+                np.datetime64("NaT", "ns"),
+            ),
+        ),
+    )
+
+    def evaluation(rule):
+        return SimpleNamespace(
+            rule=rule,
+            strictness="exact",
+            hold_rate=1.0,
+            hold_rate_lo=1.0,
+            hold_rate_hi=1.0,
+            eps=0.0,
+            mdl_gain=0.0,
+            support=1.0,
+            n_bindings=1,
+            parameters={},
+        )
+
+    result = SimpleNamespace(
+        dataset=SimpleNamespace(name="d", name_model=None),
+        rounds_run=1,
+        progress_history=[1.0],
+        diagnostics=[],
+        portfolio=[evaluation(rule) for rule in rules],
+    )
+
+    payload = json.loads(json.dumps(
+        _portfolio_payload(result),
+        allow_nan=False,
+    ))
+    restored = [
+        rule_from_dict(entry["rule_payload"])
+        for entry in payload["portfolio"]
+    ]
+
+    assert restored[0] == rules[0]
+    assert restored[1].signature() == rules[1].signature()
+    assert all(
+        "__autogram_temporal__" in entry["rule"]
+        for entry in payload["portfolio"]
+    )
 
 
 def test_parser_wires_subcommands():
@@ -256,6 +320,145 @@ def test_checked_in_gtib_raw_config_covers_conditional_search():
     assert configured.max_rules == 30_000
 
 
+@pytest.mark.parametrize(
+    ("key", "scalar"),
+    [
+        ("group_keys", "tenant"),
+        ("condition_columns", "label"),
+        ("windows", "10"),
+        ("run_lengths", "3"),
+        ("agg_kinds", "SUM"),
+    ],
+)
+def test_yaml_profile_repeatable_fields_reject_scalars(
+    tmp_path,
+    key,
+    scalar,
+):
+    config = tmp_path / "profile.yaml"
+    config.write_text(
+        f"profile:\n  {key}: {scalar}\n",
+        encoding="utf-8",
+    )
+    argv = ["discover", "--config", str(config)]
+    args = build_parser().parse_args(argv)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"profile\.{key}.*YAML list",
+    ):
+        _apply_config_file(args, argv)
+
+
+def test_yaml_profile_repeatable_fields_accept_singleton_lists(tmp_path):
+    config = tmp_path / "profile.yaml"
+    config.write_text(
+        """
+profile:
+  group_keys: [tenant]
+  condition_columns: [label]
+  windows: [10]
+  run_lengths: [3]
+  agg_kinds: [SUM]
+""".lstrip(),
+        encoding="utf-8",
+    )
+    argv = ["discover", "--config", str(config)]
+    args = _apply_config_file(
+        build_parser().parse_args(argv),
+        argv,
+    )
+
+    assert args.group_keys == ["tenant"]
+    assert args.condition_columns == ["label"]
+    assert args.windows == [10]
+    assert args.run_lengths == [3]
+    assert args.agg_kinds == ["SUM"]
+
+    configured = _configure_dataframe_profile(
+        pd.DataFrame({
+            "tenant": ["a"],
+            "label": ["x"],
+            "value": [1.0],
+        }),
+        args,
+    )
+    profile = configured.attrs[AUTOGRAM_PROFILE_ATTR]
+    assert profile["group_keys"] == ["tenant"]
+    assert profile["condition_columns"] == ["label"]
+    assert profile["temporal_windows"] == [10]
+    assert profile["run_lengths"] == [3]
+    assert profile["agg_kinds"] == ["SUM"]
+
+
+@pytest.mark.parametrize(
+    ("key", "values", "bad_index", "message"),
+    [
+        ("group_keys", ["tenant", ""], 1, "nonempty string"),
+        ("group_keys", ["tenant", 7], 1, "nonempty string"),
+        ("condition_columns", [False], 0, "nonempty string"),
+        ("windows", [10, 10.9], 1, "positive integer"),
+        ("windows", [True], 0, "positive integer"),
+        ("windows", [0], 0, "positive integer"),
+        ("run_lengths", [3, -1], 1, "positive integer"),
+        ("run_lengths", [False], 0, "positive integer"),
+        ("agg_kinds", ["SUM", "MEDIAN"], 1, "must be one of"),
+        ("agg_kinds", [1], 0, "nonempty string"),
+    ],
+)
+def test_yaml_profile_repeatable_fields_reject_invalid_elements(
+    tmp_path,
+    key,
+    values,
+    bad_index,
+    message,
+):
+    config = tmp_path / "profile.yaml"
+    config.write_text(
+        f"profile:\n  {key}: {json.dumps(values)}\n",
+        encoding="utf-8",
+    )
+    argv = ["discover", "--config", str(config)]
+
+    with pytest.raises(
+        ValueError,
+        match=rf"profile\.{key}\[{bad_index}\].*{message}",
+    ):
+        _apply_config_file(build_parser().parse_args(argv), argv)
+
+
+def test_yaml_integer_repeatables_match_argparse_normalization(tmp_path):
+    config = tmp_path / "profile.yaml"
+    config.write_text(
+        """
+profile:
+  windows: ["10"]
+  run_lengths: ["3"]
+""".lstrip(),
+        encoding="utf-8",
+    )
+    argv = ["discover", "--config", str(config)]
+
+    args = _apply_config_file(build_parser().parse_args(argv), argv)
+
+    assert args.windows == [10]
+    assert args.run_lengths == [3]
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--group-key", ""),
+        ("--condition-column", ""),
+        ("--window", "0"),
+        ("--run-length", "-1"),
+    ],
+)
+def test_repeatable_profile_flags_reject_invalid_elements(flag, value):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["discover", flag, value])
+
+
 def test_cli_aggregation_override_reaches_dataframe_profile():
     args = build_parser().parse_args([
         "discover",
@@ -270,6 +473,52 @@ def test_cli_aggregation_override_reaches_dataframe_profile():
     )
 
     assert frame.attrs["autogram_profile"]["agg_kinds"] == ["MAX"]
+
+
+@pytest.mark.parametrize(
+    ("flag", "name"),
+    [
+        ("--time-index", "missing_time"),
+        ("--group-key", "missing_group"),
+        ("--condition-column", "missing_condition"),
+    ],
+)
+def test_explicit_profile_columns_must_exist(flag, name):
+    args = build_parser().parse_args([
+        "discover",
+        "--input",
+        "series.csv",
+        flag,
+        name,
+    ])
+
+    with pytest.raises(ValueError, match=flag):
+        _configure_dataframe_profile(
+            pd.DataFrame({"value": [1.0, 2.0]}),
+            args,
+        )
+
+
+def test_inherited_missing_profile_columns_remain_nonfatal():
+    frame = pd.DataFrame({"value": [1.0, 2.0]})
+    frame.attrs[AUTOGRAM_PROFILE_ATTR] = {
+        "time_index": "old_time",
+        "group_keys": ["old_group"],
+        "condition_columns": ["old_condition"],
+    }
+    args = build_parser().parse_args([
+        "discover",
+        "--input",
+        "series.csv",
+        "--aggregation",
+        "SUM",
+    ])
+
+    configured = _configure_dataframe_profile(frame, args)
+
+    assert configured.attrs[AUTOGRAM_PROFILE_ATTR]["time_index"] == ""
+    assert configured.attrs[AUTOGRAM_PROFILE_ATTR]["group_keys"] == []
+    assert configured.attrs[AUTOGRAM_PROFILE_ATTR]["condition_columns"] == []
 
 
 def test_unrelated_profile_override_preserves_conjunction_arity():

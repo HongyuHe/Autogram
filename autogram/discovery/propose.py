@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence
 
 from ..dsl import ast as A
 from ..dsl.evaluate import (
     typed_binary_domain,
+    typed_condition_key,
     typed_group_key,
     typed_sort_key,
     typed_unique,
@@ -29,15 +32,417 @@ class SearchSpaceTruncatedError(RuntimeError):
 # columns are categorical/Boolean with small domains; a candidate space beyond this is a declaration
 # error (a continuous column mislabelled as a condition), so fail loud rather than exhaust memory.
 _MAX_CONDITION_CANDIDATES = 1_000_000
+_MAX_CATEGORY_CANDIDATES = 1_000_000
 
 
-def _term_key(t: A.Term) -> str:
-    return t.unparse()
+@dataclass(frozen=True)
+class ExecutableConditionGrammar:
+    """Condition forms the bounded proposer can attach exhaustively."""
+
+    simple_ops: tuple[str, ...] = ("==", "in")
+    conjunction_arities: tuple[int, ...] = (2,)
+    conjunction_child_ops: tuple[str, ...] = ("==",)
+    conjunction_allows_binary_domains: bool = False
+    # Definition and broad algebraic families stay unconditioned to preserve the bounded null
+    # surface; known catalogs use this same allow-list and fail before induction for every omission.
+    conditioned_relation_kinds: frozenset[str] = frozenset({
+        "healthy_band",
+        "pair",
+        "proportional",
+        "delta_bound",
+        "delta_zero",
+    })
+
+
+EXECUTABLE_CONDITION_GRAMMAR = ExecutableConditionGrammar()
+
+
+def condition_family_is_enumerable(kind: str | None) -> bool:
+    """Whether the proposer attaches conditions to this relation family."""
+    return kind in EXECUTABLE_CONDITION_GRAMMAR.conditioned_relation_kinds
+
+
+def condition_conjunction_arity_error() -> str:
+    arities = EXECUTABLE_CONDITION_GRAMMAR.conjunction_arities
+    if len(arities) == 1:
+        return (
+            "condition conjunction must contain exactly "
+            f"{arities[0]} child conditions"
+        )
+    return (
+        "condition conjunction arity must be one of "
+        f"{arities!r}"
+    )
+
+
+def canonical_executable_condition(
+    condition: A.Condition,
+    *,
+    condition_columns: Mapping[object, Sequence[object]] | None = None,
+    max_condition_values: int | None = None,
+    _inside_conjunction: bool = False,
+) -> A.Condition:
+    """Validate and canonicalize one condition in the executable grammar."""
+    policy = EXECUTABLE_CONDITION_GRAMMAR
+    if not isinstance(condition, A.Condition):
+        raise ValueError("condition conjunction must contain condition children")
+    if condition.op == "all":
+        if _inside_conjunction:
+            raise ValueError("condition conjunctions may not nest")
+        if len(condition.values) not in policy.conjunction_arities:
+            raise ValueError(condition_conjunction_arity_error())
+        children = tuple(
+            canonical_executable_condition(
+                child,
+                condition_columns=condition_columns,
+                max_condition_values=max_condition_values,
+                _inside_conjunction=True,
+            )
+            for child in condition.values
+        )
+        if any(
+            child.op not in policy.conjunction_child_ops
+            for child in children
+        ):
+            raise ValueError(
+                "condition conjunction children must use equality conditions"
+            )
+        columns = tuple(
+            typed_group_key(child.column)
+            for child in children
+        )
+        if len(columns) != len(set(columns)):
+            raise ValueError(
+                "condition conjunction must use distinct columns"
+            )
+        return A.Condition(
+            "",
+            "all",
+            tuple(sorted(
+                children,
+                key=lambda child: repr(typed_condition_key(child)),
+            )),
+        )
+    if condition.op not in policy.simple_ops:
+        raise ValueError(
+            f"condition operator {condition.op!r} is not executable"
+        )
+    if (
+        _inside_conjunction
+        and condition.op not in policy.conjunction_child_ops
+    ):
+        raise ValueError(
+            "condition conjunction children must use equality conditions"
+        )
+    if condition.op == "==" and len(condition.values) != 1:
+        raise ValueError(
+            "equality condition requires exactly one value"
+        )
+    values = typed_unique(condition.values)
+    if not values:
+        raise ValueError("condition must contain at least one value")
+    op = condition.op
+    if op == "in":
+        if len(values) == 1:
+            op = "=="
+        elif (
+            max_condition_values is not None
+            and len(values) > max(1, int(max_condition_values))
+        ):
+            raise ValueError("condition exceeds the value cap")
+    if op == "in":
+        values = tuple(sorted(
+            values,
+            key=lambda value: typed_sort_key(
+                typed_group_key(value)
+            ),
+        ))
+    if condition_columns is not None:
+        if condition.column not in condition_columns:
+            raise ValueError(
+                f"condition column {condition.column!r} is not enabled"
+            )
+        if (
+            _inside_conjunction
+            and not policy.conjunction_allows_binary_domains
+            and typed_binary_domain(condition_columns[condition.column])
+        ):
+            raise ValueError(
+                "condition conjunction children require non-binary "
+                "categorical columns"
+            )
+        allowed_values = {
+            typed_group_key(value)
+            for value in typed_unique(
+                condition_columns[condition.column]
+            )
+        }
+        condition_values = {
+            typed_group_key(value)
+            for value in values
+        }
+        if not condition_values <= allowed_values:
+            raise ValueError(
+                "condition value is not observed for the declared column"
+            )
+        if op == "in" and len(condition_values) >= len(allowed_values):
+            raise ValueError(
+                "membership condition requires a proper multi-value subset"
+            )
+    elif (
+        _inside_conjunction
+        and not policy.conjunction_allows_binary_domains
+        and typed_binary_domain(values)
+    ):
+        raise ValueError(
+            "condition conjunction children require non-binary "
+            "categorical columns"
+        )
+    return A.Condition(condition.column, op, tuple(values))
+
+
+def enumerate_executable_conditions(
+    condition_columns: Mapping[object, Sequence[object]],
+    max_condition_values: int,
+) -> List[A.Condition]:
+    """Enumerate exactly the declarative executable condition grammar."""
+    policy = EXECUTABLE_CONDITION_GRAMMAR
+    cap = max(1, int(max_condition_values))
+    ranked = sorted(
+        (
+            (column, typed_unique(values))
+            for column, values in condition_columns.items()
+        ),
+        key=lambda item: typed_sort_key(typed_group_key(item[0])),
+    )
+
+    simple_counts: list[int] = []
+    equality_counts: list[int] = []
+    for _column, values in ranked:
+        value_count = len(values)
+        if value_count <= 1:
+            simple_counts.append(0)
+            equality_counts.append(0)
+            continue
+        subset_count = sum(
+            math.comb(value_count, subset_size)
+            for subset_size in range(
+                2,
+                min(cap, value_count - 1) + 1,
+            )
+        )
+        simple_counts.append(value_count + subset_count)
+        equality_counts.append(
+            value_count
+            if (
+                policy.conjunction_allows_binary_domains
+                or not typed_binary_domain(values)
+            )
+            else 0
+        )
+
+    total = sum(simple_counts)
+    max_arity = max(policy.conjunction_arities, default=0)
+    elementary = [0] * (max_arity + 1)
+    elementary[0] = 1
+    for count in equality_counts:
+        for arity in range(max_arity, 0, -1):
+            elementary[arity] += elementary[arity - 1] * count
+    total += sum(
+        elementary[arity]
+        for arity in policy.conjunction_arities
+    )
+    if total > _MAX_CONDITION_CANDIDATES:
+        raise SearchSpaceTruncatedError(
+            f"condition grammar would enumerate {total} candidates, "
+            f"exceeding the trusted ceiling {_MAX_CONDITION_CANDIDATES}; "
+            "tighten the declared condition domains or value cap"
+        )
+
+    out: List[A.Condition] = []
+    equalities_by_column: list[tuple[object, tuple[A.Condition, ...]]] = []
+    for column, values in ranked:
+        if len(values) <= 1:
+            continue
+        equalities = tuple(
+            canonical_executable_condition(
+                A.Condition(column, "==", (value,)),
+                max_condition_values=cap,
+            )
+            for value in values
+        )
+        out.extend(equalities)
+        if (
+            policy.conjunction_allows_binary_domains
+            or not typed_binary_domain(values)
+        ):
+            equalities_by_column.append((column, equalities))
+        for subset_size in range(
+            2,
+            min(cap, len(values) - 1) + 1,
+        ):
+            for subset in itertools.combinations(
+                values,
+                subset_size,
+            ):
+                out.append(canonical_executable_condition(
+                    A.Condition(column, "in", subset),
+                    max_condition_values=cap,
+                ))
+
+    for arity in policy.conjunction_arities:
+        for selected in itertools.combinations(
+            equalities_by_column,
+            arity,
+        ):
+            canonical_executable_condition(
+                A.Condition(
+                    "",
+                    "all",
+                    tuple(
+                        conditions[0]
+                        for _column, conditions in selected
+                    ),
+                ),
+                condition_columns=condition_columns,
+                max_condition_values=cap,
+            )
+            for children in itertools.product(*(
+                conditions
+                for _column, conditions in selected
+            )):
+                out.append(A.Condition(
+                    "",
+                    "all",
+                    tuple(children),
+                ))
+    return out
+
+
+def _onto_assignment_count(item_count: int, block_count: int) -> int:
+    """Number of assignments onto ``block_count`` ordered non-empty blocks."""
+    if block_count <= 0 or item_count < block_count:
+        return 0
+    return sum(
+        (-1) ** (block_count - used)
+        * math.comb(block_count, used)
+        * used ** item_count
+        for used in range(block_count + 1)
+    )
+
+
+def _label_block_assignment_count(
+    label_count: int,
+    block_count: int,
+) -> int:
+    """Adjacent-distinct block labels that use every available output label."""
+    if label_count <= 0 or block_count < label_count:
+        return 0
+    return sum(
+        (-1) ** (label_count - used)
+        * math.comb(label_count, used)
+        * (
+            0
+            if used == 0
+            else used * (used - 1) ** (block_count - 1)
+        )
+        for used in range(label_count + 1)
+    )
+
+
+def _category_semantic_candidate_count(
+    column_count: int,
+    label_count: int,
+    max_arity: int,
+) -> int:
+    """Count canonical priority maps for one target/default pair."""
+    return sum(
+        math.comb(column_count, arity)
+        * _onto_assignment_count(arity, block_count)
+        * _label_block_assignment_count(label_count, block_count)
+        for arity in range(label_count, max_arity + 1)
+        for block_count in range(label_count, arity + 1)
+    )
+
+
+def _label_block_assignments(labels: Sequence[object], block_count: int):
+    """Yield adjacent-distinct block-label sequences that cover ``labels``."""
+    label_count = len(labels)
+    required = (1 << label_count) - 1
+
+    def visit(prefix: tuple[int, ...], used: int):
+        remaining = block_count - len(prefix)
+        if (required & ~used).bit_count() > remaining:
+            return
+        if not remaining:
+            if used == required:
+                yield tuple(labels[index] for index in prefix)
+            return
+        previous = prefix[-1] if prefix else None
+        for index in range(label_count):
+            if previous is not None and index == previous:
+                continue
+            yield from visit(
+                prefix + (index,),
+                used | (1 << index),
+            )
+
+    yield from visit((), 0)
+
+
+def _ordered_nonempty_blocks(
+    columns: Sequence[str],
+    block_count: int,
+):
+    """Yield each ordered partition once, with columns sorted inside every block."""
+    columns = tuple(columns)
+    if block_count == 1:
+        yield (columns,)
+        return
+    max_first_size = len(columns) - block_count + 1
+    positions = tuple(range(len(columns)))
+    for first_size in range(1, max_first_size + 1):
+        for selected in itertools.combinations(positions, first_size):
+            selected_set = set(selected)
+            first = tuple(columns[index] for index in selected)
+            remaining = tuple(
+                column
+                for index, column in enumerate(columns)
+                if index not in selected_set
+            )
+            for rest in _ordered_nonempty_blocks(
+                remaining,
+                block_count - 1,
+            ):
+                yield (first, *rest)
+
+
+def _term_key(t: A.Term) -> tuple:
+    return A.term_identity(t)
+
+
+def _legacy_term_order_key(t: A.Term) -> tuple:
+    """Legacy presentation order with an exact structural tie-break."""
+    return (t.unparse(), _term_key(t))
 
 
 def _term_sort_key(t: A.Term) -> tuple:
     rank = {A.Ref: 0, A.Agg: 1, A.RelatedAgg: 1, A.Scale: 2, A.Add: 3, A.Const: 4}
-    return (rank.get(type(t), 9), t.unparse())
+    return (rank.get(type(t), 9), _legacy_term_order_key(t))
+
+
+def _rule_semantic_key(rule: A.Rule):
+    if isinstance(rule.atom, A.CategoryDefinition):
+        return (
+            "rule",
+            rule.binder,
+            A.category_definition_semantic_key(
+                rule.atom,
+                typed_group_key,
+            ),
+            typed_condition_key(rule.condition),
+        )
+    return rule.signature()
 
 
 def _is_zero(t: A.Term) -> bool:
@@ -94,7 +499,11 @@ def normalize_rule(rule: A.Rule) -> A.Rule:
     left = normalize_term(rule.atom.left)
     right = normalize_term(rule.atom.right)
     op = rule.atom.op
-    if op in _SYMMETRIC_OPS and _term_key(right) < _term_key(left):
+    if (
+        op in _SYMMETRIC_OPS
+        and _legacy_term_order_key(right)
+        < _legacy_term_order_key(left)
+    ):
         left, right = right, left
     elif op == "<=" and _is_zero(left) and not _is_zero(right):
         left, right, op = right, left, ">="
@@ -264,7 +673,7 @@ class EnumerationProposer:
 
     def _base_terms_for(self, binder: str) -> List[A.Term]:
         cap = self.G.complexity_cap(binder)
-        terms: Dict[str, A.Term] = {}
+        terms: Dict[tuple, A.Term] = {}
         for role in self.G.refs_for(binder):
             t = A.Ref(role)
             if t.complexity() <= cap:
@@ -290,7 +699,7 @@ class EnumerationProposer:
                 "the declared grammar"
             )
         cap = self.G.complexity_cap(binder)
-        terms: Dict[str, A.Term] = {}
+        terms: Dict[tuple, A.Term] = {}
         for t in base_terms:
             for coeff in self.G.scale_coeffs:
                 st = normalize_term(A.Scale(float(coeff), t))
@@ -319,7 +728,7 @@ class EnumerationProposer:
                 f"max_linear_leaves={cap}; raise the ceiling or tighten "
                 "the declared grammar"
             )
-        terms: Dict[str, A.Term] = {}
+        terms: Dict[tuple, A.Term] = {}
         for arity in range(2, max(1, arity_cap) + 1):
             for combo in itertools.combinations(leaves, arity):
                 at = normalize_term(A.Add(tuple(combo)))
@@ -497,20 +906,20 @@ class EnumerationProposer:
             zero = A.Const(0.0)
             base_terms = sorted(
                 self._base_terms_for(binder),
-                key=_term_key,
+                key=_legacy_term_order_key,
             )
             scaled_terms = sorted(
                 self._scaled_terms_for(binder, base_terms),
-                key=_term_key,
+                key=_legacy_term_order_key,
             )
             add_terms = sorted(
                 self._add_terms_for(binder),
-                key=_term_key,
+                key=_legacy_term_order_key,
             )
             nonlinear_terms = (
                 sorted(
                     self._nonlinear_terms_for(binder, base_terms),
-                    key=_term_key,
+                    key=_legacy_term_order_key,
                 )
                 if self.G.degree_cap(binder) >= 2
                 else []
@@ -572,7 +981,7 @@ class EnumerationProposer:
         """Products a*b (a!=b) and ratios a/b, gated by the binder's degree cap (item 6)."""
         deg_cap = self.G.degree_cap(binder)
         comp_cap = self.G.complexity_cap(binder)
-        terms: Dict[str, A.Term] = {}
+        terms: Dict[tuple, A.Term] = {}
         leaves = list(base_terms)
         for i, a in enumerate(leaves):
             for j, b in enumerate(leaves):
@@ -631,7 +1040,7 @@ class EnumerationProposer:
         base_terms: Sequence[A.Term],
     ) -> List[A.Term]:
         comp_cap = self.G.complexity_cap(binder)
-        terms: Dict[str, A.Term] = {}
+        terms: Dict[tuple, A.Term] = {}
         refs = [term for term in base_terms if isinstance(term, A.Ref)]
         lags = range(1, int(self.G.max_lag) + 1)
         for ref in refs:
@@ -720,16 +1129,19 @@ class EnumerationProposer:
                 ok, _ = is_admissible(rule, self.G)
                 if not ok:
                     continue
-                if (
-                    legacy_is_trivial(rule)
-                    if self.G.legacy_compat
-                    else is_trivial(rule)
-                ):
-                    continue
-                sig = rule.signature()
+                sig = _rule_semantic_key(rule)
                 if sig in seen:
                     continue
                 seen.add(sig)
+                if (
+                    not isinstance(rule.atom, A.CategoryDefinition)
+                    and (
+                        legacy_is_trivial(rule)
+                        if self.G.legacy_compat
+                        else is_trivial(rule)
+                    )
+                ):
+                    continue
                 if self.G.max_rules and len(out) >= self.G.max_rules:
                     raise SearchSpaceTruncatedError(
                         "bounded grammar exceeds "
@@ -847,12 +1259,14 @@ class EnumerationProposer:
             return
 
         target_columns = self.G.condition_columns
-        bool_columns = list(self.G.category_cases_for(binder))
+        bool_columns = sorted(set(self.G.category_cases_for(binder)))
         category_columns = [
             column
             for column, values in target_columns.items()
             if values and not typed_binary_domain(values)
         ]
+        category_specs = []
+        semantic_total = 0
         for target_column in category_columns:
             target_values = typed_unique(target_columns[target_column])
             for default in target_values:
@@ -862,125 +1276,132 @@ class EnumerationProposer:
                     for value in target_values
                     if typed_group_key(value) != default_key
                 )
-                if not labels or len(labels) > len(bool_columns):
+                max_arity = min(
+                    len(bool_columns),
+                    int(self.G.max_conjunction_terms),
+                    max(0, self.G.complexity_cap(binder) - 3),
+                )
+                if not labels or len(labels) > max_arity:
                     continue
-                for columns in itertools.permutations(bool_columns, len(labels)):
-                    for emitted in itertools.permutations(labels):
-                        yield A.Rule(
-                            binder,
-                            A.CategoryDefinition(
-                                target_column,
-                                tuple(zip(columns, emitted)),
-                                default,
-                            ),
-                        )
+                semantic_count = _category_semantic_candidate_count(
+                    len(bool_columns),
+                    len(labels),
+                    max_arity,
+                )
+                semantic_total += semantic_count
+                category_specs.append((
+                    target_column,
+                    default,
+                    labels,
+                    max_arity,
+                ))
+        if (
+            self.G.max_rules > 0
+            and semantic_total > self.G.max_rules
+        ):
+            raise SearchSpaceTruncatedError(
+                "categorical grammar would enumerate "
+                f"{semantic_total} semantic candidates, exceeding "
+                f"max_rules={self.G.max_rules}; raise the ceiling or tighten "
+                "the categorical arity/domain bounds"
+            )
+        if semantic_total > _MAX_CATEGORY_CANDIDATES:
+            raise SearchSpaceTruncatedError(
+                "categorical grammar would enumerate "
+                f"{semantic_total} semantic candidates, exceeding the trusted "
+                f"ceiling {_MAX_CATEGORY_CANDIDATES}; tighten the categorical "
+                "arity/domain bounds"
+            )
+        for target_column, default, labels, max_arity in category_specs:
+            label_count = len(labels)
+            assignments_by_block_count = {
+                block_count: tuple(_label_block_assignments(
+                    labels,
+                    block_count,
+                ))
+                for block_count in range(
+                    label_count,
+                    max_arity + 1,
+                )
+            }
+            for arity in range(label_count, max_arity + 1):
+                for columns in itertools.combinations(
+                    bool_columns,
+                    arity,
+                ):
+                    for block_count in range(
+                        label_count,
+                        arity + 1,
+                    ):
+                        assignments = assignments_by_block_count[
+                            block_count
+                        ]
+                        if not assignments:
+                            continue
+                        for blocks in _ordered_nonempty_blocks(
+                            columns,
+                            block_count,
+                        ):
+                            for emitted in assignments:
+                                cases = tuple(
+                                    (column, value)
+                                    for block, value in zip(
+                                        blocks,
+                                        emitted,
+                                    )
+                                    for column in block
+                                )
+                                cases = A.category_definition_canonical_cases(
+                                    cases,
+                                    typed_group_key,
+                                )
+                                yield A.Rule(
+                                    binder,
+                                    A.CategoryDefinition(
+                                        target_column,
+                                        cases,
+                                        default,
+                                    ),
+                                )
 
     def _conditions(self) -> List[A.Condition]:
-        out: List[A.Condition] = []
-        cap = max(1, int(self.G.max_condition_values))
-        ranked = sorted(
-            (
-                (column, typed_unique(values))
-                for column, values in self.G.condition_columns.items()
-            ),
-            key=lambda item: item[0],
+        return enumerate_executable_conditions(
+            self.G.condition_columns,
+            self.G.max_condition_values,
         )
-        # Fail loud *before* materialising a combinatorial blow-up: the subset ("in") enumeration is
-        # sum_{s=2..min(cap, v-1)} C(v, s) per column, which for a wide domain and a high value cap
-        # would eagerly allocate trillions of conditions before any rule ceiling could fire. Count
-        # the candidates first and refuse an unbounded grammar rather than exhaust memory.
-        import math as _math
-
-        categorical_columns = {
-            column
-            for column, values in self.G.condition_columns.items()
-            if values and not typed_binary_domain(values)
-        }
-        total = 0
-        simple_per_column = []
-        for column, raw_values in ranked:
-            v = len(raw_values)
-            if v <= 1:
-                continue
-            total += v
-            if column in categorical_columns:
-                simple_per_column.append(v)
-            for subset_size in range(2, min(cap, v - 1) + 1):
-                total += _math.comb(v, subset_size)
-        # The cross-column conjunctions built below are conditions too, and they are quadratic in
-        # the number of simple categorical equalities. Counting only the per-column subsets let
-        # millions of conditions materialise before the ceiling could fire. Only pairs from
-        # DIFFERENT columns are generated, so same-column pairs must not be counted or the ceiling
-        # would refuse a grammar it could actually enumerate.
-        running = 0
-        for v in simple_per_column:
-            total += running * v
-            running += v
-        ceiling = _MAX_CONDITION_CANDIDATES
-        if total > ceiling:
-            raise SearchSpaceTruncatedError(
-                f"condition grammar would enumerate {total} candidates, exceeding the trusted "
-                f"ceiling {ceiling}; tighten the declared condition domains or value cap"
-            )
-        for column, raw_values in ranked:
-            values = typed_unique(raw_values)
-            if len(values) <= 1:
-                continue
-            for value in values:
-                out.append(A.Condition(column, "==", (value,)))
-            max_subset = min(cap, len(values) - 1)
-            for subset_size in range(2, max_subset + 1):
-                for subset in itertools.combinations(
-                    values,
-                    subset_size,
-                ):
-                    out.append(A.Condition(
-                        column,
-                        "in",
-                        tuple(sorted(
-                            subset,
-                            key=lambda value: typed_sort_key(
-                                typed_group_key(value)
-                            ),
-                        )),
-                    ))
-        simple = [
-            condition for condition in out
-            if condition.op == "==" and condition.values
-            and condition.column in categorical_columns
-        ]
-        for left, right in itertools.combinations(simple, 2):
-            if left.column != right.column:
-                out.append(A.Condition("", "all", (left, right)))
-        return out
 
     def _conditional_candidate(self, rule: A.Rule) -> bool:
         atom = rule.atom
-        # A band definition is conditionable: `x ~band c where regime == A` is a regime-restricted
-        # concentration claim, and it must pass through the same ceiling accounting as the rest.
         if isinstance(atom, A.BandDefinition):
-            return bool(self.G.band_enabled)
+            kind = "healthy_band" if self.G.band_enabled else None
+            return condition_family_is_enumerable(kind)
         if not isinstance(atom, A.Compare):
             return False
-        # Proportional laws are conditionable.
-        if atom.op == "\u007e\u221d":
-            return True
-        # A generic near-equality / equality between two DISTINCT atomic measurements is a
-        # conditionable relation (e.g. a regime-conditioned balance ``x ~= y where regime == A``).
-        # This is not tied to any named invariant -- any measured ref pair qualifies.
+        kind = None
+        if (
+            atom.op == "\u007e\u221d"
+            and isinstance(atom.left, A.Ref)
+            and isinstance(atom.right, A.Ref)
+            and atom.left != atom.right
+        ):
+            kind = "proportional"
         if (
             atom.op in ("~=", "==")
             and isinstance(atom.left, A.Ref)
             and isinstance(atom.right, A.Ref)
             and atom.left != atom.right
         ):
-            return True
-        # A finite-difference term compared to zero under ANY operator: conditional monotonicity /
-        # positivity (``DELTA_k(x) > 0``) and conditional zero-change (``DELTA_k(x) ~= 0``).
-        return (
+            kind = "pair"
+        if (
             (isinstance(atom.left, A.Diff) and _is_zero(atom.right))
             or (isinstance(atom.right, A.Diff) and _is_zero(atom.left))
-        )
+        ):
+            kind = (
+                "delta_zero"
+                if atom.op in ("~=", "==")
+                else "delta_bound"
+            )
+        return condition_family_is_enumerable(kind)
 
 
 # Backward-compatible name for callers that still ask for a random proposer; it now enumerates.

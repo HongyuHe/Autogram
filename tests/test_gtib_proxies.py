@@ -315,6 +315,61 @@ def test_new_proxy_shape_recovers_with_zero_temporal_null(shape, noise):
     assert getattr(recovery, shape) == 1.0
 
 
+def test_categorical_proxy_recovers_transitively_identified_order():
+    suite = prepare_proxy_suite(
+        RegimeSpec(entries=[
+            ProxyEntry(
+                "categorical",
+                noise=0.0,
+                n_entities=3,
+                n_snapshots=120,
+            ),
+        ]),
+        seed=0,
+        inducer=_WideSyntheticInducer(),
+    )
+    proxy = suite.positives[0]
+    rule = _rule("categorical")
+    n = proxy.ds.observed.n_rows
+    phase = np.arange(n) % 6
+    first = np.isin(phase, (0, 3))
+    second = np.isin(phase, (1, 3, 4))
+    third = np.isin(phase, (2, 4))
+    category = np.full(n, "baseline", dtype=object)
+    category[third] = "class_c"
+    category[second] = "class_b"
+    category[first] = "class_a"
+    for name, values in {
+        "flag_a": first,
+        "flag_b": second,
+        "flag_c": third,
+        "category": category,
+    }.items():
+        proxy.ds.row_context[name] = values
+        proxy.ds.observed.row_context[name] = values
+
+    evaluation = DataOnlyEvaluator(
+        proxy.ds,
+        DiscoveryConfig(
+            tolerance=0.05,
+            hold_rate_threshold=0.75,
+            band_mode="global",
+        ),
+    ).evaluate(rule)
+    recovery = score_recovery(
+        type(
+            "Result",
+            (),
+            {"portfolio": [evaluation], "dataset": proxy.ds},
+        )(),
+        proxy.planted,
+    )
+
+    assert not np.any(first & third)
+    assert evaluation.accepted
+    assert recovery.categorical == 1.0
+
+
 def test_time_shuffled_proxy_accepts_no_temporal_rules():
     suite = prepare_proxy_suite(
         RegimeSpec(entries=[

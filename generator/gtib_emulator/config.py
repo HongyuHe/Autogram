@@ -371,6 +371,16 @@ def _validate(cfg: EmulatorConfig) -> None:
         ):
             raise ValueError(f"{name} must be a positive integer number of seconds")
 
+    alert_duration = cfg.alerting.alert_duration_minutes
+    if (
+        isinstance(alert_duration, bool)
+        or not isinstance(alert_duration, Integral)
+        or alert_duration <= 0
+    ):
+        raise ValueError(
+            "alerting.alert_duration_minutes must be a positive integer"
+        )
+
     raw_seconds = cfg.time.raw_scrape_seconds
     rate_seconds = cfg.time.rate_window_seconds
     smoothing_seconds = cfg.time.smoothing_window_seconds

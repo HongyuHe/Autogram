@@ -18,6 +18,62 @@ from .discovery.subagent import HARNESSES, configured_harness
 from .discovery.validate import run_all
 
 
+_AGG_KINDS = ("SUM", "MIN", "MAX", "AVG")
+
+
+def _nonempty_string(value):
+    if not isinstance(value, str) or not value:
+        raise argparse.ArgumentTypeError("must be a nonempty string")
+    return value
+
+
+def _positive_int(value):
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if normalized <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return normalized
+
+
+_REPEATABLE_PROFILE_FIELDS = {
+    "group_keys": (_nonempty_string, None),
+    "condition_columns": (_nonempty_string, None),
+    "windows": (_positive_int, None),
+    "run_lengths": (_positive_int, None),
+    "agg_kinds": (_nonempty_string, _AGG_KINDS),
+}
+
+
+def _normalize_repeatable_profile_fields(profile: dict) -> None:
+    for key, (element_type, choices) in _REPEATABLE_PROFILE_FIELDS.items():
+        if key not in profile:
+            continue
+        values = profile[key]
+        if not isinstance(values, list):
+            raise ValueError(
+                f"config profile.{key} must be a YAML list, "
+                f"not {type(values).__name__}"
+            )
+        normalized = []
+        for index, value in enumerate(values):
+            location = f"config profile.{key}[{index}]"
+            try:
+                item = element_type(value)
+            except argparse.ArgumentTypeError as error:
+                raise ValueError(f"{location} {error}") from error
+            if choices is not None and item not in choices:
+                expected = ", ".join(repr(choice) for choice in choices)
+                raise ValueError(
+                    f"{location} must be one of {expected}, got {value!r}"
+                )
+            normalized.append(item)
+        profile[key] = normalized
+
+
 def _git_short() -> str:
     try:
         import subprocess
@@ -106,6 +162,29 @@ def _configure_dataframe_profile(df, args):
     from .loader.gtib import AUTOGRAM_PROFILE_ATTR, profile_dataframe
 
     profile = dict(df.attrs.get(AUTOGRAM_PROFILE_ATTR, {}))
+    explicit_columns = (
+        ("--time-index", getattr(args, "time_index", "")),
+        ("--group-key", getattr(args, "group_keys", [])),
+        (
+            "--condition-column",
+            getattr(args, "condition_columns", []),
+        ),
+    )
+    for flag, requested in explicit_columns:
+        if isinstance(requested, str):
+            requested = (requested,) if requested else ()
+        else:
+            requested = tuple(requested or ())
+        missing = [
+            str(column)
+            for column in requested
+            if str(column) not in df.columns
+        ]
+        if missing:
+            raise ValueError(
+                f"{flag} references nonexistent input "
+                f"column(s): {missing!r}"
+            )
     explicit = any((
         getattr(args, "time_index", ""),
         getattr(args, "group_keys", []),
@@ -196,6 +275,7 @@ def _apply_config_file(args: argparse.Namespace, argv=None) -> argparse.Namespac
     assign("harness", schema.get("harness"), "--harness")
 
     profile = config.get("profile", {}) or {}
+    _normalize_repeatable_profile_fields(profile)
     assign("time_index", profile.get("time_index"), "--time-index")
     assign("group_keys", profile.get("group_keys"), "--group-key")
     assign("condition_columns", profile.get("condition_columns"), "--condition-column")
@@ -423,19 +503,21 @@ def build_parser() -> argparse.ArgumentParser:
     def add_profile_args(parser):
         parser.add_argument("--time-index", dest="time_index", default="",
                             help="ordered timestamp column for temporal terms")
-        parser.add_argument("--group-key", dest="group_keys", action="append", default=[],
+        parser.add_argument("--group-key", dest="group_keys", action="append",
+                            type=_nonempty_string, default=[],
                             help="row grouping column; repeat for composite groups")
         parser.add_argument("--condition-column", dest="condition_columns",
-                            action="append", default=[],
+                            action="append", type=_nonempty_string, default=[],
                             help="categorical or Boolean condition column; repeat as needed")
-        parser.add_argument("--window", dest="windows", action="append", type=int, default=[],
+        parser.add_argument("--window", dest="windows", action="append",
+                            type=_positive_int, default=[],
                             help="allowed rolling window in rows; repeat as needed")
         parser.add_argument("--cadence-seconds", dest="cadence_seconds", type=float, default=None,
                             help="expected seconds between consecutive temporal observations")
         parser.add_argument("--max-lag", dest="max_lag", type=int, default=None,
                             help="maximum temporal lag in rows")
         parser.add_argument("--run-length", dest="run_lengths", action="append",
-                            type=int, default=[],
+                            type=_positive_int, default=[],
                             help="allowed sustained-predicate window; repeat as needed")
         parser.add_argument("--max-conjunction-terms", dest="max_conjunction_terms",
                             type=int, default=None)
@@ -445,8 +527,8 @@ def build_parser() -> argparse.ArgumentParser:
                             help="minimum nonlinear polynomial degree for profiled data")
         parser.add_argument("--proportional", action="store_true",
                             help="enable robust proportional equality")
-        parser.add_argument("--aggregation", dest="agg_kinds", action="append", default=[],
-                            choices=["SUM", "MIN", "MAX", "AVG"],
+        parser.add_argument("--aggregation", dest="agg_kinds", action="append",
+                            type=_nonempty_string, default=[], choices=_AGG_KINDS,
                             help="allowed family aggregation; repeat as needed")
         parser.add_argument("--config", default="",
                             help="optional YAML dataset/profile configuration")

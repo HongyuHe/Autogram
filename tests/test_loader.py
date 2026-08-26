@@ -19,7 +19,7 @@ from autogram.schema.spec import (
 )
 
 
-def _matrix_adapter(*, time_index=""):
+def _matrix_adapter(*, time_index="", condition_columns=None):
     return compile_spec(GrammarSpec(
         name="matrix_identity",
         patterns=(
@@ -43,6 +43,7 @@ def _matrix_adapter(*, time_index=""):
         noisy_kind="measurement",
         time_index=time_index,
         group_keys=("group_id",),
+        condition_columns=dict(condition_columns or {}),
     ))
 
 
@@ -180,6 +181,45 @@ def test_matrix_loader_preserves_declared_time_column_when_not_overridden():
         2**53 + 1,
     ]
     assert dataset.observed.names == ["metric"]
+
+
+def test_matrix_loader_preserves_temporal_condition_context():
+    event_at = np.array(
+        [
+            "2026-01-01T00:00:00.000",
+            "2026-01-02T00:00:00.000",
+        ],
+        dtype="datetime64[ms]",
+    )
+    elapsed = np.array([1, 2], dtype="timedelta64[h]")
+    frame = pd.DataFrame({
+        "event_time": event_at,
+        "elapsed": elapsed,
+        "metric": [1.0, 2.0],
+    })
+    adapter = _matrix_adapter(condition_columns={
+        "event_time": (event_at[0], event_at[1]),
+        "elapsed": (elapsed[0], elapsed[1]),
+    })
+
+    dataset = build_dataset(
+        tuple(frame.columns),
+        frame,
+        adapter,
+        "temporal_context",
+    )
+
+    assert dataset.observed.names == ["metric"]
+    assert dataset.row_context["event_time"].dtype.kind == "M"
+    assert dataset.row_context["elapsed"].dtype.kind == "m"
+    np.testing.assert_array_equal(
+        dataset.row_context["event_time"],
+        event_at,
+    )
+    np.testing.assert_array_equal(
+        dataset.row_context["elapsed"],
+        elapsed,
+    )
 
 
 def test_matrix_loader_keeps_row_sequence_boolean_context_ref():

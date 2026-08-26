@@ -113,18 +113,14 @@ def _same_fitted_semantics(a: Evaluation, b: Evaluation) -> bool:
         and isinstance(b.rule.atom, A.CategoryDefinition)
     ):
         atom_equal = (
-            a.rule.atom.target_column
-            == b.rule.atom.target_column
-            and tuple(
-                (column, typed_group_key(value))
-                for column, value in a.rule.atom.cases
+            A.category_definition_semantic_key(
+                a.rule.atom,
+                typed_group_key,
             )
-            == tuple(
-                (column, typed_group_key(value))
-                for column, value in b.rule.atom.cases
+            == A.category_definition_semantic_key(
+                b.rule.atom,
+                typed_group_key,
             )
-            and typed_group_key(a.rule.atom.default)
-            == typed_group_key(b.rule.atom.default)
         )
     return (
         atom_equal

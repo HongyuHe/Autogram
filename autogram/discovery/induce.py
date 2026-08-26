@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
+from ..dsl.scalar_codec import scalar_from_json, scalar_to_json
 from ..loader.names import NameModel
 from ..schema.adapter import SchemaAdapter
 from ..schema.compiler import compile_spec
@@ -364,8 +365,6 @@ def _load_json_object(payload: str | dict) -> dict:
 
 
 def _spec_to_json(spec: GrammarSpec) -> dict:
-    from ..dsl.evaluate import canonical_typed_value
-
     return {
         "name": spec.name,
         "patterns": [p.__dict__ for p in spec.patterns],
@@ -391,7 +390,13 @@ def _spec_to_json(spec: GrammarSpec) -> dict:
         "time_index": spec.time_index,
         "group_keys": list(spec.group_keys),
         "condition_columns": {
-            key: [canonical_typed_value(value) for value in values]
+            key: [
+                scalar_to_json(
+                    value,
+                    f"condition value for {key!r}",
+                )
+                for value in values
+            ]
             for key, values in spec.condition_columns.items()
         },
         "temporal_enabled": spec.temporal_enabled,
@@ -404,7 +409,10 @@ def _spec_to_json(spec: GrammarSpec) -> dict:
             {
                 **template.__dict__,
                 "filter_values": [
-                    canonical_typed_value(value)
+                    scalar_to_json(
+                        value,
+                        f"span filter value for {template.role!r}",
+                    )
                     for value in template.filter_values
                 ],
             }
@@ -1592,7 +1600,10 @@ def _spec_from_json(payload) -> GrammarSpec:
                 span_start=str(template.get("span_start", "")),
                 span_end=str(template.get("span_end", "")),
                 filter_column=str(template.get("filter_column", "")),
-                filter_values=tuple(template.get("filter_values", ())),
+                filter_values=_scalar_values_from_json(
+                    template.get("filter_values", ()),
+                    f"span filter value for {template.get('role')!r}",
+                ),
             )
             for template in (payload.get("related_templates", ()) or ())
         ),
@@ -1782,10 +1793,31 @@ def _role_map(value, field_name: str) -> dict[str, tuple[str, ...]]:
     return out
 
 
+def _scalar_values_from_json(
+    values,
+    label: str,
+) -> tuple[object, ...]:
+    raw_values = (
+        values
+        if isinstance(values, (list, tuple))
+        else (values,)
+    )
+    return tuple(
+        scalar_from_json(item, label)
+        for item in raw_values
+    )
+
+
 def _condition_columns(value) -> dict[str, tuple[object, ...]]:
+    def values_for(column, values) -> tuple[object, ...]:
+        return _scalar_values_from_json(
+            values,
+            f"condition value for {column!r}",
+        )
+
     if isinstance(value, dict):
         return {
-            str(column): tuple(values if isinstance(values, (list, tuple)) else (values,))
+            str(column): values_for(column, values)
             for column, values in value.items()
         }
     out: dict[str, tuple[object, ...]] = {}
@@ -1796,9 +1828,7 @@ def _condition_columns(value) -> dict[str, tuple[object, ...]]:
             column = item.get("column") or item.get("name")
             if column:
                 values = item.get("values", ())
-                out[str(column)] = tuple(
-                    values if isinstance(values, (list, tuple)) else (values,)
-                )
+                out[str(column)] = values_for(column, values)
     return out
 
 

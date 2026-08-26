@@ -3,8 +3,10 @@
 Because the AST is plain data, the canonical serialization is a JSON-friendly dict
 (``rule_to_dict`` / ``rule_from_dict``); this is what makes a learned rule auditable
 and storable.  :meth:`~autogram.dsl.ast.Rule.unparse` provides the human-readable ASCII
-surface rendering described in the grammar (Sec. 6.6); the dict form is the machine
-contract used by the proposer backends and the archive.
+surface rendering described in the grammar (Sec. 6.6), with exact float spellings and
+precedence grouping so it can also be parsed losslessly; the dict form remains the JSON
+machine contract used by the proposer backends and the archive. Temporal condition/category
+scalars use the same tagged JSON codec in both forms.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import math
 import numbers
 
 from . import ast as A
+from .scalar_codec import scalar_from_json, scalar_to_json
 
 
 def term_to_dict(t: A.Term) -> dict:
@@ -106,18 +109,15 @@ def _positive_int(value, label: str) -> int:
     return number
 
 
-def _scalar(value, label: str):
-    from .evaluate import canonical_typed_value
+def _scalar_to_dict(value, label: str):
+    try:
+        return scalar_to_json(value, label)
+    except TypeError as error:
+        raise ValueError(f"{label} must be a JSON scalar") from error
 
-    value = canonical_typed_value(value)
-    if value is None or isinstance(value, (str, bool)):
-        return value
-    if isinstance(value, int) and not isinstance(value, bool):
-        return value
-    if isinstance(value, float):
-        number = _finite_float(value, label)
-        return number
-    raise ValueError(f"{label} must be a JSON scalar")
+
+def _scalar_from_dict(value, label: str):
+    return scalar_from_json(value, label)
 
 
 def term_from_dict(d: dict) -> A.Term:
@@ -230,10 +230,16 @@ def rule_to_dict(r: A.Rule) -> dict:
             "atom_kind": "CategoryDefinition",
             "target_column": r.atom.target_column,
             "cases": [
-                [column, _scalar(value, "categorical case value")]
+                [
+                    column,
+                    _scalar_to_dict(
+                        value,
+                        "categorical case value",
+                    ),
+                ]
                 for column, value in r.atom.cases
             ],
-            "default": _scalar(
+            "default": _scalar_to_dict(
                 r.atom.default,
                 "categorical default",
             ),
@@ -300,7 +306,10 @@ def rule_from_dict(d: dict, *, grammar=None) -> A.Rule:
                 )
             cases.append((
                 _name(case[0], "category case column"),
-                _scalar(case[1], "category case value"),
+                _scalar_from_dict(
+                    case[1],
+                    "category case value",
+                ),
             ))
         if not cases:
             raise ValueError(
@@ -309,7 +318,7 @@ def rule_from_dict(d: dict, *, grammar=None) -> A.Rule:
         atom = A.CategoryDefinition(
             target_column,
             tuple(cases),
-            _scalar(
+            _scalar_from_dict(
                 _required(
                     d,
                     "default",
@@ -353,7 +362,7 @@ def condition_to_dict(condition: A.Condition) -> dict:
         ]
     else:
         values = [
-            _scalar(value, "condition value")
+            _scalar_to_dict(value, "condition value")
             for value in condition.values
         ]
     return {
@@ -384,7 +393,7 @@ def condition_from_dict(raw: dict) -> A.Condition:
     if op not in ("==", "in"):
         raise ValueError(f"unknown condition operator {op!r}")
     values = tuple(
-        _scalar(value, "condition value")
+        _scalar_from_dict(value, "condition value")
         for value in raw.get("values", ())
     )
     if not values:

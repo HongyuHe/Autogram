@@ -27,11 +27,20 @@ import numpy as np
 import pandas as pd
 
 from .config import DiscoveryConfig, SearchConfig
+from .dsl import ast as A
+from .dsl.evaluate import typed_unique
+from .dsl.scalar_codec import scalar_to_json
 from .discovery.export import write_rules_dl
 from .discovery.evaluate import DataOnlyEvaluator
 from .discovery.induce import induce_spec, make_inducer
 from .discovery.induce import _spec_to_json
-from .discovery.known import KnownInvariant, abstract_shapes, load_known, recover_known
+from .discovery.known import (
+    KnownInvariant,
+    abstract_shapes,
+    load_known,
+    recover_known,
+    validate_known_conditions,
+)
 from .discovery.known import _signature as _known_signature
 from .discovery.known import _matching_signatures as _known_matching_signatures
 from .discovery.known import _canonicalize as _known_canonicalize
@@ -76,6 +85,7 @@ class CalibrationConfig:
     max_nonlinear_leaves: int = 0
     max_linear_leaves: int = 0
     max_conditioned_rules: int = 0
+    max_condition_values: int = 4
     max_lag: int = 0
     windows: tuple[int, ...] = ()
 
@@ -197,7 +207,14 @@ def _json_normalize(value):
     This makes the serialized ``normalized_spec`` and its ``_json_fingerprint`` agree exactly with
     what a consumer reads back from the report.
     """
-    return json.loads(json.dumps(value, ensure_ascii=False))
+    return json.loads(json.dumps(
+        value,
+        ensure_ascii=False,
+        default=lambda item: scalar_to_json(
+            item,
+            "JSON-normalized scalar",
+        ),
+    ))
 
 
 def _json_fingerprint(value) -> str:
@@ -227,12 +244,67 @@ def _engine_source_fingerprint() -> str:
     return digest.hexdigest()
 
 
-def _calibration_provenance(df, known, cfg) -> dict[str, str]:
+def _known_membership(
+    known: List[KnownInvariant],
+    members: List[KnownInvariant],
+) -> list[dict]:
+    """Serialize one side of the split by original object identity and catalogue index."""
+    remaining = list(members)
+    membership = []
+    for index, invariant in enumerate(known):
+        matching_index = next((
+            candidate_index
+            for candidate_index, candidate in enumerate(remaining)
+            if candidate is invariant
+        ), None)
+        if matching_index is None:
+            continue
+        remaining.pop(matching_index)
+        membership.append({
+            "index": index,
+            **_json_normalize(asdict(invariant)),
+        })
+    if remaining:
+        raise ValueError(
+            "known split contains entries outside the loaded catalogue"
+        )
+    return membership
+
+
+def _calibration_provenance(
+    df,
+    known,
+    cfg,
+    *,
+    split_grammar_specs=(),
+    calibration_known=(),
+    validation_known=(),
+) -> dict:
+    known_split = {
+        "calibration": _known_membership(
+            known,
+            list(calibration_known),
+        ),
+        "validation": _known_membership(
+            known,
+            list(validation_known),
+        ),
+    }
+    split_grammar_specs = _json_normalize(
+        list(split_grammar_specs)
+    )
+    split_inputs = {
+        "grammar_specs": split_grammar_specs,
+        "known_membership": known_split,
+    }
     return {
         "engine_source_sha256": _engine_source_fingerprint(),
         "input_sha256": _fingerprint(df),
         "known_sha256": _fingerprint(known),
         "calibration_config_sha256": _fingerprint(cfg),
+        "split_sha256": _json_fingerprint(split_inputs),
+        "split_grammar_specs": split_grammar_specs,
+        "known_split": known_split,
     }
 
 
@@ -375,6 +447,27 @@ def _validate_split_inputs(known: List[KnownInvariant], frac: float) -> None:
         )
     if not 0.0 < float(frac) < 1.0:
         raise ValueError("validation_frac must be strictly between 0 and 1")
+
+
+def _runtime_condition_domains(df, profile) -> dict[str, tuple]:
+    """Read the exact condition domains calibration will attach at runtime."""
+    columns = set(getattr(df, "columns", ()))
+    domains = {}
+    for raw_column in profile.get("condition_columns", ()):
+        column = str(raw_column)
+        if column not in columns:
+            continue
+        values = df[column]
+        values = (
+            values.to_numpy(dtype=object)
+            if hasattr(values, "to_numpy")
+            else np.asarray(values, dtype=object)
+        )
+        domains[column] = typed_unique(
+            values,
+            drop_missing=True,
+        )
+    return domains
 
 
 def _split_known(known: List[KnownInvariant], frac: float, seed: int,
@@ -528,7 +621,6 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
     def lag_grounds(column, steps) -> bool:
         if recovery_dataset is None:
             return False
-        from .dsl import ast as A
         from .dsl.binders import (
             enumerate_bindings,
             resolve_family,
@@ -741,6 +833,56 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
             if isinstance(value, tuple):
                 if value[:1] == ("category_value",):
                     return {value}
+                if (
+                    len(value) == 2
+                    and value[0] == "categorical_definition"
+                    and isinstance(value[1], tuple)
+                    and len(value[1]) == 3
+                ):
+                    target, cases, default = value[1]
+                    if not isinstance(cases, tuple):
+                        return {value}
+                    target_options = quantified_variants(target)
+                    case_options = []
+                    for case in cases:
+                        if not (
+                            isinstance(case, tuple)
+                            and len(case) == 2
+                        ):
+                            return {value}
+                        column, label = case
+                        case_options.append(tuple(
+                            (column_variant, label_variant)
+                            for column_variant in quantified_variants(column)
+                            for label_variant in quantified_variants(label)
+                        ))
+                    default_options = quantified_variants(default)
+                    combinations = (
+                        len(target_options)
+                        * math.prod(
+                            len(option)
+                            for option in case_options
+                        )
+                        * len(default_options)
+                    )
+                    if combinations > 10_000:
+                        raise ValueError(
+                            "quantified split abstraction exceeds 10000 "
+                            "categorical alternatives; tighten the induced schema"
+                        )
+                    return {
+                        A.category_definition_semantic_signature(
+                            target_variant,
+                            tuple(case_variants),
+                            default_variant,
+                            lambda item: item,
+                        )
+                        for target_variant in target_options
+                        for case_variants in itertools.product(
+                            *case_options
+                        )
+                        for default_variant in default_options
+                    }
                 if (
                     len(value) == 3
                     and value[0] == "one_sided"
@@ -962,7 +1104,6 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
                     rule,
                     witness_dataset,
                 ))
-                from .dsl import ast as A
                 from .dsl.binders import (
                     enumerate_bindings,
                     resolve_ref,
@@ -1163,9 +1304,9 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
             ):
                 union(i, j)
 
-    groups: dict = {}
+    groups: dict[int, list[int]] = {}
     for index in range(len(known)):
-        groups.setdefault(find(index), []).append(known[index])
+        groups.setdefault(find(index), []).append(index)
     if len(groups) < 2:
         raise ValueError(
             "calibration requires at least two distinct known-invariant relations for a "
@@ -1180,8 +1321,20 @@ def _split_known(known: List[KnownInvariant], frac: float, seed: int,
         max(1, int(round(frac * len(order)))),
     )
     val_keys = set(order[:n_val])
-    calib = [inv for key, members in groups.items() if key not in val_keys for inv in members]
-    valid = [inv for key, members in groups.items() if key in val_keys for inv in members]
+    calib_indices = [
+        index
+        for key, indices in groups.items()
+        if key not in val_keys
+        for index in indices
+    ]
+    valid_indices = [
+        index
+        for key, indices in groups.items()
+        if key in val_keys
+        for index in indices
+    ]
+    calib = [known[index] for index in calib_indices]
+    valid = [known[index] for index in valid_indices]
     return calib, valid
 
 
@@ -1916,6 +2069,7 @@ def _iter_runtime_tier_specs(
     tiers,
     search_cfg,
     profile,
+    max_condition_values=None,
 ):
     """Prepare every grammar the configured calibration loop could execute.
 
@@ -1971,6 +2125,11 @@ def _iter_runtime_tier_specs(
                 3,
             ),
         )
+        if max_condition_values is not None:
+            spec = replace(
+                spec,
+                max_condition_values=int(max_condition_values),
+            )
         accumulated = spec
         yield normalize_dataframe_spec(
             df,
@@ -2018,6 +2177,7 @@ def _prepare_runtime_tier_specs(
     tiers,
     search_cfg,
     profile,
+    max_condition_values=None,
 ):
     return list(_iter_runtime_tier_specs(
         df,
@@ -2026,6 +2186,7 @@ def _prepare_runtime_tier_specs(
         tiers,
         search_cfg,
         profile,
+        max_condition_values,
     ))
 
 
@@ -2128,6 +2289,24 @@ def _spec_summary(spec, tier: int, caps: dict) -> dict:
     }
 
 
+def _normalized_spec_summary(
+    spec,
+    tier: int,
+    caps: dict,
+) -> dict:
+    normalized_spec = _json_normalize(_spec_to_json(spec))
+    return {
+        "tier": tier,
+        "capabilities_forced": _json_normalize(
+            caps or "as-induced"
+        ),
+        "normalized_spec": normalized_spec,
+        "normalized_spec_sha256": _json_fingerprint(
+            normalized_spec
+        ),
+    }
+
+
 def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
               name: str = "calibrate") -> dict:
     """Full calibration loop: jointly tune knobs on the proxy suite, discover on the dataset, report recall.
@@ -2174,6 +2353,11 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
     # inducer, so an invalid known catalogue or split fraction fails without spending a subagent
     # request or producing its side effects.
     _validate_split_inputs(known, cfg.validation_frac)
+    validate_known_conditions(
+        known,
+        _runtime_condition_domains(df, profile),
+        cfg.max_condition_values,
+    )
     inducer = _make_calibration_inducer(cfg)
     # Prepare every grammar tier BEFORE the split. Besides learning the runtime cell codec, this
     # exposes the complete structural candidate space that calibration may reach after a recall
@@ -2194,9 +2378,14 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
             configured_tiers,
             scfg,
             profile,
+            cfg.max_condition_values,
         ),
         cfg.max_iterations,
     )
+    split_grammar_specs = [
+        _normalized_spec_summary(spec, tier_index, caps)
+        for tier_index, caps, spec in runtime_tiers
+    ]
     split_dataset, split_grammar = build_dataframe_grammar(
         df,
         runtime_tiers[-1][2],
@@ -2364,10 +2553,12 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
         summary["runtime"]["null_candidate_counts"] = dict(
             runtime_nulls.candidate_counts
         )
-        normalized_spec = _json_normalize(_spec_to_json(runtime_spec))
-        summary["normalized_spec"] = normalized_spec
-        summary["normalized_spec_sha256"] = _json_fingerprint(
-            normalized_spec
+        summary.update(
+            _normalized_spec_summary(
+                runtime_spec,
+                ti,
+                caps,
+            )
         )
         grammar_specs.append(summary)
 
@@ -2541,7 +2732,14 @@ def calibrate(df, known_path: str, cfg: Optional[CalibrationConfig] = None,
         },
         "n_rules_learned": len(best_res.portfolio),
         "rules_file": rules_file,
-        "provenance": _calibration_provenance(df, known, cfg),
+        "provenance": _calibration_provenance(
+            df,
+            known,
+            cfg,
+            split_grammar_specs=split_grammar_specs,
+            calibration_known=calib,
+            validation_known=valid,
+        ),
         "learned_invariants": learned_invariants,
         "invariants": report_all["invariants"],
         "limits": ("Known-invariant recall is a lower bound under representativeness, not a "

@@ -121,6 +121,58 @@ def test_definition_null_independently_permutes_categorical_target():
     assert not np.array_equal(context["label"][present], label[present])
 
 
+def test_definition_null_constructs_required_multi_swap():
+    label = np.array(
+        ["common"] * 97 + [True, 1, "rare", pd.NA, None],
+        dtype=object,
+    )
+    supports = []
+    for index in (0, 1, 2):
+        support = np.zeros(label.size, dtype=bool)
+        support[index] = True
+        supports.append(support)
+
+    randomized = V._permute_present_categories(
+        label,
+        np.random.default_rng(0),
+        required_supports=supports,
+        column="label",
+    )
+    repeated = V._permute_present_categories(
+        label,
+        np.random.default_rng(0),
+        required_supports=supports,
+        column="label",
+    )
+
+    present = ~pd.isna(label)
+    changed = np.zeros(label.size, dtype=bool)
+    changed[present] = [
+        typed_group_key(left) != typed_group_key(right)
+        for left, right in zip(label[present], randomized[present])
+    ]
+    source_counts = {}
+    randomized_counts = {}
+    for value in label[present]:
+        key = typed_group_key(value)
+        source_counts[key] = source_counts.get(key, 0) + 1
+    for value in randomized[present]:
+        key = typed_group_key(value)
+        randomized_counts[key] = randomized_counts.get(key, 0) + 1
+
+    assert np.array_equal(pd.isna(randomized), pd.isna(label))
+    assert source_counts == randomized_counts
+    assert all(np.any(changed & support) for support in supports)
+    assert np.count_nonzero(changed) > 2
+    assert [
+        typed_group_key(value)
+        for value in randomized[present]
+    ] == [
+        typed_group_key(value)
+        for value in repeated[present]
+    ]
+
+
 def _sparse_nullable_category():
     missing = np.array([3, 15])
     first = np.full(20, False, dtype=object)
@@ -255,6 +307,169 @@ def test_runtime_definition_null_fails_loudly_if_category_becomes_ungradeable():
                 definition_min_lift=0.0,
                 band_mode="global",
             ),
+            seed=0,
+        )
+
+
+def _same_label_category_null_fixture():
+    n = 240
+    phase = np.arange(n) % 6
+    first = np.isin(phase, (1, 4))
+    second = np.isin(phase, (2, 5))
+    warning = np.isin(phase, (3, 4, 5))
+    label = np.full(n, "normal", dtype=object)
+    label[warning] = "warning"
+    label[first | second] = "alert"
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "is_first": first,
+            "is_second": second,
+            "is_warning": warning,
+            "label": label,
+        }),
+        condition_columns=(
+            "is_first",
+            "is_second",
+            "is_warning",
+            "label",
+        ),
+        advanced=True,
+        max_conjunction_terms=3,
+    )
+    spec = GrammarSpec(
+        name="same-label-category-null",
+        patterns=(
+            ColumnPattern(
+                name="placeholder",
+                matcher="regex",
+                kind="unused",
+                direction="unused",
+                regex=r"^does_not_match$",
+            ),
+        ),
+        ontology=RoleOntology(
+            binders=("network",),
+            ref_roles={"network": ()},
+            fam_roles={"network": ()},
+        ),
+        ref_templates=(),
+        family_selectors=(),
+        binder_enumerate={"network": "singleton"},
+        cell_codec=CellCodec(kind="scalar"),
+    )
+    dataset, grammar = build_dataframe_grammar(
+        frame,
+        spec,
+        name="same_label_category_null",
+    )
+    rule = A.Rule(
+        "network",
+        A.CategoryDefinition(
+            "label",
+            (
+                ("is_first", "alert"),
+                ("is_second", "alert"),
+                ("is_warning", "warning"),
+            ),
+            "normal",
+        ),
+    )
+    config = DiscoveryConfig(
+        hold_rate_threshold=0.9,
+        band_mode="global",
+    )
+    return dataset, grammar, rule, config
+
+
+def test_runtime_null_requires_accepted_same_label_category_block():
+    dataset, grammar, rule, config = (
+        _same_label_category_null_fixture()
+    )
+
+    real = DataOnlyEvaluator(dataset, config).evaluate(rule)
+    controls = V.prepare_runtime_null_controls(
+        dataset,
+        grammar,
+        SearchConfig(seed=0),
+        seed=0,
+        rules=[rule],
+    )
+
+    assert real.accepted
+    assert controls.definition_null is not None
+    assert controls.definition_null.definition_gradeable_points == {
+        rule.signature(): dataset.observed.n_rows,
+    }
+    assert V.null_definitions_at(
+        controls.definition_null,
+        config,
+        seed=0,
+    ) == 0
+
+
+def test_runtime_null_omits_ambiguous_same_label_requirement():
+    dataset, grammar, rule, config = (
+        _same_label_category_null_fixture()
+    )
+    n = dataset.observed.n_rows
+    phase = np.arange(n) % 5
+    first = np.isin(phase, (0, 1))
+    second = np.isin(phase, (0, 2))
+    warning = np.isin(phase, (0, 3))
+    label = np.full(n, "normal", dtype=object)
+    label[warning] = "warning"
+    label[first | second] = "alert"
+    context = dataset.observed.row_context
+    context["is_first"] = first
+    context["is_second"] = second
+    context["is_warning"] = warning
+    context["label"] = label
+
+    real = DataOnlyEvaluator(dataset, config).evaluate(rule)
+    controls = V.prepare_runtime_null_controls(
+        dataset,
+        grammar,
+        SearchConfig(seed=0),
+        seed=0,
+        rules=[rule],
+    )
+
+    assert not real.accepted
+    assert "observed combinations" in real.reason
+    assert controls.definition_null is not None
+    assert controls.definition_null.definition_gradeable_points == {}
+    assert V.null_definitions_at(
+        controls.definition_null,
+        config,
+        seed=0,
+    ) == 0
+
+
+def test_runtime_null_rechecks_case_level_category_identifiability():
+    dataset, grammar, rule, config = (
+        _same_label_category_null_fixture()
+    )
+    controls = V.prepare_runtime_null_controls(
+        dataset,
+        grammar,
+        SearchConfig(seed=0),
+        seed=0,
+        rules=[rule],
+    )
+    n = controls.definition_null.ds.observed.n_rows
+    phase = np.arange(n) % 5
+    context = controls.definition_null.ds.observed.row_context
+    context["is_first"] = np.isin(phase, (0, 1))
+    context["is_second"] = np.isin(phase, (0, 2))
+    context["is_warning"] = np.isin(phase, (0, 3))
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"expected {n} gradeable rows, found 0",
+    ):
+        V.null_definitions_at(
+            controls.definition_null,
+            config,
             seed=0,
         )
 

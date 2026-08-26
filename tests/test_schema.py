@@ -8,6 +8,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
+from dateutil import tz as dateutil_tz
 
 from autogram.discovery import synth
 from autogram.discovery.loop import build_dataframe_grammar
@@ -16,6 +17,7 @@ from autogram.discovery.induce import (
     _spec_to_json,
     induce_spec,
 )
+from autogram.dsl.evaluate import typed_group_key
 from autogram.schema import CompileError, compile_spec
 from autogram.schema.spec import (
     CellCodec,
@@ -26,6 +28,32 @@ from autogram.schema.spec import (
     RelatedTemplate,
     RoleOntology,
 )
+
+
+def _span_filter_spec(*values) -> GrammarSpec:
+    return replace(
+        _node_template_spec(),
+        related_templates=(
+            RelatedTemplate(
+                binder="node",
+                role="event",
+                relation="events",
+                column="kind",
+                mode="span_any",
+                parent_keys=(),
+                child_keys=(),
+                partition_keys=(),
+                parent_time="timestamp",
+                child_time="span_start",
+                window_seconds=60,
+                span_start="span_start",
+                span_end="span_end",
+                filter_column="kind",
+                filter_values=values,
+            ),
+        ),
+        advanced_enabled=True,
+    )
 
 
 def test_induced_spec_compiles(adapter):
@@ -188,6 +216,178 @@ def test_numpy_span_filter_values_compile_and_serialize_as_python_scalars():
 
 
 @pytest.mark.parametrize(
+    "value,tag",
+    [
+        (
+            pd.Timestamp("2026-01-01"),
+            "pandas.Timestamp",
+        ),
+        (
+            pd.Timestamp("2026-01-01", tz="US/Eastern"),
+            "pandas.Timestamp",
+        ),
+        (
+            pd.Timedelta("1h"),
+            "pandas.Timedelta",
+        ),
+        (
+            np.datetime64("2026-01-01T00:00:00.123", "ms"),
+            "numpy.datetime64",
+        ),
+        (
+            np.timedelta64(3, "h"),
+            "numpy.timedelta64",
+        ),
+        (
+            pd.NaT,
+            "pandas.NaT",
+        ),
+        (
+            np.datetime64("NaT", "us"),
+            "numpy.datetime64",
+        ),
+        (
+            np.timedelta64("NaT", "ms"),
+            "numpy.timedelta64",
+        ),
+    ],
+)
+def test_temporal_span_filter_values_round_trip_and_compile(value, tag):
+    spec = _span_filter_spec(value)
+
+    payload = json.loads(json.dumps(
+        _spec_to_json(spec),
+        allow_nan=False,
+    ))
+    encoded = payload["related_templates"][0]["filter_values"][0]
+    restored = _spec_from_json(payload)
+    restored_value = restored.related_templates[0].filter_values[0]
+    adapter = compile_spec(restored)
+    compiled_value = adapter.related_templates[
+        ("node", "event")
+    ].filter_values[0]
+
+    assert encoded["__autogram_temporal__"] == tag
+    assert (
+        _spec_to_json(restored)["related_templates"][0][
+            "filter_values"
+        ][0]
+        == encoded
+    )
+    assert type(restored_value) is type(value)
+    assert typed_group_key(compiled_value) == typed_group_key(value)
+
+
+def test_dateutil_zone_span_filter_values_preserve_json_and_dst():
+    timezone = dateutil_tz.gettz("America/New_York")
+    values = (
+        pd.Timestamp("2026-01-15 12:00", tz=timezone),
+        pd.Timestamp("2026-07-15 12:00", tz=timezone),
+    )
+    spec = _span_filter_spec(*values)
+    payload = json.loads(json.dumps(
+        _spec_to_json(spec),
+        allow_nan=False,
+    ))
+    canonical_filter_json = json.dumps(
+        payload["related_templates"][0]["filter_values"],
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    restored = _spec_from_json(payload)
+    adapter = compile_spec(restored)
+    restored_values = restored.related_templates[0].filter_values
+    compiled_values = adapter.related_templates[
+        ("node", "event")
+    ].filter_values
+
+    assert json.dumps(
+        _spec_to_json(restored)["related_templates"][0][
+            "filter_values"
+        ],
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ) == canonical_filter_json
+    assert [
+        item["timezone"]
+        for item in payload["related_templates"][0]["filter_values"]
+    ] == [
+        {
+            "kind": "dateutil.tzfile",
+            "key": "America/New_York",
+        },
+        {
+            "kind": "dateutil.tzfile",
+            "key": "America/New_York",
+        },
+    ]
+    for original, restored_value, compiled_value in zip(
+        values,
+        restored_values,
+        compiled_values,
+    ):
+        assert repr(restored_value) == repr(original)
+        assert typed_group_key(restored_value) == typed_group_key(
+            original
+        )
+        assert typed_group_key(compiled_value) == typed_group_key(
+            original
+        )
+    assert {
+        value.utcoffset() for value in restored_values
+    } == {
+        pd.Timedelta(hours=-5),
+        pd.Timedelta(hours=-4),
+    }
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        (
+            pd.Timestamp("2026-01-01"),
+            np.datetime64("2026-01-01", "ns"),
+        ),
+        (
+            pd.Timedelta(0),
+            np.timedelta64(0, "ns"),
+        ),
+        (
+            pd.Timestamp("2026-01-01", tz="UTC"),
+            pd.Timestamp("2025-12-31 19:00", tz="US/Eastern"),
+        ),
+        (
+            None,
+            pd.NaT,
+        ),
+        (
+            np.datetime64("NaT", "ns"),
+            np.timedelta64("NaT", "ns"),
+        ),
+    ],
+)
+def test_temporal_span_filter_values_enforce_typed_uniqueness(values):
+    with pytest.raises(CompileError, match="duplicate span filter value"):
+        compile_spec(_span_filter_spec(*values))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float("nan"), float("inf"), -float("inf")],
+)
+def test_span_filter_values_keep_finite_json_number_restriction(value):
+    spec = _span_filter_spec(value)
+
+    with pytest.raises(CompileError, match="must be finite"):
+        compile_spec(spec)
+    with pytest.raises(ValueError, match="must be finite"):
+        _spec_to_json(spec)
+
+
+@pytest.mark.parametrize(
     "field,value",
     [
         ("max_lag", 2.9),
@@ -297,6 +497,160 @@ def test_temporal_cadence_round_trips_through_schema_and_compiler():
 
     assert restored.temporal_cadence_seconds == 1.5
     assert adapter.temporal_cadence_seconds == 1.5
+
+
+@pytest.mark.parametrize(
+    "value,tag",
+    [
+        (
+            pd.Timestamp("2026-01-01"),
+            "pandas.Timestamp",
+        ),
+        (
+            pd.Timestamp("2026-01-01", tz="US/Eastern"),
+            "pandas.Timestamp",
+        ),
+        (
+            pd.Timedelta("1h"),
+            "pandas.Timedelta",
+        ),
+        (
+            np.datetime64("2026-01-01T00:00:00.123", "ms"),
+            "numpy.datetime64",
+        ),
+        (
+            np.timedelta64(3, "h"),
+            "numpy.timedelta64",
+        ),
+        (
+            pd.NaT,
+            "pandas.NaT",
+        ),
+        (
+            np.datetime64("NaT", "us"),
+            "numpy.datetime64",
+        ),
+        (
+            np.timedelta64("NaT", "ms"),
+            "numpy.timedelta64",
+        ),
+    ],
+)
+def test_temporal_condition_values_round_trip_and_compile(value, tag):
+    spec = replace(
+        _node_template_spec(),
+        condition_columns={"when": (value,)},
+        conditional_enabled=True,
+    )
+
+    payload = json.loads(json.dumps(
+        _spec_to_json(spec),
+        allow_nan=False,
+    ))
+    restored = _spec_from_json(payload)
+    restored_value = restored.condition_columns["when"][0]
+    adapter = compile_spec(restored)
+    compiled_value = adapter.condition_columns["when"][0]
+
+    assert (
+        payload["condition_columns"]["when"][0][
+            "__autogram_temporal__"
+        ]
+        == tag
+    )
+    assert type(restored_value) is type(value)
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        assert restored_value.dtype == value.dtype
+        if np.isnat(value):
+            assert np.isnat(restored_value)
+        else:
+            assert restored_value == value
+    elif value is pd.NaT:
+        assert restored_value is pd.NaT
+    elif isinstance(value, pd.Timestamp):
+        assert restored_value == value
+        assert restored_value.asm8.dtype == value.asm8.dtype
+        assert str(restored_value.tz) == str(value.tz)
+    elif isinstance(value, pd.Timedelta):
+        assert restored_value == value
+        assert restored_value.asm8.dtype == value.asm8.dtype
+    else:
+        assert restored_value == value
+    assert typed_group_key(compiled_value) == typed_group_key(value)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        (
+            pd.Timestamp("2026-01-01"),
+            np.datetime64("2026-01-01", "ns"),
+        ),
+        (
+            pd.Timedelta(0),
+            np.timedelta64(0, "ns"),
+        ),
+        (
+            pd.Timestamp("2026-01-01", tz="UTC"),
+            pd.Timestamp("2025-12-31 19:00", tz="US/Eastern"),
+        ),
+        (
+            None,
+            pd.NaT,
+        ),
+        (
+            np.datetime64("NaT", "ns"),
+            np.timedelta64("NaT", "ns"),
+        ),
+    ],
+)
+def test_temporal_condition_values_enforce_canonical_uniqueness(values):
+    spec = replace(
+        _node_template_spec(),
+        condition_columns={"when": values},
+    )
+
+    with pytest.raises(CompileError, match="duplicate condition value"):
+        compile_spec(spec)
+
+
+def test_temporal_condition_values_preserve_typed_distinctions():
+    values = (
+        False,
+        0,
+        0.0,
+        "0",
+        pd.Timestamp("1970-01-01"),
+        pd.Timedelta(0),
+    )
+    spec = replace(
+        _node_template_spec(),
+        condition_columns={"when": values},
+    )
+
+    adapter = compile_spec(spec)
+    compiled = adapter.condition_columns["when"]
+
+    assert len(compiled) == len(values)
+    assert len({typed_group_key(value) for value in compiled}) == len(
+        values
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float("nan"), float("inf"), -float("inf")],
+)
+def test_condition_values_keep_finite_json_number_restriction(value):
+    spec = replace(
+        _node_template_spec(),
+        condition_columns={"when": (value,)},
+    )
+
+    with pytest.raises(CompileError, match="must be finite"):
+        compile_spec(spec)
+    with pytest.raises(ValueError, match="must be finite"):
+        _spec_to_json(spec)
 
 
 @pytest.mark.parametrize(

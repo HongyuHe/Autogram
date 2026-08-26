@@ -148,6 +148,109 @@ def test_load_known_rejects_duplicate_sum_members(tmp_path, lhs, rhs):
 @pytest.mark.parametrize(
     "invariant",
     [
+        {
+            "name": "ratio_string",
+            "op": "==",
+            "lhs": "ratio",
+            "rhs": {"ratio": "xy"},
+        },
+        {
+            "name": "ratio_wrong_arity",
+            "op": "==",
+            "lhs": "ratio",
+            "rhs": {"ratio": ["x"]},
+        },
+        {
+            "name": "ratio_structured_operand",
+            "op": "==",
+            "lhs": "ratio",
+            "rhs": {"ratio": [{"sum": ["x"]}, "y"]},
+        },
+        {
+            "name": "difference_string",
+            "op": ":=",
+            "lhs": "flag",
+            "rhs": {
+                "and": [{
+                    "bound": [
+                        {"difference": "xy"},
+                        ">",
+                        0,
+                    ],
+                }],
+            },
+        },
+        {
+            "name": "difference_wrong_arity",
+            "op": ":=",
+            "lhs": "flag",
+            "rhs": {
+                "and": [{
+                    "bound": [
+                        {"difference": ["x"]},
+                        ">",
+                        0,
+                    ],
+                }],
+            },
+        },
+        {
+            "name": "bound_string",
+            "op": ":=",
+            "lhs": "flag",
+            "rhs": {"and": [{"bound": "x>0"}]},
+        },
+        {
+            "name": "lag_wrong_arity",
+            "op": ">=",
+            "lhs": {"lag": ["x"]},
+            "rhs": 0,
+        },
+        {
+            "name": "delta_wrong_arity",
+            "op": ">=",
+            "lhs": {"delta": ["x", 1, 2]},
+            "rhs": 0,
+        },
+        {
+            "name": "rolling_string",
+            "op": "==",
+            "lhs": "ratio",
+            "rhs": {
+                "ratio": [
+                    {"roll_sum": "x2"},
+                    {"roll_sum": ["y", 2]},
+                ],
+            },
+        },
+        {
+            "name": "priority_string",
+            "op": ":=",
+            "lhs": "label",
+            "rhs": {"priority": "ab", "default": "none"},
+        },
+        {
+            "name": "sum_structured_member",
+            "op": "==",
+            "lhs": "total",
+            "rhs": {"sum": [["x"], "y"]},
+        },
+    ],
+)
+def test_load_known_rejects_non_sequence_and_wrong_arity_payloads(
+    tmp_path,
+    invariant,
+):
+    path = tmp_path / "invalid-structure.json"
+    path.write_text(json.dumps({"invariants": [invariant]}))
+
+    with pytest.raises(ValueError, match="known invariant"):
+        load_known(str(path))
+
+
+@pytest.mark.parametrize(
+    "invariant",
+    [
         {"name": "fractional_lag", "op": ">=", "lhs": {"lag": ["x", 1.9]}, "rhs": 0},
         {"name": "negative_lag", "op": ">=", "lhs": {"lag": ["x", -1]}, "rhs": 0},
         {"name": "boolean_zero", "op": ">=", "lhs": "x", "rhs": False},

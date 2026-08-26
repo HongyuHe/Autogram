@@ -118,6 +118,13 @@ def _positive_scale_floor(values: np.ndarray) -> float:
     )
 
 
+def _adaptive_band_epsilon(fitted_eps: float, cap: float) -> float:
+    """Apply the numerical epsilon floor without exceeding the global cap."""
+    cap = float(cap)
+    floor = min(1e-9, cap)
+    return min(cap, max(float(fitted_eps), floor))
+
+
 def _group_labels(frame, name_model, row_indices=None):
     keys = tuple(
         getattr(
@@ -217,6 +224,309 @@ def _typed_scalar_mask(values, target) -> np.ndarray:
         dtype=bool,
         count=values.size,
     ).reshape(values.shape)
+
+
+def _typed_present_mask(values) -> np.ndarray:
+    """Rows whose categorical value is not a typed missing scalar."""
+    values = np.asarray(values, dtype=object)
+    return np.fromiter(
+        (_typed_label(value)[0] != "missing" for value in values.flat),
+        dtype=bool,
+        count=values.size,
+    ).reshape(values.shape)
+
+
+def _assign_object_scalar(values: np.ndarray, mask: np.ndarray, value) -> None:
+    """Assign one object scalar without NumPy unpacking tuple-valued labels."""
+    positions = np.flatnonzero(mask)
+    if not positions.size:
+        return
+    replacements = np.empty(positions.size, dtype=object)
+    replacements.fill(value)
+    values[positions] = replacements
+
+
+@dataclass(frozen=True)
+class _CategoricalCasePopulation:
+    column: str
+    value: object
+    value_key: tuple
+    active: np.ndarray
+
+
+@dataclass(frozen=True)
+class _CategoricalBlockPopulation:
+    block: A.CategoryLabelBlock
+    active: np.ndarray
+
+
+@dataclass(frozen=True)
+class _CategoricalDefinitionPopulation:
+    target: np.ndarray
+    predicted: np.ndarray
+    valid: np.ndarray
+    cases: tuple[_CategoricalCasePopulation, ...]
+    blocks: tuple[_CategoricalBlockPopulation, ...]
+    precedence_constraints: frozenset[tuple[int, int]]
+    precedence_closure: frozenset[tuple[int, int]]
+    ambiguous_pairs: frozenset[tuple[int, int]]
+
+    @property
+    def order_identifiable(self) -> bool:
+        return not self.ambiguous_pairs
+
+
+_MAX_EXACT_CATEGORY_CASES = 20
+
+
+def _category_precedence_reduction(
+    case_count: int,
+    closure: frozenset[tuple[int, int]],
+) -> frozenset[tuple[int, int]]:
+    """Transitive reduction used only to expose the direct fixed precedence edges."""
+    return frozenset(
+        (higher, lower)
+        for higher, lower in closure
+        if not any(
+            middle not in (higher, lower)
+            and (higher, middle) in closure
+            and (middle, lower) in closure
+            for middle in range(case_count)
+        )
+    )
+
+
+def _category_activation_patterns(
+    cases: tuple[_CategoricalCasePopulation, ...],
+    valid: np.ndarray,
+) -> frozenset[int]:
+    """Distinct non-empty case-activation masks observed on gradeable rows."""
+    positions = np.flatnonzero(valid)
+    if not positions.size:
+        return frozenset()
+    patterns = np.zeros(positions.size, dtype=np.uint64)
+    for index, case in enumerate(cases):
+        patterns |= (
+            np.asarray(case.active[positions], dtype=np.uint64)
+            << np.uint64(index)
+        )
+    return frozenset(
+        int(pattern)
+        for pattern in np.unique(patterns)
+        if pattern
+    )
+
+
+def _minimal_category_blockers(blockers) -> tuple[int, ...]:
+    """Remove redundant supersets from one case's prefix-hitting requirements."""
+    minimal = []
+    for blocker in sorted(set(blockers), key=lambda item: (item.bit_count(), item)):
+        if not any(
+            existing & blocker == existing
+            for existing in minimal
+        ):
+            minimal.append(blocker)
+    return tuple(minimal)
+
+
+def _category_case_order_analysis(
+    cases: tuple[_CategoricalCasePopulation, ...],
+    valid: np.ndarray,
+) -> tuple[
+    frozenset[tuple[int, int]],
+    frozenset[tuple[int, int]],
+    frozenset[tuple[int, int]],
+]:
+    """Exact observational uniqueness of a categorical priority order.
+
+    A prefix is feasible when every observed activation pattern first resolved by its next case
+    receives the same typed label as the candidate order. Dynamic programming over the bounded
+    subset lattice therefore represents every total case order that is indistinguishable on the
+    gradeable rows. A rule is identifiable exactly when no such order reverses a differently
+    labelled case pair: any reversal changes the rule on the unseen input where only that pair is
+    active.
+    """
+    case_count = len(cases)
+    cross_label_pairs = A.category_definition_cross_label_pairs(
+        tuple((case.column, case.value) for case in cases),
+        _typed_label,
+    )
+    if not cross_label_pairs:
+        return frozenset(), frozenset(), frozenset()
+    if case_count > _MAX_EXACT_CATEGORY_CASES:
+        raise ValueError(
+            "categorical priority exact identifiability supports at most "
+            f"{_MAX_EXACT_CATEGORY_CASES} cases; found {case_count}"
+        )
+
+    patterns = _category_activation_patterns(cases, valid)
+    value_keys = tuple(case.value_key for case in cases)
+    blockers_by_case = []
+    for index, value_key in enumerate(value_keys):
+        bit = 1 << index
+        blockers = []
+        for pattern in patterns:
+            if not (pattern & bit):
+                continue
+            first = (pattern & -pattern).bit_length() - 1
+            if value_keys[first] == value_key:
+                continue
+            blocker = pattern & ~bit
+            if not blocker:  # pragma: no cover - the active case would itself define the label
+                raise AssertionError("invalid categorical activation constraint")
+            blockers.append(blocker)
+        blockers_by_case.append(_minimal_category_blockers(blockers))
+
+    if not any(blockers_by_case):
+        return (
+            frozenset(),
+            frozenset(),
+            frozenset(cross_label_pairs),
+        )
+
+    full = (1 << case_count) - 1
+
+    def appendable(state: int, index: int) -> bool:
+        return all(
+            state & blocker
+            for blocker in blockers_by_case[index]
+        )
+
+    reachable = bytearray(full + 1)
+    reachable[0] = 1
+    for state in range(full + 1):
+        if not reachable[state]:
+            continue
+        remaining = full ^ state
+        while remaining:
+            bit = remaining & -remaining
+            index = bit.bit_length() - 1
+            if appendable(state, index):
+                reachable[state | bit] = 1
+            remaining ^= bit
+    if not reachable[full]:  # pragma: no cover - the candidate order is always a witness
+        raise AssertionError("candidate categorical order is not observationally feasible")
+
+    completable = bytearray(full + 1)
+    completable[full] = 1
+    for state in range(full - 1, -1, -1):
+        remaining = full ^ state
+        while remaining:
+            bit = remaining & -remaining
+            index = bit.bit_length() - 1
+            if (
+                appendable(state, index)
+                and completable[state | bit]
+            ):
+                completable[state] = 1
+                break
+            remaining ^= bit
+
+    possible_before = [0] * case_count
+    for state in range(full):
+        if not reachable[state]:
+            continue
+        remaining = full ^ state
+        candidates = remaining
+        while candidates:
+            bit = candidates & -candidates
+            index = bit.bit_length() - 1
+            next_state = state | bit
+            if (
+                completable[next_state]
+                and appendable(state, index)
+            ):
+                possible_before[index] |= full ^ next_state
+            candidates ^= bit
+
+    ambiguous = frozenset(
+        (higher, lower)
+        for higher, lower in cross_label_pairs
+        if possible_before[lower] & (1 << higher)
+    )
+    closure = frozenset(cross_label_pairs) - ambiguous
+    constraints = _category_precedence_reduction(
+        case_count,
+        closure,
+    )
+    return constraints, closure, ambiguous
+
+
+def _categorical_definition_population(
+    rule: A.Rule,
+    frame,
+) -> _CategoricalDefinitionPopulation:
+    """Build the shared typed case population and exact observational order analysis."""
+    if not isinstance(rule.atom, A.CategoryDefinition):
+        raise TypeError("categorical population requires a category definition")
+    atom = rule.atom
+    if atom.target_column not in frame.row_context:
+        raise ValueError("categorical target is absent from row context")
+    target = _typed_object_array(
+        frame.row_context[atom.target_column]
+    )
+    valid = _typed_present_mask(target)
+    if rule.condition is not None:
+        condition = _condition_mask(rule.condition, frame)
+        valid &= condition if condition is not None else False
+
+    cases = []
+    for column, value in atom.cases:
+        if column not in frame.row_context:
+            raise ValueError(f"categorical case column {column!r} is absent")
+        raw_active = _typed_object_array(
+            frame.row_context[column]
+        )
+        present = _typed_present_mask(raw_active)
+        active = np.zeros(target.shape, dtype=bool)
+        active[present] = raw_active[present].astype(bool)
+        valid &= present
+        cases.append(_CategoricalCasePopulation(
+            column=column,
+            value=value,
+            value_key=_typed_label(value),
+            active=active,
+        ))
+    case_tuple = tuple(cases)
+
+    blocks = []
+    case_index = 0
+    for block in A.category_definition_label_blocks(
+        atom.cases,
+        _typed_label,
+    ):
+        active = np.zeros(target.shape, dtype=bool)
+        for case in case_tuple[
+            case_index:case_index + len(block.cases)
+        ]:
+            active |= case.active
+        blocks.append(_CategoricalBlockPopulation(block, active))
+        case_index += len(block.cases)
+    block_tuple = tuple(blocks)
+
+    constraints, closure, ambiguous = _category_case_order_analysis(
+        case_tuple,
+        valid,
+    )
+
+    predicted = np.empty(target.shape, dtype=object)
+    predicted.fill(atom.default)
+    for block in reversed(block_tuple):
+        _assign_object_scalar(
+            predicted,
+            block.active,
+            block.block.value,
+        )
+    return _CategoricalDefinitionPopulation(
+        target=target,
+        predicted=predicted,
+        valid=valid,
+        cases=case_tuple,
+        blocks=block_tuple,
+        precedence_constraints=constraints,
+        precedence_closure=closure,
+        ambiguous_pairs=ambiguous,
+    )
 
 
 def _untyped_label(typed):
@@ -768,7 +1078,7 @@ class DataOnlyEvaluator:
                         rule,
                         "adaptive band could not retain every declared group",
                     )
-                eps = max(float(bf.eps), 1e-9)
+                eps = _adaptive_band_epsilon(bf.eps, cfg.tolerance)
                 evaluation_positions = band_positions[
                     bf.eval_indices
                 ]
@@ -901,7 +1211,10 @@ class DataOnlyEvaluator:
                     cfg.seed,
                     cap=cfg.tolerance,
                 )
-                eps = max(float(band.eps), 1e-9)
+                eps = _adaptive_band_epsilon(
+                    band.eps,
+                    cfg.tolerance,
+                )
                 holdout_holds = (
                     violation_magnitude(
                         op,
@@ -1330,27 +1643,15 @@ class DataOnlyEvaluator:
 
     def _evaluate_category_definition(self, rule: A.Rule) -> Evaluation:
         frame = self.ds.observed
-        atom = rule.atom
-        if atom.target_column not in frame.row_context:
-            return self._reject(rule, "categorical target is absent from row context")
-        target = np.asarray(frame.row_context[atom.target_column], dtype=object)
-        valid = ~pd.isna(target)
-        if rule.condition is not None:
-            condition = _condition_mask(rule.condition, frame)
-            valid &= condition if condition is not None else False
-        case_masks = []
-        for column, value in atom.cases:
-            if column not in frame.row_context:
-                return self._reject(rule, f"categorical case column {column!r} is absent")
-            raw_active = np.asarray(
-                frame.row_context[column],
-                dtype=object,
+        try:
+            population = _categorical_definition_population(
+                rule,
+                frame,
             )
-            present = ~pd.isna(raw_active)
-            active = np.zeros(target.size, dtype=bool)
-            active[present] = raw_active[present].astype(bool)
-            valid &= present
-            case_masks.append((active, value))
+        except (TypeError, ValueError) as error:
+            return self._reject(rule, str(error))
+        target = population.target
+        valid = population.valid
         thin = self._graded_condition_rejection(
             rule,
             valid,
@@ -1358,41 +1659,22 @@ class DataOnlyEvaluator:
         )
         if thin is not None:
             return thin
-        missing_edges = []
-        for left_index, (left_mask, left_value) in enumerate(case_masks):
-            higher_active = np.zeros(target.size, dtype=bool)
-            for higher_mask, _higher_value in case_masks[:left_index]:
-                higher_active |= higher_mask
-            for right_index, (right_mask, right_value) in enumerate(
-                case_masks[left_index + 1:],
-                start=left_index + 1,
-            ):
-                identifiable = (
-                    _typed_label(left_value) == _typed_label(right_value)
-                    or np.any(
-                        left_mask
-                        & right_mask
-                        & ~higher_active
-                        & valid
-                    )
-                )
-                if not identifiable:
-                    missing_edges.append((left_index, right_index))
-        if missing_edges:
+        if not population.order_identifiable:
             return self._reject(
                 rule,
-                "categorical priority is not identifiable for every precedence edge",
+                "categorical priority case order is not uniquely identifiable "
+                "from observed combinations",
             )
-        predicted = np.full(target.size, atom.default, dtype=object)
-        for active, value in reversed(case_masks):
-            predicted[active] = value
         category_groups = _group_labels(
             frame,
             self.ds.name_model,
         )
         return self._definition_evaluation(
             rule,
-            _typed_equal_array(target[valid], predicted[valid]),
+            _typed_equal_array(
+                target[valid],
+                population.predicted[valid],
+            ),
             int(target.size),
             1,
             parameters={},

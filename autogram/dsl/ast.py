@@ -29,38 +29,28 @@ from __future__ import annotations
 
 import json
 import math
-import numbers
+import re
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Callable, NamedTuple, Optional, Tuple, Union
 
-import numpy as np
+from .scalar_codec import scalar_to_text
 
 # Operator and aggregation vocabularies are intrinsic to the DSL (not dataset-specific).
 OPS = ("~=", "==", "<=", ">=", "<", ">", "!=", "<|>", "~∝")
 AGG_KINDS = ("SUM", "MIN", "MAX", "AVG")
+_SIMPLE_IDENTIFIER = re.compile(r"\w+\Z")
 
 
 def _scalar_unparse(value: object) -> str:
-    if isinstance(value, np.generic):
-        value = value.item()
-    if value is None or isinstance(value, (str, bool)):
-        scalar = value
-    elif isinstance(value, numbers.Integral):
-        scalar = int(value)
-    elif isinstance(value, numbers.Real):
-        scalar = float(value)
-        if not math.isfinite(scalar):
-            raise ValueError("DSL scalar values must be finite")
-    else:
-        raise TypeError(
-            f"DSL scalar values must be strings, booleans, numbers, or null; got {value!r}"
-        )
-    return json.dumps(
-        scalar,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-    )
+    return scalar_to_text(value, "DSL scalar value")
+
+
+def _identifier_unparse(identifier: str) -> str:
+    if not isinstance(identifier, str):
+        raise TypeError(f"DSL identifiers must be strings; got {identifier!r}")
+    if _SIMPLE_IDENTIFIER.fullmatch(identifier):
+        return identifier
+    return json.dumps(identifier, ensure_ascii=False, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
@@ -93,8 +83,7 @@ class Const:
         return 0
 
     def unparse(self) -> str:
-        v = self.value
-        return str(int(v)) if float(v).is_integer() else f"{v:g}"
+        return _term_unparse(self)
 
 
 @dataclass(frozen=True)
@@ -110,9 +99,7 @@ class Scale:
         return self.term.degree()
 
     def unparse(self) -> str:
-        c = self.coeff
-        cs = str(int(c)) if float(c).is_integer() else f"{c:g}"
-        return f"{cs}*{self.term.unparse()}"
+        return _term_unparse(self)
 
 
 @dataclass(frozen=True)
@@ -127,7 +114,7 @@ class Add:
         return max((t.degree() for t in self.terms), default=0)
 
     def unparse(self) -> str:
-        return " + ".join(t.unparse() for t in self.terms)
+        return _term_unparse(self)
 
 
 @dataclass(frozen=True)
@@ -143,7 +130,7 @@ class Agg:
         return 1
 
     def unparse(self) -> str:
-        return f"{self.kind}({self.family_role})"
+        return _term_unparse(self)
 
 
 @dataclass(frozen=True)
@@ -159,7 +146,7 @@ class Mul:
         return self.left.degree() + self.right.degree()
 
     def unparse(self) -> str:
-        return f"({self.left.unparse()} * {self.right.unparse()})"
+        return _term_unparse(self)
 
 
 @dataclass(frozen=True)
@@ -178,7 +165,7 @@ class Div:
         return self.num.degree() + self.den.degree()
 
     def unparse(self) -> str:
-        return f"({self.num.unparse()} / {self.den.unparse()})"
+        return _term_unparse(self)
 
 
 @dataclass(frozen=True)
@@ -195,7 +182,7 @@ class Lag:
         return self.term.degree()
 
     def unparse(self) -> str:
-        return f"LAG_{self.steps}({self.term.unparse()})"
+        return _term_unparse(self)
 
 
 @dataclass(frozen=True)
@@ -212,7 +199,7 @@ class Diff:
         return self.term.degree()
 
     def unparse(self) -> str:
-        return f"DELTA_{self.steps}({self.term.unparse()})"
+        return _term_unparse(self)
 
 
 @dataclass(frozen=True)
@@ -230,7 +217,7 @@ class Rolling:
         return self.term.degree()
 
     def unparse(self) -> str:
-        return f"ROLL_{self.kind}_{self.window}({self.term.unparse()})"
+        return _term_unparse(self)
 
 
 @dataclass(frozen=True)
@@ -246,10 +233,130 @@ class RelatedAgg:
         return 1
 
     def unparse(self) -> str:
-        return f"RELATED({self.role})"
+        return _term_unparse(self)
 
 
 Term = Union[Ref, Const, Scale, Add, Agg, Mul, Div, Lag, Diff, Rolling, RelatedAgg]
+
+
+def _number_unparse(value: object) -> str:
+    """Shortest decimal spelling that reconstructs the exact finite binary float."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("DSL numeric values must be finite")
+    if number == 0.0 and math.copysign(1.0, number) < 0:
+        return "-0.0"
+    if number.is_integer():
+        return str(int(number))
+    return repr(number)
+
+
+def _group_add_child(term: Term, rendered: str) -> str:
+    return f"({rendered})" if isinstance(term, Add) else rendered
+
+
+def _term_unparse(term: Term) -> str:
+    """Canonical precedence-aware surface rendering for one term."""
+    if isinstance(term, Ref):
+        return term.role
+    if isinstance(term, Const):
+        return _number_unparse(term.value)
+    if isinstance(term, Scale):
+        child = _group_add_child(term.term, _term_unparse(term.term))
+        return f"{_number_unparse(term.coeff)}*{child}"
+    if isinstance(term, Add):
+        if len(term.terms) <= 1:
+            children = ", ".join(_term_unparse(child) for child in term.terms)
+            return f"ADD({children})"
+        rendered = []
+        for child in term.terms:
+            text = _term_unparse(child)
+            rendered.append(_group_add_child(child, text))
+        return " + ".join(rendered)
+    if isinstance(term, Agg):
+        return f"{term.kind}({term.family_role})"
+    if isinstance(term, Mul):
+        left = _group_add_child(term.left, _term_unparse(term.left))
+        right = _group_add_child(term.right, _term_unparse(term.right))
+        return f"({left} * {right})"
+    if isinstance(term, Div):
+        num = _group_add_child(term.num, _term_unparse(term.num))
+        den = _group_add_child(term.den, _term_unparse(term.den))
+        return f"({num} / {den})"
+    if isinstance(term, Lag):
+        return f"LAG_{term.steps}({_term_unparse(term.term)})"
+    if isinstance(term, Diff):
+        return f"DELTA_{term.steps}({_term_unparse(term.term)})"
+    if isinstance(term, Rolling):
+        return (
+            f"ROLL_{term.kind}_{term.window}"
+            f"({_term_unparse(term.term)})"
+        )
+    if isinstance(term, RelatedAgg):
+        return f"RELATED({term.role})"
+    raise TypeError(f"unknown term {term!r}")
+
+
+def _float_identity(value: object) -> Tuple[str, str]:
+    """Exact, orderable identity for one DSL floating-point field."""
+    return ("float", float(value).hex())
+
+
+def term_identity(term: Term) -> Tuple:
+    """Exact typed structural identity for a term.
+
+    Machine-facing deduplication and opaque solver symbols use this tuple rather than reparsing
+    surface text.
+    """
+    if isinstance(term, Ref):
+        return ("ref", term.role)
+    if isinstance(term, Const):
+        return ("const", _float_identity(term.value))
+    if isinstance(term, Scale):
+        return (
+            "scale",
+            _float_identity(term.coeff),
+            term_identity(term.term),
+        )
+    if isinstance(term, Add):
+        return (
+            "add",
+            tuple(sorted(
+                term_identity(child)
+                for child in term.terms
+            )),
+        )
+    if isinstance(term, Agg):
+        return ("agg", term.kind, term.family_role)
+    if isinstance(term, Mul):
+        operands = tuple(sorted((
+            term_identity(term.left),
+            term_identity(term.right),
+        )))
+        return (
+            "mul",
+            operands,
+        )
+    if isinstance(term, Div):
+        return (
+            "div",
+            term_identity(term.num),
+            term_identity(term.den),
+        )
+    if isinstance(term, Lag):
+        return ("lag", int(term.steps), term_identity(term.term))
+    if isinstance(term, Diff):
+        return ("diff", int(term.steps), term_identity(term.term))
+    if isinstance(term, Rolling):
+        return (
+            "rolling",
+            term.kind,
+            int(term.window),
+            term_identity(term.term),
+        )
+    if isinstance(term, RelatedAgg):
+        return ("related", term.role)
+    raise TypeError(f"unknown term {term!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +388,7 @@ class Bound:
         return 1 + self.term.complexity()
 
     def unparse(self) -> str:
-        threshold = "?" if self.threshold is None else Const(float(self.threshold)).unparse()
+        threshold = "?" if self.threshold is None else _number_unparse(self.threshold)
         return f"{self.term.unparse()} {self.op} {threshold}"
 
 
@@ -315,6 +422,37 @@ class Conjunction:
 Predicate = Union[Bound, Sustained, Conjunction]
 
 
+def predicate_identity(predicate: Predicate) -> Tuple:
+    """Exact typed structural identity for a Boolean-definition predicate."""
+    if isinstance(predicate, Bound):
+        threshold = (
+            None
+            if predicate.threshold is None
+            else _float_identity(predicate.threshold)
+        )
+        return (
+            "bound",
+            term_identity(predicate.term),
+            predicate.op,
+            threshold,
+        )
+    if isinstance(predicate, Sustained):
+        return (
+            "sustained",
+            int(predicate.window),
+            predicate_identity(predicate.predicate),
+        )
+    if isinstance(predicate, Conjunction):
+        return (
+            "conjunction",
+            tuple(
+                predicate_identity(child)
+                for child in predicate.predicates
+            ),
+        )
+    raise TypeError(f"unknown predicate {predicate!r}")
+
+
 @dataclass(frozen=True)
 class BooleanDefinition:
     """A Boolean measured target defined by a total predicate."""
@@ -342,13 +480,129 @@ class CategoryDefinition:
 
     def unparse(self) -> str:
         cases = ", ".join(
-            f"{column}->{_scalar_unparse(value)}"
+            f"{_identifier_unparse(column)}->{_scalar_unparse(value)}"
             for column, value in self.cases
         )
         return (
-            f"{self.target_column} := PRIORITY("
+            f"{_identifier_unparse(self.target_column)} := PRIORITY("
             f"{cases}; default={_scalar_unparse(self.default)})"
         )
+
+
+class CategoryLabelBlock(NamedTuple):
+    """One maximal same-label run in the semantics of a fixed priority rule.
+
+    Cases inside the run can be permuted without changing that rule's total function.  This
+    canonical equivalence does not by itself establish that every case has observationally fixed
+    precedence relative to cases carrying other labels; discovery checks that at case level.
+    """
+
+    value_key: Tuple
+    cases: Tuple[Tuple[object, object], ...]
+
+    @property
+    def value(self) -> object:
+        return self.cases[0][1]
+
+
+def category_definition_label_blocks(
+    cases: Tuple[Tuple[object, object], ...],
+    typed_value_key: Callable[[object], Tuple],
+) -> Tuple[CategoryLabelBlock, ...]:
+    """Ordered canonical blocks for the total function of a categorical priority map.
+
+    Adjacent cases with the same typed output are functionally one unordered OR block. Repeated
+    labels separated by another output remain separate blocks because their positions carry
+    different precedence. Observational identifiability must still be established for every
+    differently labelled *case* before discovery may accept the canonical block representation.
+    """
+    blocks: list[tuple[Tuple, list[tuple[object, object]]]] = []
+    for case in cases:
+        value_key = typed_value_key(case[1])
+        if blocks and blocks[-1][0] == value_key:
+            blocks[-1][1].append(case)
+        else:
+            blocks.append((value_key, [case]))
+    return tuple(
+        CategoryLabelBlock(value_key, tuple(block_cases))
+        for value_key, block_cases in blocks
+    )
+
+
+def category_definition_cross_label_pairs(
+    cases: Tuple[Tuple[object, object], ...],
+    typed_value_key: Callable[[object], Tuple],
+) -> Tuple[Tuple[int, int], ...]:
+    """Case-index pairs whose relative priority can change the rule on an unseen input."""
+    value_keys = tuple(
+        typed_value_key(value)
+        for _column, value in cases
+    )
+    return tuple(
+        (left, right)
+        for left in range(len(cases))
+        for right in range(left + 1, len(cases))
+        if value_keys[left] != value_keys[right]
+    )
+
+
+def category_definition_canonical_cases(
+    cases: Tuple[Tuple[object, object], ...],
+    typed_value_key: Callable[[object], Tuple],
+) -> Tuple[Tuple[object, object], ...]:
+    """Canonical case order that sorts only within same-label OR blocks."""
+    return tuple(
+        case
+        for _value_key, block_cases in category_definition_label_blocks(
+            cases,
+            typed_value_key,
+        )
+        for case in sorted(
+            block_cases,
+            key=lambda item: repr(item[0]),
+        )
+    )
+
+
+def category_definition_semantic_signature(
+    target_column: object,
+    cases: Tuple[Tuple[object, object], ...],
+    default: object,
+    typed_value_key: Callable[[object], Tuple],
+) -> Tuple:
+    """Typed recovery/solver identity for a categorical priority map.
+
+    Consecutive cases with the same typed output form one OR block, so their Boolean columns are
+    unordered. Block order is retained because precedence between different output labels remains
+    semantically significant. The flattened result keeps the long-standing recovery-signature
+    shape while putting every same-label block in one deterministic order.
+    """
+    return (
+        "categorical_definition",
+        (
+            target_column,
+            tuple(
+                (column, typed_value_key(value))
+                for column, value in category_definition_canonical_cases(
+                    cases,
+                    typed_value_key,
+                )
+            ),
+            typed_value_key(default),
+        ),
+    )
+
+
+def category_definition_semantic_key(
+    atom: CategoryDefinition,
+    typed_value_key: Callable[[object], Tuple],
+) -> Tuple:
+    return category_definition_semantic_signature(
+        atom.target_column,
+        atom.cases,
+        atom.default,
+        typed_value_key,
+    )
 
 
 @dataclass(frozen=True)
@@ -362,7 +616,7 @@ class BandDefinition:
         return 1 + self.term.complexity()
 
     def unparse(self) -> str:
-        center = "?" if self.center is None else Const(float(self.center)).unparse()
+        center = "?" if self.center is None else _number_unparse(self.center)
         return f"{self.term.unparse()} ~band {center}"
 
 
@@ -400,7 +654,10 @@ class Rule:
 
 @dataclass(frozen=True)
 class Condition:
-    """A bounded row filter over one categorical or Boolean context column."""
+    """A bounded row filter over one categorical or Boolean context column.
+
+    Surface syntax keeps word-only column names bare and JSON-quotes all other identifiers.
+    """
 
     column: str
     op: str
@@ -412,10 +669,11 @@ class Condition:
                 value.unparse() for value in self.values
                 if isinstance(value, Condition)
             ) + ")"
+        column = _identifier_unparse(self.column)
         if self.op == "in":
             return (
-                f"{self.column} in ("
+                f"{column} in ("
                 f"{', '.join(_scalar_unparse(value) for value in self.values)})"
             )
         value = self.values[0] if self.values else ""
-        return f"{self.column} {self.op} {_scalar_unparse(value)}"
+        return f"{column} {self.op} {_scalar_unparse(value)}"

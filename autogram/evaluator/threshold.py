@@ -48,8 +48,12 @@ def rule_threshold(cfg, *, op: str, strictness: str, complexity: int,
     # regime where a spurious candidate's band had to stretch toward the ceiling.
     if (strictness not in ("existence", "separation")
             and getattr(cfg, "band_mode", "adaptive") == "adaptive"):
-        cap = max(float(cfg.tolerance), 1e-9)
-        frac = min(1.0, max(0.0, (float(eps) / cap - 0.5) * 2.0))
+        cap = float(cfg.tolerance)
+        frac = (
+            min(1.0, max(0.0, (float(eps) / cap - 0.5) * 2.0))
+            if cap > 0.0
+            else 0.0
+        )
         thr += float(cfg.thr_separation_penalty) * frac
     # Complexity penalty for forms above a baseline size.
     over = max(0, int(complexity) - int(cfg.thr_base_complexity))

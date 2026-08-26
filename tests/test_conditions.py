@@ -15,7 +15,11 @@ from autogram.discovery.evaluate import DataOnlyEvaluator, Evaluation
 from autogram.discovery import synth, validate as validation
 from autogram.discovery.known import KnownInvariant, _signature, recover_known, shapes_for_invariant
 from autogram.discovery.loop import build_dataframe_grammar
-from autogram.discovery.propose import EnumerationProposer, normalize_rule
+from autogram.discovery.propose import (
+    EnumerationProposer,
+    canonical_executable_condition,
+    normalize_rule,
+)
 from autogram.discovery.validate import score_recovery
 from autogram.dsl import ast as A
 from autogram.dsl.evaluate import (
@@ -140,6 +144,88 @@ def test_condition_domains_and_masks_preserve_typed_identity():
     assert not np.any(in_mask & masks[1])
 
 
+def test_dataframe_grammar_supports_temporal_condition_scalars():
+    instant = pd.Timestamp("2026-01-01")
+    duration = pd.Timedelta("1h")
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "event_at": pd.Series(
+                [
+                    instant,
+                    instant + pd.Timedelta(days=1),
+                    pd.NaT,
+                    instant,
+                ],
+                dtype="datetime64[ns]",
+            ),
+            "elapsed": pd.Series(
+                [
+                    duration,
+                    duration * 2,
+                    pd.NaT,
+                    duration,
+                ],
+                dtype="timedelta64[ns]",
+            ),
+            "x": [1.0, 2.0, 3.0, 4.0],
+        }),
+        condition_columns=("event_at", "elapsed"),
+    )
+
+    dataset, grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="temporal_conditions",
+    )
+
+    assert grammar.condition_columns == {
+        "event_at": (
+            instant,
+            instant + pd.Timedelta(days=1),
+        ),
+        "elapsed": (
+            duration,
+            duration * 2,
+        ),
+    }
+    assert dataset.row_context["event_at"].dtype.kind == "M"
+    assert dataset.row_context["elapsed"].dtype.kind == "m"
+    instant_mask = _condition_mask(
+        A.Condition(
+            "event_at",
+            "==",
+            (np.datetime64("2026-01-01", "ns"),),
+        ),
+        dataset.observed,
+    )
+    duration_mask = _condition_mask(
+        A.Condition(
+            "elapsed",
+            "==",
+            (np.timedelta64(1, "h"),),
+        ),
+        dataset.observed,
+    )
+    missing_mask = _condition_mask(
+        A.Condition(
+            "event_at",
+            "==",
+            (np.datetime64("NaT", "ns"),),
+        ),
+        dataset.observed,
+    )
+
+    np.testing.assert_array_equal(
+        instant_mask,
+        [True, False, False, True],
+    )
+    np.testing.assert_array_equal(
+        duration_mask,
+        [True, False, False, True],
+    )
+    assert not np.any(missing_mask)
+
+
 def test_structured_rule_signatures_do_not_collide_on_condition_text():
     atom = A.Compare(A.Ref("x"), "==", A.Ref("y"))
     first = A.Rule(
@@ -167,7 +253,13 @@ def test_structured_rule_signatures_do_not_collide_on_condition_text():
         ),
     )
 
-    assert first.condition.unparse() == second.condition.unparse()
+    assert first.condition.unparse() == (
+        'ALL(a == 1, "b == 2, c" == 3)'
+    )
+    assert second.condition.unparse() == (
+        'ALL("a == 1, b" == 2, c == 3)'
+    )
+    assert first.condition.unparse() != second.condition.unparse()
     assert first.signature() != second.signature()
 
     category_a = A.Rule(
@@ -214,7 +306,7 @@ def test_category_solver_and_archive_use_typed_structural_identity():
             "default",
         ),
     )
-    assert first.unparse() == second.unparse()
+    assert first.unparse() != second.unparse()
     assert first.signature() != second.signature()
     assert not equivalent(first, second)
     assert not subsumes(first, second)
@@ -541,6 +633,219 @@ def test_solver_and_membership_enumeration_preserve_typed_conditions():
         for rule in EnumerationProposer(grammar).propose()
     }
     assert normalize_rule(membership).signature() in proposed
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pd.Timestamp("2026-01-01"),
+        pd.Timestamp("2026-01-01", tz="US/Eastern"),
+        pd.Timedelta("1h"),
+        np.datetime64("2026-01-01T00:00:00.123", "ms"),
+        np.timedelta64(3, "h"),
+    ],
+)
+def test_temporal_scalar_dict_round_trip_preserves_ast_equality(value):
+    rules = (
+        A.Rule(
+            "record",
+            A.Compare(A.Ref("x"), "~=", A.Ref("y")),
+            condition=A.Condition("when", "==", (value,)),
+        ),
+        A.Rule(
+            "record",
+            A.CategoryDefinition(
+                "target",
+                (("flag", value),),
+                "fallback",
+            ),
+        ),
+    )
+
+    for rule in rules:
+        payload = json.loads(json.dumps(
+            rule_to_dict(rule),
+            allow_nan=False,
+        ))
+        restored = rule_from_dict(payload)
+
+        assert restored == rule
+        assert restored.signature() == rule.signature()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pd.NaT,
+        np.datetime64("NaT", "us"),
+        np.timedelta64("NaT", "ms"),
+    ],
+)
+def test_temporal_nat_dict_round_trip_preserves_type_and_semantics(value):
+    condition_rule = A.Rule(
+        "record",
+        A.Compare(A.Ref("x"), "~=", A.Ref("y")),
+        condition=A.Condition("when", "==", (value,)),
+    )
+    category_rule = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "target",
+            (("flag", value),),
+            "fallback",
+        ),
+    )
+
+    restored_condition = rule_from_dict(json.loads(json.dumps(
+        rule_to_dict(condition_rule),
+        allow_nan=False,
+    )))
+    restored_category = rule_from_dict(json.loads(json.dumps(
+        rule_to_dict(category_rule),
+        allow_nan=False,
+    )))
+    condition_value = restored_condition.condition.values[0]
+    category_value = restored_category.atom.cases[0][1]
+
+    assert type(condition_value) is type(value)
+    assert type(category_value) is type(value)
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        assert condition_value.dtype == value.dtype
+        assert category_value.dtype == value.dtype
+        assert np.isnat(condition_value)
+        assert np.isnat(category_value)
+    assert (
+        typed_condition_key(restored_condition.condition)
+        == typed_condition_key(condition_rule.condition)
+    )
+    assert A.category_definition_semantic_key(
+        restored_category.atom,
+        typed_group_key,
+    ) == A.category_definition_semantic_key(
+        category_rule.atom,
+        typed_group_key,
+    )
+    assert restored_condition.signature() == condition_rule.signature()
+    assert restored_category.signature() == category_rule.signature()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_dict_condition_and_category_scalars_reject_nonfinite_values(value):
+    invalid_payloads = (
+        {
+            "binder": "record",
+            "op": "==",
+            "left": {"k": "Ref", "role": "x"},
+            "right": {"k": "Ref", "role": "y"},
+            "condition": {
+                "column": "kind",
+                "op": "==",
+                "values": [value],
+            },
+        },
+        {
+            "binder": "record",
+            "atom_kind": "CategoryDefinition",
+            "target_column": "target",
+            "cases": [["flag", value]],
+            "default": "fallback",
+        },
+    )
+    invalid_rules = (
+        A.Rule(
+            "record",
+            A.Compare(A.Ref("x"), "==", A.Ref("y")),
+            condition=A.Condition("kind", "==", (value,)),
+        ),
+        A.Rule(
+            "record",
+            A.CategoryDefinition(
+                "target",
+                (("flag", value),),
+                "fallback",
+            ),
+        ),
+    )
+
+    for payload in invalid_payloads:
+        with pytest.raises(ValueError, match="finite"):
+            rule_from_dict(payload)
+    for rule in invalid_rules:
+        with pytest.raises(ValueError, match="finite"):
+            rule_to_dict(rule)
+
+
+def test_temporal_categorical_scalars_are_admissible_and_solver_safe():
+    instant = pd.Timestamp("2026-01-01")
+    duration = pd.Timedelta("1h")
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=",),
+        ref_roles={"record": ("x", "y")},
+        fam_roles={"record": ()},
+        condition_columns={
+            "target": (instant, duration, pd.NaT),
+            "when": (instant, duration, pd.NaT),
+        },
+        category_case_columns={"record": ("flag",)},
+        conditional_enabled=True,
+        advanced_enabled=True,
+    )
+    atom = A.Compare(A.Ref("x"), "~=", A.Ref("y"))
+    condition_rules = (
+        A.Rule(
+            "record",
+            atom,
+            condition=A.Condition(
+                "when",
+                "==",
+                (np.datetime64("2026-01-01", "ns"),),
+            ),
+        ),
+        A.Rule(
+            "record",
+            atom,
+            condition=A.Condition(
+                "when",
+                "==",
+                (np.timedelta64(1, "h"),),
+            ),
+        ),
+        A.Rule(
+            "record",
+            atom,
+            condition=A.Condition(
+                "when",
+                "==",
+                (np.datetime64("NaT", "ns"),),
+            ),
+        ),
+    )
+    category_rules = (
+        A.Rule(
+            "record",
+            A.CategoryDefinition(
+                "target",
+                (("flag", np.datetime64("2026-01-01", "ns")),),
+                np.datetime64("NaT", "ns"),
+            ),
+        ),
+        A.Rule(
+            "record",
+            A.CategoryDefinition(
+                "target",
+                (("flag", np.timedelta64(1, "h")),),
+                np.timedelta64("NaT", "ns"),
+            ),
+        ),
+    )
+
+    assert all(
+        is_admissible(rule, grammar)[0]
+        for rule in (*condition_rules, *category_rules)
+    )
+    assert not equivalent(condition_rules[0], condition_rules[1])
+    assert not equivalent(category_rules[0], category_rules[1])
 
 
 def test_condition_round_trip_typecheck_and_solver_antecedent():
@@ -879,6 +1184,161 @@ def test_condition_conjunction_search_is_column_name_invariant():
     )
 
     assert expected in EnumerationProposer(grammar)._conditions()
+
+
+def test_timestamp_equality_and_numeric_conjunction_are_enumerable():
+    timestamps = tuple(pd.date_range(
+        "2026-08-26",
+        periods=3,
+        freq="1h",
+    ))
+    grammar = Grammar(
+        binders=("record",),
+        ops=("==",),
+        ref_roles={"record": ("left", "right")},
+        fam_roles={"record": ()},
+        conditional_enabled=True,
+        condition_columns={
+            "observed_at": timestamps,
+            "first": (0, 1, 2),
+            "second": (1, 2, 3),
+        },
+        max_condition_values=2,
+    )
+    conditions = set(EnumerationProposer(grammar)._conditions())
+
+    assert A.Condition(
+        "observed_at",
+        "==",
+        (timestamps[1],),
+    ) in conditions
+    assert A.Condition(
+        "",
+        "all",
+        (
+            A.Condition("first", "==", (1,)),
+            A.Condition("second", "==", (1,)),
+        ),
+    ) in conditions
+
+
+def test_executable_condition_form_matrix_matches_enumeration():
+    grammar = Grammar(
+        binders=("record",),
+        ops=("==",),
+        ref_roles={"record": ("left", "right")},
+        fam_roles={"record": ()},
+        conditional_enabled=True,
+        condition_columns={
+            "flag": (False, True),
+            "ready": (False, True),
+            "archetype": ("steady", "bursty"),
+            "label": ("normal", "alert", "idle"),
+            "region": ("east", "west"),
+            "state": ("ready", "blocked"),
+        },
+        max_condition_values=2,
+    )
+    enumerated = set(EnumerationProposer(grammar)._conditions())
+    accepted = (
+        A.Condition("label", "in", ("normal", "alert")),
+        A.Condition(
+            "",
+            "all",
+            (
+                A.Condition("archetype", "==", ("steady",)),
+                A.Condition("label", "==", ("normal",)),
+            ),
+        ),
+    )
+    rejected = (
+        A.Condition(
+            "",
+            "all",
+            (
+                A.Condition("archetype", "==", ("steady",)),
+                A.Condition("label", "==", ("normal",)),
+                A.Condition("region", "==", ("east",)),
+            ),
+        ),
+        A.Condition(
+            "",
+            "all",
+            (
+                A.Condition("archetype", "==", ("steady",)),
+                A.Condition("label", "==", ("normal",)),
+                A.Condition("region", "==", ("east",)),
+                A.Condition("state", "==", ("ready",)),
+            ),
+        ),
+        A.Condition(
+            "",
+            "all",
+            (
+                A.Condition("archetype", "==", ("steady",)),
+                A.Condition(
+                    "label",
+                    "in",
+                    ("normal", "alert"),
+                ),
+            ),
+        ),
+        A.Condition(
+            "",
+            "all",
+            (
+                A.Condition("flag", "==", (True,)),
+                A.Condition("ready", "==", (False,)),
+            ),
+        ),
+    )
+
+    for condition in accepted:
+        canonical = canonical_executable_condition(
+            condition,
+            condition_columns=grammar.condition_columns,
+            max_condition_values=grammar.max_condition_values,
+        )
+        assert canonical in enumerated
+    for condition in rejected:
+        with pytest.raises(ValueError):
+            canonical_executable_condition(
+                condition,
+                condition_columns=grammar.condition_columns,
+                max_condition_values=grammar.max_condition_values,
+            )
+        assert condition not in enumerated
+
+
+def test_conditioned_definitions_are_outside_the_enumerated_families():
+    grammar = Grammar(
+        binders=("record",),
+        ops=("==", "<=", ">="),
+        ref_roles={"record": ("signal", "alert")},
+        fam_roles={"record": ()},
+        boolean_roles={"record": ("alert",)},
+        advanced_enabled=True,
+        conditional_enabled=True,
+        condition_columns={
+            "regime": ("active", "idle"),
+            "label": ("normal", "alert"),
+        },
+        category_case_columns={"record": ("alert",)},
+        max_complexity=10,
+        max_conjunction_terms=2,
+    )
+    rules = EnumerationProposer(grammar).propose()
+    definitions = [
+        rule
+        for rule in rules
+        if isinstance(
+            rule.atom,
+            (A.BooleanDefinition, A.CategoryDefinition),
+        )
+    ]
+
+    assert definitions
+    assert not any(rule.condition is not None for rule in definitions)
 
 
 def test_proposer_legacy_no_map_rejects_raw_name_self_condition():

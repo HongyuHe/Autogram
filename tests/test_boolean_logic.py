@@ -8,22 +8,31 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from autogram.config import DiscoveryConfig
+from autogram.config import DiscoveryConfig, SearchConfig
 from autogram.calibrate import _capability_tiers, _widen_spec
-from autogram.discovery.evaluate import DataOnlyEvaluator, _predicate_population
+from autogram.discovery.evaluate import (
+    DataOnlyEvaluator,
+    _categorical_definition_population,
+    _predicate_population,
+)
 from autogram.discovery import synth, validate as validation
 from autogram.discovery.known import KnownInvariant, _signature, shapes_for_invariant
 from autogram.discovery.known import recover_known
 from autogram.discovery.validate import score_recovery
 from autogram.discovery.loop import build_dataframe_grammar
-from autogram.discovery.propose import EnumerationProposer, normalize_rule
+from autogram.discovery.propose import (
+    EnumerationProposer,
+    SearchSpaceTruncatedError,
+    _category_semantic_candidate_count,
+    normalize_rule,
+)
 from autogram.dsl import ast as A
 from autogram.dsl.evaluate import typed_group_key, typed_signature_value
 from autogram.dsl.grammar import Grammar
 from autogram.dsl.parser import rule_from_dict, rule_to_dict
 from autogram.dsl.typecheck import is_admissible
 from autogram.loader.gtib import profile_dataframe
-from autogram.logic.solver import atom_expr
+from autogram.logic.solver import atom_expr, equivalent
 from autogram.schema.spec import CellCodec, ColumnPattern, GrammarSpec, RoleOntology
 
 
@@ -1202,6 +1211,748 @@ def test_categorical_enumeration_is_boolean_column_rename_invariant():
     assert neutral > 0
 
 
+def test_categorical_enumeration_allows_repeated_labels_with_bounded_arity():
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=", "=="),
+        ref_roles={"record": ()},
+        fam_roles={"record": ()},
+        condition_columns={
+            "label": ("normal", "alert"),
+        },
+        category_case_columns={
+            "record": ("is_a", "is_b", "is_c"),
+        },
+        advanced_enabled=True,
+        max_conjunction_terms=2,
+        max_complexity=20,
+    )
+
+    definitions = [
+        rule.atom
+        for rule in EnumerationProposer(grammar).propose()
+        if isinstance(rule.atom, A.CategoryDefinition)
+    ]
+
+    assert A.CategoryDefinition(
+        "label",
+        (("is_a", "alert"), ("is_b", "alert")),
+        "normal",
+    ) in definitions
+    assert {len(atom.cases) for atom in definitions} == {1, 2}
+
+
+def test_categorical_enumeration_has_exact_eight_flag_semantic_count():
+    flags = tuple(f"is_{index}" for index in range(8))
+    expected = 2 * (2 ** len(flags) - 1)
+    grammar = Grammar(
+        binders=("record",),
+        ops=("~=", "=="),
+        ref_roles={"record": ()},
+        fam_roles={"record": ()},
+        condition_columns={
+            "label": ("normal", "alert"),
+        },
+        category_case_columns={
+            "record": flags,
+        },
+        advanced_enabled=True,
+        max_conjunction_terms=len(flags),
+        max_complexity=20,
+        max_rules=expected,
+    )
+
+    definitions = [
+        rule.atom
+        for rule in EnumerationProposer(grammar).propose()
+        if isinstance(rule.atom, A.CategoryDefinition)
+    ]
+
+    assert len(definitions) == expected
+    assert len({
+        A.category_definition_semantic_key(
+            atom,
+            typed_group_key,
+        )
+        for atom in definitions
+    }) == expected
+    assert _category_semantic_candidate_count(
+        len(flags),
+        1,
+        len(flags),
+    ) == 2 ** len(flags) - 1
+
+
+def test_thirteen_flag_categories_avoid_raw_permutations_and_precount(
+    monkeypatch,
+):
+    import autogram.discovery.propose as propose_module
+
+    flags = tuple(f"is_{index}" for index in range(13))
+    expected = 2 * (2 ** len(flags) - 1)
+
+    def raw_permutations_are_forbidden(*_args, **_kwargs):
+        raise AssertionError("categorical enumeration used raw permutations")
+
+    monkeypatch.setattr(
+        propose_module.itertools,
+        "permutations",
+        raw_permutations_are_forbidden,
+    )
+
+    def grammar(max_rules):
+        return Grammar(
+            binders=("record",),
+            ops=("~=", "=="),
+            ref_roles={"record": ()},
+            fam_roles={"record": ()},
+            condition_columns={
+                "label": ("normal", "alert"),
+            },
+            category_case_columns={
+                "record": flags,
+            },
+            advanced_enabled=True,
+            max_conjunction_terms=len(flags),
+            max_complexity=20,
+            max_rules=max_rules,
+        )
+
+    definitions = [
+        rule.atom
+        for rule in EnumerationProposer(grammar(expected)).propose()
+        if isinstance(rule.atom, A.CategoryDefinition)
+    ]
+    assert len(definitions) == expected
+    assert _category_semantic_candidate_count(
+        len(flags),
+        1,
+        len(flags),
+    ) == 2 ** len(flags) - 1
+
+    with pytest.raises(
+        SearchSpaceTruncatedError,
+        match=rf"{expected} semantic candidates.*max_rules={expected - 1}",
+    ):
+        EnumerationProposer(grammar(expected - 1)).propose()
+
+
+def test_categorical_semantic_key_preserves_priority_and_typed_labels():
+    grouped = A.CategoryDefinition(
+        "label",
+        (
+            ("is_a", "alert"),
+            ("is_b", "alert"),
+            ("is_c", "warning"),
+        ),
+        "normal",
+    )
+    grouped_permutation = A.CategoryDefinition(
+        "label",
+        (
+            ("is_b", "alert"),
+            ("is_a", "alert"),
+            ("is_c", "warning"),
+        ),
+        "normal",
+    )
+    precedence_sensitive = A.CategoryDefinition(
+        "label",
+        (
+            ("is_a", "alert"),
+            ("is_c", "warning"),
+            ("is_b", "alert"),
+        ),
+        "normal",
+    )
+    typed_true = A.CategoryDefinition(
+        "label",
+        (("is_a", True),),
+        "normal",
+    )
+    typed_one = A.CategoryDefinition(
+        "label",
+        (("is_a", 1),),
+        "normal",
+    )
+
+    key = lambda atom: A.category_definition_semantic_key(
+        atom,
+        typed_group_key,
+    )
+    assert A.category_definition_label_blocks(
+        grouped.cases,
+        typed_group_key,
+    ) == (
+        (
+            typed_group_key("alert"),
+            (
+                ("is_a", "alert"),
+                ("is_b", "alert"),
+            ),
+        ),
+        (
+            typed_group_key("warning"),
+            (("is_c", "warning"),),
+        ),
+    )
+    assert A.category_definition_canonical_cases(
+        grouped_permutation.cases,
+        typed_group_key,
+    ) == grouped.cases
+    assert A.category_definition_cross_label_pairs(
+        grouped.cases,
+        typed_group_key,
+    ) == ((0, 2), (1, 2))
+    assert key(grouped) == key(grouped_permutation)
+    assert key(grouped) != key(precedence_sensitive)
+    assert key(typed_true) != key(typed_one)
+
+    grouped_rule = A.Rule("record", grouped)
+    assert equivalent(
+        grouped_rule,
+        A.Rule("record", grouped_permutation),
+    )
+    assert not equivalent(
+        grouped_rule,
+        A.Rule("record", precedence_sensitive),
+    )
+    assert not equivalent(
+        A.Rule("record", typed_true),
+        A.Rule("record", typed_one),
+    )
+
+
+def _same_label_category_block_fixture():
+    n = 500
+    phase = np.arange(n) % 5
+    is_a = np.isin(phase, (0, 2))
+    is_b = np.isin(phase, (1, 2))
+    is_warning = np.isin(phase, (0, 1, 2, 3))
+    label = np.full(n, "normal", dtype=object)
+    label[is_warning] = "warning"
+    label[is_a | is_b] = "alert"
+    frame = profile_dataframe(
+        pd.DataFrame({
+            "is_a": is_a,
+            "is_b": is_b,
+            "is_warning": is_warning,
+            "label": label,
+        }),
+        condition_columns=("label",),
+        advanced=True,
+        max_conjunction_terms=3,
+    )
+    dataset, grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="same_label_block_identifiability",
+    )
+
+    def rule(cases):
+        return A.Rule(
+            "record",
+            A.CategoryDefinition(
+                "label",
+                cases,
+                "normal",
+            ),
+        )
+
+    canonical = rule((
+        ("is_a", "alert"),
+        ("is_b", "alert"),
+        ("is_warning", "warning"),
+    ))
+    same_block_permutation = rule((
+        ("is_b", "alert"),
+        ("is_a", "alert"),
+        ("is_warning", "warning"),
+    ))
+    reversed_blocks = rule((
+        ("is_warning", "warning"),
+        ("is_a", "alert"),
+        ("is_b", "alert"),
+    ))
+    return (
+        dataset,
+        grammar,
+        canonical,
+        same_block_permutation,
+        reversed_blocks,
+    )
+
+
+def test_same_label_category_accepts_identifiable_or_block():
+    """Every OR-block member has fixed precedence over the differently labelled case."""
+    (
+        dataset,
+        grammar,
+        canonical,
+        same_block_permutation,
+        reversed_blocks,
+    ) = _same_label_category_block_fixture()
+    evaluator = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    )
+
+    canonical_evaluation = evaluator.evaluate(canonical)
+    permuted_evaluation = evaluator.evaluate(
+        same_block_permutation
+    )
+    reversed_evaluation = evaluator.evaluate(reversed_blocks)
+    population = _categorical_definition_population(
+        canonical,
+        dataset.observed,
+    )
+    semantic_key = lambda rule: A.category_definition_semantic_key(
+        rule.atom,
+        typed_group_key,
+    )
+
+    assert canonical_evaluation.accepted
+    assert permuted_evaluation.accepted
+    assert canonical_evaluation.hold_rate == 1.0
+    assert permuted_evaluation.hold_rate == 1.0
+    assert population.precedence_closure == {
+        (0, 2),
+        (1, 2),
+    }
+    assert population.order_identifiable
+    assert semantic_key(canonical) == semantic_key(
+        same_block_permutation
+    )
+
+    assert semantic_key(canonical) != semantic_key(reversed_blocks)
+    assert "identifiable" not in reversed_evaluation.reason
+    assert not reversed_evaluation.accepted
+
+    representatives = [
+        candidate
+        for candidate in EnumerationProposer(grammar).propose()
+        if isinstance(candidate.atom, A.CategoryDefinition)
+        and semantic_key(candidate) == semantic_key(canonical)
+    ]
+    assert [candidate.atom.cases for candidate in representatives] == [
+        canonical.atom.cases
+    ]
+    assert evaluator.evaluate(representatives[0]).accepted
+
+
+def test_same_label_category_block_null_and_recovery_regression():
+    (
+        dataset,
+        grammar,
+        canonical,
+        same_block_permutation,
+        _reversed_blocks,
+    ) = _same_label_category_block_fixture()
+    config = DiscoveryConfig(
+        hold_rate_threshold=0.9,
+        band_mode="global",
+    )
+    controls = validation.prepare_runtime_null_controls(
+        dataset,
+        grammar,
+        SearchConfig(seed=0),
+        seed=0,
+        rules=[canonical, same_block_permutation],
+    )
+
+    assert controls.definition_null is not None
+    assert controls.definition_null.definition_gradeable_points
+    assert validation.null_definitions_at(
+        controls.definition_null,
+        config,
+        seed=0,
+    ) == 0
+
+    evaluation = DataOnlyEvaluator(dataset, config).evaluate(canonical)
+    known = KnownInvariant(
+        "same_label_permutation",
+        ":=",
+        "label",
+        {
+            "priority": [
+                {"when": "is_b", "value": "alert"},
+                {"when": "is_a", "value": "alert"},
+                {"when": "is_warning", "value": "warning"},
+            ],
+            "default": "normal",
+        },
+    )
+    recovery = recover_known(
+        SimpleNamespace(
+            dataset=dataset,
+            portfolio=[evaluation],
+        ),
+        [known],
+    )
+
+    assert evaluation.accepted
+    assert recovery["recall"] == 1.0
+
+
+def _category_block_dataset(name, flags, labels):
+    n = len(labels)
+    frame = _profile(pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=n,
+            freq="1min",
+        ),
+        "series_id": "a",
+        **flags,
+        "label": labels,
+    }))
+    return build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name=name,
+    )[0]
+
+
+def test_categorical_block_order_accepts_transitively_unique_precedence():
+    n = 600
+    phase = np.arange(n) % 6
+    is_a = np.isin(phase, (0, 3))
+    is_b = np.isin(phase, (1, 3, 4))
+    is_c = np.isin(phase, (2, 4))
+    labels = np.full(n, "none", dtype=object)
+    labels[is_c] = "c"
+    labels[is_b] = "b"
+    labels[is_a] = "a"
+    dataset = _category_block_dataset(
+        "transitive_category_order",
+        {"is_a": is_a, "is_b": is_b, "is_c": is_c},
+        labels,
+    )
+    rule = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (("is_a", "a"), ("is_b", "b"), ("is_c", "c")),
+            "none",
+        ),
+    )
+
+    population = _categorical_definition_population(
+        rule,
+        dataset.observed,
+    )
+    evaluation = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(rule)
+
+    assert population.precedence_constraints == {
+        (0, 1),
+        (1, 2),
+    }
+    assert population.precedence_closure == {
+        (0, 1),
+        (0, 2),
+        (1, 2),
+    }
+    assert population.order_identifiable
+    assert not np.any(is_a & is_c)
+    assert evaluation.accepted
+    assert evaluation.hold_rate == 1.0
+
+
+def test_same_label_block_rejects_hidden_case_level_ambiguity():
+    """A union witness cannot stand in for each same-label case's precedence."""
+    n = 500
+    phase = np.arange(n) % 5
+    is_a = np.isin(phase, (0, 1))
+    is_b = np.isin(phase, (0, 2))
+    is_c = np.isin(phase, (0, 3))
+    labels = np.full(n, "normal", dtype=object)
+    labels[is_c] = "y"
+    labels[is_a | is_b] = "x"
+    dataset = _category_block_dataset(
+        "hidden_same_label_precedence",
+        {"is_a": is_a, "is_b": is_b, "is_c": is_c},
+        labels,
+    )
+    candidate = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (("is_a", "x"), ("is_b", "x"), ("is_c", "y")),
+            "normal",
+        ),
+    )
+    alternative = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (("is_b", "x"), ("is_c", "y"), ("is_a", "x")),
+            "normal",
+        ),
+    )
+
+    population = _categorical_definition_population(
+        candidate,
+        dataset.observed,
+    )
+    alternative_population = _categorical_definition_population(
+        alternative,
+        dataset.observed,
+    )
+    evaluation = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(candidate)
+
+    assert len(population.blocks) == 2
+    assert np.array_equal(
+        population.predicted[population.valid],
+        population.target[population.valid],
+    )
+    assert np.array_equal(
+        alternative_population.predicted[alternative_population.valid],
+        alternative_population.target[alternative_population.valid],
+    )
+    assert np.array_equal(
+        population.predicted[population.valid],
+        alternative_population.predicted[alternative_population.valid],
+    )
+    assert population.ambiguous_pairs == {(0, 2), (1, 2)}
+    assert not population.order_identifiable
+    assert not evaluation.accepted
+    assert "observed combinations" in evaluation.reason
+
+    unseen = {"is_a": True, "is_b": False, "is_c": True}
+
+    def emit(rule):
+        return next(
+            (
+                value
+                for column, value in rule.atom.cases
+                if unseen[column]
+            ),
+            rule.atom.default,
+        )
+
+    assert emit(candidate) == "x"
+    assert emit(alternative) == "y"
+
+
+def test_same_label_block_accepts_transitively_fixed_case_precedence():
+    n = 800
+    phase = np.arange(n) % 8
+    is_a = phase == 0
+    is_b = phase == 1
+    is_d = np.isin(phase, (0, 1, 2, 5))
+    is_c = np.isin(phase, (2, 6))
+    labels = np.full(n, "normal", dtype=object)
+    labels[is_c] = "y"
+    labels[is_d] = "z"
+    labels[is_a | is_b] = "x"
+    dataset = _category_block_dataset(
+        "transitive_same_label_precedence",
+        {
+            "is_a": is_a,
+            "is_b": is_b,
+            "is_d": is_d,
+            "is_c": is_c,
+        },
+        labels,
+    )
+    rule = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (
+                ("is_a", "x"),
+                ("is_b", "x"),
+                ("is_d", "z"),
+                ("is_c", "y"),
+            ),
+            "normal",
+        ),
+    )
+
+    population = _categorical_definition_population(
+        rule,
+        dataset.observed,
+    )
+    evaluation = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(rule)
+
+    assert population.precedence_constraints == {
+        (0, 2),
+        (1, 2),
+        (2, 3),
+    }
+    assert population.precedence_closure == {
+        (0, 2),
+        (0, 3),
+        (1, 2),
+        (1, 3),
+        (2, 3),
+    }
+    assert not np.any(is_a & is_c)
+    assert not np.any(is_b & is_c)
+    assert population.order_identifiable
+    assert evaluation.accepted
+    assert evaluation.hold_rate == 1.0
+
+
+def test_categorical_block_order_rejects_ambiguous_fitting_order():
+    n = 600
+    phase = np.arange(n) % 6
+    is_a = np.isin(phase, (0, 3, 4))
+    is_b = np.isin(phase, (1, 3))
+    is_c = np.isin(phase, (2, 4))
+    labels = np.full(n, "none", dtype=object)
+    labels[is_c] = "c"
+    labels[is_b] = "b"
+    labels[is_a] = "a"
+    dataset = _category_block_dataset(
+        "ambiguous_category_order",
+        {"is_a": is_a, "is_b": is_b, "is_c": is_c},
+        labels,
+    )
+    rule = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (("is_a", "a"), ("is_b", "b"), ("is_c", "c")),
+            "none",
+        ),
+    )
+
+    population = _categorical_definition_population(
+        rule,
+        dataset.observed,
+    )
+    evaluation = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(rule)
+
+    assert population.precedence_constraints == {
+        (0, 1),
+        (0, 2),
+    }
+    assert population.ambiguous_pairs == {(1, 2)}
+    assert not population.order_identifiable
+    assert not evaluation.accepted
+    assert "uniquely identifiable" in evaluation.reason
+
+
+def test_categorical_blocks_keep_typed_equal_values_distinct():
+    n = 400
+    phase = np.arange(n) % 4
+    is_true = np.isin(phase, (0, 2))
+    is_one = np.isin(phase, (1, 2))
+    labels = np.full(n, "none", dtype=object)
+    labels[is_one] = 1
+    labels[is_true] = True
+    dataset = _category_block_dataset(
+        "typed_category_blocks",
+        {"is_true": is_true, "is_one": is_one},
+        pd.Series(labels, dtype=object),
+    )
+    rule = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (("is_true", True), ("is_one", 1)),
+            "none",
+        ),
+    )
+
+    population = _categorical_definition_population(
+        rule,
+        dataset.observed,
+    )
+    evaluation = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(rule)
+
+    assert len(population.blocks) == 2
+    assert (
+        population.blocks[0].block.value_key
+        != population.blocks[1].block.value_key
+    )
+    assert population.precedence_constraints == {(0, 1)}
+    assert population.order_identifiable
+    assert evaluation.accepted
+
+
+def test_categorical_precedence_ignores_missing_overlap_rows():
+    n = 400
+    phase = np.arange(n) % 4
+    is_a = np.isin(phase, (0, 3))
+    is_b = np.isin(phase, (1, 3))
+    labels = np.full(n, "none", dtype=object)
+    labels[is_b] = "b"
+    labels[is_a] = "a"
+    overlap = np.flatnonzero(is_a & is_b)
+    labels[overlap[::2]] = pd.NA
+    nullable_a = pd.array(is_a, dtype="boolean")
+    nullable_a[overlap[1::2]] = pd.NA
+    dataset = _category_block_dataset(
+        "missing_category_overlap",
+        {
+            "is_a": pd.Series(nullable_a),
+            "is_b": is_b,
+        },
+        pd.Series(labels, dtype=object),
+    )
+    rule = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            "label",
+            (("is_a", "a"), ("is_b", "b")),
+            "none",
+        ),
+    )
+
+    population = _categorical_definition_population(
+        rule,
+        dataset.observed,
+    )
+    evaluation = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(
+            hold_rate_threshold=0.9,
+            band_mode="global",
+        ),
+    ).evaluate(rule)
+
+    assert not np.any(population.valid[overlap])
+    assert not population.precedence_constraints
+    assert population.ambiguous_pairs == {(0, 1)}
+    assert not evaluation.accepted
+    assert "uniquely identifiable" in evaluation.reason
+
+
 def test_categorical_case_columns_are_binder_scoped():
     grammar = Grammar(
         binders=("left", "right"),
@@ -1416,6 +2167,96 @@ def test_known_categorical_recovery_requires_exact_full_mask():
     assert evaluation.accepted
     assert evaluation.hold_rate < 1.0
     assert recover_known(result, [known])["recall"] == 0.0
+
+
+def test_known_categorical_recovery_canonicalizes_same_label_or_blocks():
+    n = 400
+    phase = np.arange(n) % 8
+    first = (phase & 1) != 0
+    second = (phase & 2) != 0
+    warning = (phase & 4) != 0
+    label = np.full(n, "normal", dtype=object)
+    label[warning] = "warning"
+    label[first | second] = "alert"
+    frame = _profile(pd.DataFrame({
+        "timestamp": pd.date_range(
+            "2026-01-01",
+            periods=n,
+            freq="1min",
+        ),
+        "series_id": "a",
+        "is_first": first,
+        "is_second": second,
+        "is_warning": warning,
+        "label": label,
+    }))
+    dataset, _grammar = build_dataframe_grammar(
+        frame,
+        _base_spec(),
+        name="same_label_categorical_known",
+    )
+    rule = A.Rule(
+        "record",
+        A.CategoryDefinition(
+            target_column="label",
+            cases=(
+                ("is_first", "alert"),
+                ("is_second", "alert"),
+                ("is_warning", "warning"),
+            ),
+            default="normal",
+        ),
+    )
+    evaluation = DataOnlyEvaluator(
+        dataset,
+        DiscoveryConfig(hold_rate_threshold=0.9),
+    ).evaluate(rule)
+    result = SimpleNamespace(
+        dataset=dataset,
+        portfolio=[evaluation],
+    )
+
+    def known(name, cases):
+        return KnownInvariant(
+            name,
+            ":=",
+            "label",
+            {
+                "priority": [
+                    {"when": column, "value": value}
+                    for column, value in cases
+                ],
+                "default": "normal",
+            },
+        )
+
+    equivalent_permutation = known(
+        "equivalent",
+        (
+            ("is_second", "alert"),
+            ("is_first", "alert"),
+            ("is_warning", "warning"),
+        ),
+    )
+    precedence_sensitive = known(
+        "different_precedence",
+        (
+            ("is_first", "alert"),
+            ("is_warning", "warning"),
+            ("is_second", "alert"),
+        ),
+    )
+    recovery = recover_known(
+        result,
+        [equivalent_permutation, precedence_sensitive],
+    )
+
+    assert evaluation.accepted
+    assert evaluation.hold_rate == 1.0
+    assert [
+        item["recovered"]
+        for item in recovery["invariants"]
+    ] == [True, False]
 
 
 def test_categorical_priority_requires_overlapping_cases():
